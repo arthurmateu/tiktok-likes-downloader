@@ -68,6 +68,8 @@ The archive page lives at a `chrome-extension://` or `moz-extension://` URL, whi
 
 It is one self-contained file because it has to be. A `file://` document gets a unique opaque origin, so it can neither `fetch('archive.json')` nor load a module script from beside itself; the CSS, the JS and a slimmed copy of the metadata are inlined instead. Media is the exception and stays on relative paths — `<img>` and `<video>` load siblings off `file://` without complaint, which is what makes the whole thing work. A 6k-item archive comes out around 3 MB.
 
+Opening an item gives you a feed rather than a single clip. The wheel, ↑ ↓ (or `j`/`k`, PageUp/PageDown) and the two round buttons step through whatever the search and sort currently list, skipping anything not on disk; space plays and pauses, `m` mutes for the rest of the session, Esc closes and leaves the grid scrolled to where you got to. A photo post shows one image at a time the way TikTok's own slideshow does — ← → or the dots page through it, and `g` opens the whole post out at once. The same feed is in the extension's own Library tab; the two are kept in step by hand.
+
 Two consequences worth knowing:
 
 - **Thumbnails are `<video>` elements seeked to 0.5 s**, not decoded frames. The archive page uses `canvas.toBlob`, which throws here: a `file://` video taints the canvas.
@@ -193,7 +195,6 @@ Checked on 2026-08-02 by loading this extension into Edge with `--load-extension
 | Video — `tiktok.com/@soupy_cos/video/7669190146864074006` | 1,219,617 bytes, exactly the `video.size` TikTok declares; h264 576×1024, 7.34 s, 220 frames |
 | Single photo post — `@abc.es/photo/7668973530595314966` | 1 image, 1080×1350 JPEG, 171 KB |
 | Gallery photo post — `@mcslobby/photo/7666435596851711254` | all 9 images, in order, up to 1440×2148, 74–196 KB each |
-
 
 **No watermarks.** `video.playAddr` and `video.downloadAddr` are two different encodes of the same clip. Frames extracted from both show the bouncing "TikTok / @author" watermark burned into `downloadAddr` and a clean image in `playAddr`. The extension selects from `bitrateInfo` (highest resolution first, bitrate breaking ties) then `playAddr`, and **never** falls back to `downloadAddr` — see the comment in `src/content/collector.js`. Photo-post images carry no watermark at any resolution.
 

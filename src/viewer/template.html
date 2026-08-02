@@ -50,9 +50,17 @@
 		</main>
 
 		<div id="lightbox" class="lightbox hidden">
-			<button id="lbClose" class="lb-close">✕</button>
+			<div id="lbCount" class="lb-count"></div>
+			<button id="lbClose" class="lb-close" title="Close (Esc)">✕</button>
 			<div id="lbStage" class="lb-stage"></div>
+			<div class="lb-nav">
+				<button id="lbPrev" class="lb-step" title="Previous (↑)">↑</button>
+				<button id="lbNext" class="lb-step" title="Next (↓)">↓</button>
+			</div>
 			<div id="lbMeta" class="lb-meta"></div>
+			<div class="lb-hint">
+				scroll or ↑ ↓ — next · ← → — images in a post · g — all of them · space — play · m — mute · esc — close
+			</div>
 		</div>
 
 		<script type="application/json" id="ttarchive-data">
