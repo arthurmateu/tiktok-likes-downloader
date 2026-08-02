@@ -10,6 +10,7 @@ import * as fs from '../lib/fs.js';
 import { loadState, saveState, scanDisk, markGone, upsertItem, missingParts } from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
 import { renderLibrary, wireLibrary } from './viewer.js';
+import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -174,6 +175,85 @@ $('rescan').addEventListener('click', async () => {
 	log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts.`);
 });
 
+// ---------------------------------------------------------------- viewer.html
+
+/**
+ * Write the folder's own browsing page. Called after every completed sync so it
+ * is never staler than the archive itself, and available as a button for a
+ * folder that hasn't been synced since this feature existed.
+ */
+async function writeViewerFile({ quiet = false } = {}) {
+	if (!app.state) return;
+	try {
+		const { bytes } = await writeViewer(app.state);
+		if (!quiet) log(`Wrote ${VIEWER_FILE} (${fmtBytes(bytes)}) — open it from the folder to browse offline.`, 'ok');
+	} catch (err) {
+		// Never fatal: the media and archive.json are already safe, and this file
+		// is regenerable from them.
+		log(`Could not write ${VIEWER_FILE}: ${err.message || err}`, 'err');
+	}
+}
+
+$('writeViewer').addEventListener('click', async () => {
+	if (!app.state) {
+		log('Pick a folder first.', 'err');
+		return;
+	}
+	$('writeViewer').disabled = true;
+	await writeViewerFile();
+	$('writeViewer').disabled = false;
+});
+
+/**
+ * A request from a generated viewer.html, relayed by the background through the
+ * content script that runs on it. Chromium only — see src/content/viewer-bridge.js.
+ */
+function onViewerRequest({ rid, cmd }) {
+	const respond = (payload) => port.postMessage({ cmd: 'viewer-response', rid, payload });
+
+	if (cmd === 'status') {
+		respond({
+			ok: true,
+			ready: !!app.state,
+			syncing: app.syncing,
+			folder: fs.rootName(),
+			seen: app.seen,
+			stats: app.queue ? { ...app.queue.stats } : null,
+		});
+		return;
+	}
+
+	if (cmd === 'state') {
+		if (!app.state) {
+			respond({ ok: false, error: 'no folder open' });
+			return;
+		}
+		respond({ ok: true, items: slimItems(app.state) });
+		return;
+	}
+
+	if (cmd === 'sync') {
+		if (app.syncing) {
+			respond({ ok: true, already: true });
+			return;
+		}
+		if (!app.state) {
+			respond({ ok: false, error: 'no folder open — pick one on the archiver page' });
+			return;
+		}
+		if (!$('username').value.trim()) {
+			respond({ ok: false, error: 'no username known — set one on the archiver page once' });
+			return;
+		}
+		// Answer before starting: startSync outlives this message by minutes.
+		respond({ ok: true });
+		startSync();
+		return;
+	}
+
+	respond({ ok: false, error: `unknown command ${cmd}` });
+}
+
 // ---------------------------------------------------------------- sync
 
 function updateCounters() {
@@ -190,6 +270,11 @@ function updateCounters() {
 }
 
 function onContentMessage(type, payload) {
+	if (type === 'viewer-request') {
+		onViewerRequest(payload || {});
+		return;
+	}
+
 	if (type === 'status') {
 		log(payload.msg, payload.fatal ? 'err' : '');
 		if (payload.fatal || payload.done) finishSync(payload.fatal ? 'error' : 'complete');
@@ -291,6 +376,7 @@ async function finishSync(reason) {
 	await saveState(app.state, { immediate: true });
 	renderLibrary(app.state);
 	log('Done. archive.json written.', 'ok');
+	await writeViewerFile();
 	$('startSync').disabled = false;
 }
 

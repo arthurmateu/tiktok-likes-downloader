@@ -2,7 +2,7 @@
 	"manifest_version": 3,
 	"name": "TikTok Likes Archiver",
 	"version": "1.0.0",
-	"description": "Archive your liked TikToks — videos, covers and photo posts — into a folder you choose. No limits, no purchases.",
+	"description": "Archive your liked TikToks — videos and photo posts — into a folder you choose. No limits, no purchases.",
 	"minimum_chrome_version": "111",
 	"permissions": ["storage", "unlimitedStorage", "tabs", "scripting", "declarativeNetRequest"],
 	"host_permissions": [
@@ -41,6 +41,21 @@
 			"run_at": "document_start",
 			"world": "ISOLATED",
 			"all_frames": false
+		},
+		{
+			"_comment": "The viewer.html written into the archive folder. Inert unless the page carries our meta tag, and dead entirely until the user turns on 'Allow access to file URLs' — Chromium will not run an extension on a local file otherwise. Firefox has no equivalent and rejects file:// match patterns, so manifest.firefox.json has no counterpart to this.",
+			"matches": ["file:///*"],
+			"js": ["src/content/viewer-bridge.js"],
+			"run_at": "document_idle",
+			"world": "ISOLATED",
+			"all_frames": false
+		}
+	],
+	"web_accessible_resources": [
+		{
+			"_comment": "So a generated viewer.html can link back to the archive page.",
+			"resources": ["src/archive/archive.html"],
+			"matches": ["file:///*"]
 		}
 	],
 	"declarative_net_request": {

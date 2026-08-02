@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+	Dev-only: builds a viewer.html out of sample state and checks the parts that
+	only go wrong once, silently, in someone's archive folder — the inlining.
+
+	A caption is arbitrary text from TikTok. It can contain `</script>`, which
+	ends the element it is sitting in; `$&`, which String.replace reads out of a
+	replacement; and U+2028, which is a line terminator to a JavaScript parser but
+	not to JSON. All three are in the fixture below and all three have to survive
+	a round trip.
+
+	The generated page is rendered into a blob: iframe, whose origin is opaque —
+	the same condition a file:// document is under, so a mistake that would break
+	the real thing breaks here too. Media 404s in that iframe; the folder layout
+	is what makes it resolve, and there is no folder here.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/viewer.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>viewer generation</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+			iframe { width: 100%; height: 620px; border: 1px solid #383c43; border-radius: 10px; margin-top: 16px; background: #1b1c1f; }
+		</style>
+	</head>
+	<body>
+		<h1>viewer.html generation</h1>
+		<pre id="out">running…</pre>
+		<iframe id="frame" title="generated viewer"></iframe>
+
+		<script>
+			// getURL has to resolve against the server root, which is the repo root.
+			window.browser = {
+				runtime: {
+					getURL: (p) => `/${p}`,
+					getManifest: () => ({ version: '0.0.0-dev' }),
+					sendMessage: (msg) =>
+						Promise.resolve(
+							msg && msg.type === 'viewer-token'
+								? { ok: true, token: '00000000-0000-4000-8000-000000000000' }
+								: null
+						),
+				},
+			};
+			// Force fs.js to pick no backend: nothing here writes, and rootName()
+			// answers null without one.
+			delete window.showDirectoryPicker;
+		</script>
+
+		<script type="module">
+			import { buildViewerHTML } from '../archive/standalone.js';
+
+			const NASTY = 'ends a script: </script> — replacement token: $& $1 — markup: <b>x</b> — sep:\u2028end';
+
+			const STATE = {
+				items: {
+					111: {
+						id: '111',
+						type: 'video',
+						desc: NASTY,
+						createTime: 1700000000,
+						author: { uniqueId: 'someone', nickname: 'Some One' },
+						stats: { diggCount: 1234, playCount: 99000 },
+						status: 'saved',
+						files: { video: 'videos/111.mp4' },
+					},
+					222: {
+						id: '222',
+						type: 'photo',
+						desc: 'a photo post',
+						createTime: 1700000100,
+						author: { uniqueId: 'other', nickname: 'Other' },
+						stats: { diggCount: 5, playCount: 6 },
+						photoCount: 2,
+						status: 'saved',
+						files: { photos: ['images/222/01.jpg', 'images/222/02.jpg'] },
+					},
+					333: {
+						id: '333',
+						type: 'video',
+						desc: 'never downloaded',
+						createTime: 1700000200,
+						author: { uniqueId: 'ghost', nickname: 'Ghost' },
+						stats: {},
+						status: 'gone',
+					},
+				},
+			};
+
+			const out = document.getElementById('out');
+			let failures = 0;
+
+			// Built as nodes, not innerHTML: half these labels are markup-shaped on
+			// purpose, and pasting them into HTML is how the last run reported a
+			// failure it couldn't then print.
+			function check(name, pass, detail) {
+				if (!pass) failures++;
+				const tag = document.createElement('span');
+				tag.className = pass ? 'pass' : 'fail';
+				tag.textContent = pass ? 'PASS' : 'FAIL';
+				out.append(tag, ` ${name}\n`);
+				if (detail && !pass) out.append(`       ${detail}\n`);
+			}
+
+			out.textContent = '';
+			try {
+				const html = await buildViewerHTML(STATE);
+
+				check('no placeholder survived', !/__TOKEN__|__TITLE__|__DATA__|\/\*__(CSS|JS)__\*\//.test(html));
+				check('token reached the meta tag', html.includes('content="00000000-0000-4000-8000-000000000000"'));
+				check('css was inlined', html.includes('--accent: #4cc2ff'));
+				check('js was inlined', html.includes("__ttarchive: 'req'"));
+
+				// Every mention below is written `<\/script`, including in comments: the
+				// HTML parser ends this element at the raw sequence wherever it sits,
+				// which is the whole bug being tested for.
+				//
+				// Two is the answer for any input: the page's own two closing tags. The
+				// fixture caption carries a third, and if it ever shows up here it means
+				// a caption reached the file able to end the element it sits in.
+				const rawClose = (html.match(/<\/script/gi) || []).length;
+				check('no unescaped <\/script from content', rawClose === 2, `found ${rawClose}, expected 2`);
+				check('caption\u2019s <\/script> was escaped', html.includes('\\u003c/script\\u003e'));
+
+				// Parse the payload back out the way the page itself does.
+				const doc = new DOMParser().parseFromString(html, 'text/html');
+				const payload = JSON.parse(doc.getElementById('ttarchive-data').textContent);
+				const item = payload.items.find((i) => i.id === '111');
+
+				check('data blob parses', !!payload.items && payload.items.length === 3);
+				check('caption survived intact', item.desc === NASTY, JSON.stringify(item.desc));
+				check('file paths carried over', item.files.video === 'videos/111.mp4');
+				check('photo paths carried over', payload.items.find((i) => i.id === '222').files.photos.length === 2);
+				check('bridge URL was baked in', /archive\.html$/.test(payload.config.bridgeURL));
+				check('slimming dropped nothing needed', 'status' in item && 'stats' in item && 'author' in item);
+
+				// U+2028 is a line terminator to the JS parser: unescaped in the blob it
+				// would be a syntax error rather than a bad caption.
+				check('U+2028 escaped in the blob', !html.includes('\u2028'));
+
+				const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
+				document.getElementById('frame').src = url;
+			} catch (err) {
+				check('generation threw', false, String((err && err.stack) || err));
+			}
+
+			const verdict = document.createElement('span');
+			verdict.className = failures ? 'fail' : 'pass';
+			verdict.textContent = failures ? `${failures} FAILED` : 'all passed';
+			out.append('\n', verdict);
+		</script>
+	</body>
+</html>

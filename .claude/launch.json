@@ -6,6 +6,13 @@
 			"runtimeExecutable": "python",
 			"runtimeArgs": ["-m", "http.server", "8777"],
 			"port": 8777
+		},
+		{
+			"_comment": "Same thing on a second port, for when 8777 is already taken.",
+			"name": "static-alt",
+			"runtimeExecutable": "python",
+			"runtimeArgs": ["-m", "http.server", "8778"],
+			"port": 8778
 		}
 	]
 }

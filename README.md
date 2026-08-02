@@ -28,6 +28,8 @@ Either way: pin the extension, click it, **Open archive**.
 
 Run it again any time. Anything already on disk is skipped.
 
+Each completed sync also rewrites `viewer.html` in the folder — the same Library as a file you can double-click, no extension needed. See [viewer.html](#viewerhtml).
+
 ## Folder layout
 
 ```
@@ -35,9 +37,10 @@ Run it again any time. Anything already on disk is skipped.
   videos/<videoId>.mp4       one file per video
   images/<postId>/01.jpg     one folder per photo post, images in order
   archive.json               every liked item, downloaded or not
+  viewer.html                the Library, as a file you can double-click
 ```
 
-Three entries, nothing hidden, nothing nested. Filenames are the TikTok item ID, so writing the same item twice is a no-op, and the **directory listing** — not any database — decides what still needs downloading. Delete a file and the next sync re-fetches it; corrupt `archive.json` and nothing re-downloads.
+Nothing hidden, nothing nested. Filenames are the TikTok item ID, so writing the same item twice is a no-op, and the **directory listing** — not any database — decides what still needs downloading. Delete a file and the next sync re-fetches it; corrupt `archive.json` and nothing re-downloads.
 
 There are no cover files. A cover is a thumbnail of something you already have, so the Library decodes a frame out of the video instead (a little way in, since TikTok's first frame is usually black) and caches it in memory. Photo posts use their own first image.
 
@@ -55,6 +58,21 @@ Every item that has ever appeared in your likes, whether or not the media could 
 `gone` is the point of the file. That media is unrecoverable and always was — but the id, author, caption, date and stats are a few hundred bytes each, and they are the only thing that survives the post. A completed sync is what promotes an item to `gone`; a run you stop early never does, because a short list proves nothing.
 
 It's indented JSON at the top level of the folder, so `jq` and a text editor are both fine on it.
+
+### viewer.html
+
+The archive page lives at a `chrome-extension://` or `moz-extension://` URL, which is not an address anyone wants to keep to hand. So the same Library is written into the folder itself, rewritten after every sync and on demand with **Write viewer.html**. Double-click it and the archive browses itself — search, sort, playback, per-item metadata — with no extension involved. Copy the folder to another machine or a drive and it still opens.
+
+It is one self-contained file because it has to be. A `file://` document gets a unique opaque origin, so it can neither `fetch('archive.json')` nor load a module script from beside itself; the CSS, the JS and a slimmed copy of the metadata are inlined instead. Media is the exception and stays on relative paths — `<img>` and `<video>` load siblings off `file://` without complaint, which is what makes the whole thing work. A 6k-item archive comes out around 3 MB.
+
+Two consequences worth knowing:
+
+- **Thumbnails are `<video>` elements seeked to 0.5 s**, not decoded frames. The archive page uses `canvas.toBlob`, which throws here: a `file://` video taints the canvas.
+- **It is a snapshot.** The metadata is as current as the last sync. The media is always current, since that is read off the folder.
+
+On Chromium it can also talk back to the extension, which makes it a front-end rather than an export. Turn on **Allow access to file URLs** on the extension's card in `chrome://extensions` and the page reads live metadata instead of its snapshot, and can start a sync itself. That permission covers every local file you open, so the content script bails unless the document carries a `<meta name="ttarchive-viewer">` whose token matches one the extension issued and keeps to itself — another local page can't drive the archiver by copying the tag.
+
+Firefox does not run extensions on `file://` pages at all, and rejects `file:///*` match patterns outright, so there is no counterpart in `manifest.firefox.json`. There the page stays a snapshot, says so in a banner, and offers the archive page's URL to copy.
 
 ## Converting an existing archive
 
@@ -84,13 +102,16 @@ Gecko has no File System Access API, so there is no handle to write through and 
 
 `src/lib/fs.js` is now a façade over two backends and picks one by feature detection. Nothing above it — `state.js`, `downloader.js`, `viewer.js` — knows which browser it's on.
 
-Three things are honestly worse than on Chromium, and the archive page says so where it matters:
+Four things are honestly worse than on Chromium, and the archive page says so where it matters:
 
 | | Chromium | Firefox |
 | --- | --- | --- |
 | Where the archive can live | any folder | only under the download folder; move it in `about:preferences` |
 | What "already downloaded" means | a live directory listing | download history, plus any folder you've scanned |
 | Reading files back (Library playback, thumbnails, `archive.json`) | always | only after **Scan an existing folder…** |
+| `viewer.html` in the folder | can read live state and start a sync | a snapshot; the extension can't attach to a local file |
+
+That last row is a platform limit with no workaround, not a gap in the port. Gecko has never run extensions on `file://` URLs — `externally_connectable` doesn't cover the scheme either, and content-initiated navigation to `moz-extension:` is blocked — so a page in your archive folder has no way to reach the extension. It still browses the archive perfectly well; it just can't sync, and it explains that rather than failing quietly.
 
 Clearing your download history costs bandwidth, never data: the next sync re-downloads over the top of files that are already there (`conflictAction: 'overwrite'`), and identical filenames mean the result is the same archive. `archive.json` is additionally mirrored into IndexedDB, because a download folder is write-only from inside the extension and the metadata has to survive to the next run.
 
@@ -115,6 +136,9 @@ The trade-off is honest: it's as fast as TikTok's own infinite scroll (~30 items
 | `src/background.js` | Relay between content scripts and the archive page; manages the TikTok tab. Service worker on Chromium, event page on Gecko, so it stays import-free. |
 | `src/archive/archive.js` | Owns the storage backend, the sync run, and all disk I/O. |
 | `src/archive/viewer.js` | Offline library browser — search, sort, thumbnails, playback from disk. |
+| `src/archive/standalone.js` | Generates the folder's own `viewer.html`, inlining `src/viewer/`. |
+| `src/viewer/` | Template, CSS and runtime for that generated page. Never loaded as files by the extension — only read and inlined. |
+| `src/content/viewer-bridge.js` | Chromium only. Relays a generated `viewer.html`'s requests to the background. |
 | `src/lib/fs.js` | Storage façade: folder layout, backend selection by feature detection. |
 | `src/lib/backends/fsa.js` | Chromium backend — File System Access, write retries. |
 | `src/lib/backends/downloads.js` | Gecko backend — downloads API, history-derived listing, folder snapshot. |
@@ -165,6 +189,8 @@ Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stu
 `src/dev/backends.html` unit-tests the Gecko backend against a faked download history and a faked directory pick — path arithmetic, the history/snapshot union, filename sanitising, the `archive.json` mirror. Serve the repo as above and open `http://127.0.0.1:8777/src/dev/backends.html`; it prints pass/fail and needs no browser extension loaded.
 
 `src/dev/thumbs.html` tests the Library against a folder that exists only in memory: an import map swaps `src/dev/fake-fs.js` in for `src/lib/fs.js`, so `state.js` and `viewer.js` run exactly as shipped. It matters most for video thumbnails, which are now decoded frames rather than files — the sample clip inlined in the page is black for its first 0.2 s and colour bars after, so "we took frame 0" fails as a real assertion rather than a flaky one. Open `http://127.0.0.1:8777/src/dev/thumbs.html`.
+
+`src/dev/viewer.html` builds a `viewer.html` from sample state and checks the inlining, which is the part that goes wrong once and silently in someone's folder. A caption is arbitrary text from TikTok, and the fixture's caption carries the three sequences that break a naive generator: `</script>`, which ends the element it sits in; `$&`, which `String.replace` reads out of a *replacement*; and U+2028, a line terminator to a JavaScript parser but not to JSON. The result is rendered into a `blob:` iframe, whose origin is opaque like a `file://` document's. Open `http://127.0.0.1:8777/src/dev/viewer.html`.
 
 `src/dev/selftest.html` answers what a stubbed API can't, by running inside the loaded extension: whether a credentialed fetch from `moz-extension://` carries TikTok's cookies, whether a root-level `archive.json` lands where it was asked to, whether `conflictAction: 'overwrite'` really overwrites instead of uniquifying to `probe(1).txt`, whether `downloads.search` returns paths in the shape `refresh()` parses, and whether the `world: "MAIN"` hook actually installed. Build with `python tools/build.py firefox --dev`, then open the archive page and replace `src/archive/archive.html` in the URL with `src/dev/selftest.html`. It writes only into `<Downloads>/ttarchive-selftest/`, saves and restores the stored folder setting around the run, and has a button to delete everything it wrote.
 

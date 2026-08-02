@@ -1,0 +1,292 @@
+/*
+ * Styles for the generated viewer.html.
+ *
+ * Inlined into that file by src/archive/standalone.js, so it can't @import and
+ * can't reference a font or image by URL — everything here has to stand alone
+ * next to a folder of media and nothing else.
+ *
+ * Kept visually in step with archive.css by hand. They are deliberately not the
+ * same file: this one has no sync panel, and archive.css has no bridge banner.
+ */
+
+:root {
+	--bg: #1b1c1f;
+	--bg-2: #232529;
+	--bg-3: #2b2e33;
+	--fg: #e6e7ea;
+	--fg-dim: #9aa0a8;
+	--line: #383c43;
+	--accent: #4cc2ff;
+	--danger: #ff6b6b;
+	--ok: #63d68a;
+	--radius: 10px;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	background: var(--bg);
+	color: var(--fg);
+	font: 14px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+}
+
+code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+	background: var(--bg-3);
+	border-radius: 4px;
+	padding: 1px 5px;
+}
+
+.hidden {
+	display: none !important;
+}
+.muted {
+	color: var(--fg-dim);
+}
+.grow {
+	flex: 1;
+}
+.center {
+	text-align: center;
+	padding: 16px;
+}
+
+/* ------------------------------------------------------------------ chrome */
+
+.topbar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 16px;
+	padding: 12px 20px;
+	background: var(--bg-2);
+	border-bottom: 1px solid var(--line);
+	position: sticky;
+	top: 0;
+	z-index: 20;
+}
+
+.topbar h1 {
+	font-size: 17px;
+	margin: 0;
+	font-weight: 600;
+}
+
+.topbar .sub {
+	color: var(--fg-dim);
+	font-size: 12px;
+}
+
+main {
+	padding: 20px;
+	max-width: 1400px;
+	margin: 0 auto;
+}
+
+/* ----------------------------------------------------------------- widgets */
+
+.btn {
+	background: var(--bg-3);
+	color: var(--fg);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	padding: 7px 14px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.btn:hover:not(:disabled) {
+	border-color: var(--accent);
+}
+.btn:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+.btn.primary {
+	background: var(--accent);
+	color: #04263a;
+	border-color: transparent;
+	font-weight: 600;
+}
+
+input,
+select {
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	color: var(--fg);
+	padding: 7px 10px;
+	font-size: 13px;
+}
+input:focus,
+select:focus {
+	outline: none;
+	border-color: var(--accent);
+}
+
+.row {
+	display: flex;
+	gap: 12px;
+	align-items: center;
+	flex-wrap: wrap;
+	margin-bottom: 14px;
+}
+
+/* ------------------------------------------------------------------ banner */
+
+.banner {
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-left: 3px solid var(--accent);
+	border-radius: var(--radius);
+	padding: 12px 14px;
+	margin-bottom: 16px;
+	font-size: 13px;
+}
+.banner.live {
+	border-left-color: var(--ok);
+}
+.banner.warn {
+	border-left-color: var(--danger);
+}
+.banner p {
+	margin: 0 0 10px;
+}
+.banner p:last-child {
+	margin-bottom: 0;
+}
+.banner ol {
+	margin: 0 0 10px;
+	padding-left: 20px;
+}
+.banner .row {
+	margin-bottom: 0;
+}
+.banner .url {
+	flex: 1;
+	min-width: 240px;
+	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+	font-size: 12px;
+}
+.banner .head {
+	font-weight: 600;
+	margin-bottom: 6px;
+}
+.banner .head .dot {
+	color: var(--ok);
+}
+
+/* ----------------------------------------------------------------- library */
+
+.grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+	gap: 12px;
+}
+
+.tile {
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	overflow: hidden;
+	cursor: pointer;
+	position: relative;
+	aspect-ratio: 9 / 16;
+}
+.tile img,
+.tile video {
+	width: 100%;
+	height: 100%;
+	object-fit: cover;
+	display: block;
+	background: var(--bg-3);
+}
+.tile .badge {
+	position: absolute;
+	top: 6px;
+	left: 6px;
+	background: rgba(0, 0, 0, 0.65);
+	border-radius: 5px;
+	padding: 2px 6px;
+	font-size: 11px;
+}
+.tile .cap {
+	position: absolute;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	padding: 20px 8px 8px;
+	background: linear-gradient(transparent, rgba(0, 0, 0, 0.85));
+	font-size: 11px;
+	line-height: 1.35;
+	display: -webkit-box;
+	-webkit-line-clamp: 3;
+	-webkit-box-orient: vertical;
+	overflow: hidden;
+}
+.tile .who {
+	color: var(--accent);
+}
+.tile.missing {
+	opacity: 0.45;
+}
+
+/* ---------------------------------------------------------------- lightbox */
+
+.lightbox {
+	position: fixed;
+	inset: 0;
+	background: rgba(0, 0, 0, 0.9);
+	z-index: 50;
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 24px;
+	padding: 24px;
+}
+.lb-stage {
+	max-height: 90vh;
+	display: flex;
+	gap: 10px;
+	overflow: auto;
+	align-items: center;
+	color: var(--fg-dim);
+}
+.lb-stage video,
+.lb-stage img {
+	max-height: 88vh;
+	max-width: 60vw;
+	border-radius: var(--radius);
+}
+.lb-meta {
+	width: 340px;
+	max-height: 88vh;
+	overflow: auto;
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	padding: 16px;
+	font-size: 13px;
+}
+.lb-meta dt {
+	color: var(--fg-dim);
+	font-size: 12px;
+	margin-top: 10px;
+}
+.lb-meta dd {
+	margin: 2px 0 0;
+	word-break: break-word;
+}
+.lb-close {
+	position: absolute;
+	top: 16px;
+	right: 20px;
+	background: none;
+	border: 0;
+	color: var(--fg);
+	font-size: 22px;
+	cursor: pointer;
+}

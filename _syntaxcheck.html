@@ -29,6 +29,7 @@
 					onUpdated: { addListener: noop, removeListener: noop },
 				},
 				windows: { update: noop },
+				storage: { local: { get: () => Promise.resolve({}), set: () => Promise.resolve() } },
 				permissions: {
 					contains: () => Promise.resolve(true),
 					request: () => Promise.resolve(true),
@@ -54,7 +55,7 @@
 		<script>
 			const IDS = [
 				'folderName','pickFolder','grantFolder','noFolder','syncBody','legacyNote','username',
-				'concurrency','startSync','stopSync','rescan','bar','cSeen','cNew','cDone','cSkip',
+				'concurrency','startSync','stopSync','rescan','writeViewer','bar','cSeen','cNew','cDone','cSkip',
 				'cFail','cBytes','log','statVideos','statPhotos','statGone','statKnown','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
@@ -91,6 +92,7 @@
 				'./src/lib/state.js',
 				'./src/lib/downloader.js',
 				'./src/archive/viewer.js',
+				'./src/archive/standalone.js',
 				'./src/archive/archive.js',
 				'./src/background.js',
 			];
@@ -102,8 +104,17 @@
 					lines.push(`FAIL    ${m}\n        ${e.name}: ${e.message}`);
 				}
 			}
-			// Classic scripts (content scripts / popup) — inject and see if they parse.
-			for (const s of ['./src/content/hook.js', './src/content/collector.js', './src/popup/popup.js']) {
+// Classic scripts, plus the viewer runtime — which is never loaded as a
+			// file by anything and would otherwise only be parsed once it was already
+			// inlined into someone's archive folder.
+			const classics = [
+				'./src/content/hook.js',
+				'./src/content/collector.js',
+				'./src/content/viewer-bridge.js',
+				'./src/popup/popup.js',
+				'./src/viewer/viewer.js',
+			];
+			for (const s of classics) {
 				try {
 					const src = await (await fetch(s)).text();
 					new Function(src);

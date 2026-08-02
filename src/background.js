@@ -47,10 +47,71 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	}
 });
 
+// ----------------------------------------------------------------- from viewer
+
+/**
+ * A generated viewer.html asking the archive page for something, relayed by
+ * src/content/viewer-bridge.js.
+ *
+ * The token is issued once and kept here rather than in the page, so that a
+ * local HTML file that isn't one of ours gets nothing but 'not-recognised' no
+ * matter what meta tags it carries.
+ */
+const VIEWER_TOKEN_KEY = 'viewerToken';
+
+async function viewerToken() {
+	const stored = await ext.storage.local.get(VIEWER_TOKEN_KEY);
+	if (stored && stored[VIEWER_TOKEN_KEY]) return stored[VIEWER_TOKEN_KEY];
+	// Stable once issued: regenerating would silently orphan every viewer.html
+	// already written into a folder.
+	const token = crypto.randomUUID();
+	await ext.storage.local.set({ [VIEWER_TOKEN_KEY]: token });
+	return token;
+}
+
+let viewerReqId = 0;
+/** @type {Map<number, (payload: any) => void>} */
+const viewerWaiting = new Map();
+
+function askArchivePage(cmd, args) {
+	const port = archivePorts.values().next().value;
+	const rid = ++viewerReqId;
+	return new Promise((resolve) => {
+		viewerWaiting.set(rid, resolve);
+		port.postMessage({ type: 'viewer-request', payload: { rid, cmd, args } });
+		setTimeout(() => {
+			if (viewerWaiting.delete(rid)) resolve({ ok: false, error: 'the archive page did not answer' });
+		}, 30000);
+	});
+}
+
+async function handleViewerRequest(msg) {
+	if (!msg.token || msg.token !== (await viewerToken())) {
+		return { ok: false, error: 'not-recognised' };
+	}
+	if (msg.cmd === 'open') {
+		await openArchive();
+		return { ok: true };
+	}
+	if (!archivePorts.size) return { ok: false, error: 'no-archive-page' };
+	return askArchivePage(msg.cmd, msg.args);
+}
+
 // ---------------------------------------------------------------- from archive
 
 async function handleArchiveMessage(msg, port) {
 	const reply = (payload) => port.postMessage({ type: 'reply', id: msg.id, payload });
+
+	// An answer to a viewer request, not a request of its own — it resolves the
+	// pending sendMessage instead of getting a reply.
+	if (msg.cmd === 'viewer-response') {
+		const resolve = viewerWaiting.get(msg.rid);
+		if (resolve) {
+			viewerWaiting.delete(msg.rid);
+			resolve(msg.payload);
+		}
+		return;
+	}
 
 	try {
 		switch (msg.cmd) {
