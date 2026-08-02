@@ -195,7 +195,11 @@ Checked on 2026-08-02 by loading this extension into Edge with `--load-extension
 | Gallery photo post — `@mcslobby/photo/7666435596851711254` | all 9 images, in order, up to 1440×2148, 74–196 KB each |
 
 
-**No watermarks.** `video.playAddr` and `video.downloadAddr` are two different encodes of the same clip. Frames extracted from both show the bouncing "TikTok / @author" watermark burned into `downloadAddr` and a clean image in `playAddr`. The extension selects from `bitrateInfo` (highest bitrate first) then `playAddr`, and **never** falls back to `downloadAddr` — see the comment in `src/content/collector.js`. Photo-post images carry no watermark at any resolution.
+**No watermarks.** `video.playAddr` and `video.downloadAddr` are two different encodes of the same clip. Frames extracted from both show the bouncing "TikTok / @author" watermark burned into `downloadAddr` and a clean image in `playAddr`. The extension selects from `bitrateInfo` (highest resolution first, bitrate breaking ties) then `playAddr`, and **never** falls back to `downloadAddr` — see the comment in `src/content/collector.js`. Photo-post images carry no watermark at any resolution.
+
+**Highest resolution, not highest bitrate.** Ranking the `bitrateInfo` gears by bitrate — what this did until 2026-08-02 — picks the h264 540/720 rung over the h265 1080 one whenever HEVC's efficiency puts the latter lower in bits per second. Read off a live feed, 16 of 29 videos had a higher-resolution gear than the bitrate winner, and TikTok's own `MVMAF` scores rate the swap far worse: for `7665751835969326368`, `normal_540_0` (576×1024, 802 kbps) scores 81.98 VMAF against the original where `adapt_lowest_1080_1` (1080×1920, 676 kbps) scores 94.29. Selection now sorts on `PlayAddr.Width × Height` first. The practical cost is that most files land as h265/hvc1 rather than h264 — fine in Chromium and in the Library viewer, but older players and Firefox before 134 may not decode them.
+
+**Photo `urlList` entries are mirrors, not sizes.** Each image's `urlList` holds the same `~tplv-photomode-image.jpeg` asset on two CDN hosts (`p16-…`, `p19-…`), with no resize suffix, so taking the first one that answers cannot silently downgrade an image. Covers are never fetched at all.
 
 Two things this testing established that shape the code:
 

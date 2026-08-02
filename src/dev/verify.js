@@ -85,7 +85,12 @@ async function post(name, body) {
 			if (!m) throw new Error('no SSR blob in page html');
 			const it = JSON.parse(m[1]).__DEFAULT_SCOPE__['webapp.video-detail'].itemInfo.itemStruct;
 			const v = it.video;
-			const br = (v.bitrateInfo || []).slice().sort((a, b) => (b.Bitrate || 0) - (a.Bitrate || 0));
+			// Same ranking as videoUrls() in src/content/collector.js: resolution
+			// first, bitrate only as a tiebreak.
+			const px = (g) => (g.PlayAddr?.Width || 0) * (g.PlayAddr?.Height || 0);
+			const br = (v.bitrateInfo || [])
+				.slice()
+				.sort((a, b) => px(b) - px(a) || (b.Bitrate || 0) - (a.Bitrate || 0));
 			const cands = [];
 			for (const b of br) for (const u of b.PlayAddr?.UrlList || []) cands.push(u);
 			if (v.playAddr) cands.push(v.playAddr);

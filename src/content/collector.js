@@ -31,7 +31,19 @@
 	// ---------------------------------------------------------------- normalize
 
 	/**
-	 * Sort bitrateInfo high→low and flatten every candidate URL we could try.
+	 * Rank the bitrateInfo gears best-first and flatten every candidate URL.
+	 *
+	 * Resolution decides, bitrate only breaks ties. Sorting on bitrate alone —
+	 * which this used to do — hands the win to the h264 540/720 rung whenever
+	 * HEVC's efficiency puts the 1080 rung below it in bits per second, and that
+	 * is the common case: of 29 videos read off a live feed, 16 had a
+	 * higher-resolution gear than the bitrate winner. TikTok scores the swap
+	 * itself in each gear's `MVMAF` field — for 7665751835969326368,
+	 * normal_540_0 (576×1024, 802 kbps) is 81.98 VMAF against the original while
+	 * adapt_lowest_1080_1 (1080×1920, 676 kbps) is 94.29.
+	 *
+	 * Payloads that predate `PlayAddr.Width` fall back to the old bitrate order,
+	 * since every gear then scores zero pixels.
 	 *
 	 * `downloadAddr` is deliberately excluded. Verified against
 	 * tiktok.com/@soupy_cos/video/7669190146864074006: playAddr and downloadAddr
@@ -41,10 +53,11 @@
 	 */
 	function videoUrls(v) {
 		const urls = [];
-		const bitrates = Array.isArray(v.bitrateInfo) ? v.bitrateInfo.slice() : [];
-		bitrates.sort((a, b) => (b.Bitrate || 0) - (a.Bitrate || 0));
-		for (const b of bitrates) {
-			const list = b.PlayAddr?.UrlList || [];
+		const gears = Array.isArray(v.bitrateInfo) ? v.bitrateInfo.slice() : [];
+		const pixels = (g) => (g.PlayAddr?.Width || 0) * (g.PlayAddr?.Height || 0);
+		gears.sort((a, b) => pixels(b) - pixels(a) || (b.Bitrate || 0) - (a.Bitrate || 0));
+		for (const g of gears) {
+			const list = g.PlayAddr?.UrlList || [];
 			for (const u of list) urls.push(u);
 		}
 		if (v.playAddr) urls.push(v.playAddr);
@@ -106,7 +119,7 @@
 
 	function toBackground(type, payload) {
 		try {
-			chrome.runtime.sendMessage({ type, payload }).catch(() => {});
+			ext.runtime.sendMessage({ type, payload }).catch(() => {});
 		} catch (_) {
 			/* extension context invalidated (reload); harmless */
 		}
@@ -544,7 +557,7 @@
 
 	// ---------------------------------------------------------------- commands
 
-	chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+	ext.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 		if (!msg || !msg.cmd) return;
 		if (msg.cmd === 'ping') {
 			sendResponse({
