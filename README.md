@@ -37,7 +37,8 @@ Each completed sync also rewrites `viewer.html` in the folder — the same Libra
 ```
 <your folder>/
   videos/<videoId>.mp4       one file per video
-  images/<postId>/01.jpg     one folder per photo post, images in order
+  images/<postId>.jpg        a single-image post
+  images/<postId>_01.jpg     a gallery, one file per image, numbered in order
   archive.json               every liked item, downloaded or not
   viewer.html                the Library, as a file you can double-click
 ```

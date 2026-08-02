@@ -55,7 +55,9 @@
 		<script type="module">
 			import { buildViewerHTML } from '../archive/standalone.js';
 
-			const NASTY = 'ends a script: </script> — replacement token: $& $1 — markup: <b>x</b> — sep:\u2028end';
+			// `<\/script>` rather than the literal: this file has the same problem it
+			// is testing for, and an unescaped one here ends *this* element.
+			const NASTY = 'ends a script: <\/script> — replacement token: $& $1 — markup: <b>x</b> — sep:\u2028end';
 
 			const STATE = {
 				items: {
@@ -78,7 +80,7 @@
 						stats: { diggCount: 5, playCount: 6 },
 						photoCount: 2,
 						status: 'saved',
-						files: { photos: ['images/222/01.jpg', 'images/222/02.jpg'] },
+						files: { photos: ['images/222_01.jpg', 'images/222_02.jpg'] },
 					},
 					333: {
 						id: '333',

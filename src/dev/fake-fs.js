@@ -10,7 +10,7 @@
  * quietly testing a folder shape that no longer exists.
  */
 
-export { LAYOUT } from '../lib/fs.js?real';
+export { LAYOUT, photoName, photoOwner } from '../lib/fs.js?real';
 
 /** rel path -> Blob */
 const files = new Map();

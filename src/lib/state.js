@@ -15,7 +15,7 @@
  * by hand. `tools/script.py` writes the same shape.
  */
 
-import { LAYOUT, listFiles, listDirs, readTextFile, writeFile, refresh } from './fs.js';
+import { LAYOUT, listFiles, photoOwner, readTextFile, writeFile, refresh } from './fs.js';
 
 const STATE_FILE = 'archive.json';
 const STATE_VERSION = 2;
@@ -44,7 +44,7 @@ export function emptyState() {
 
 export const disk = {
 	videos: new Set(), // id
-	photoDirs: new Map(), // id -> file count
+	photos: new Map(), // id -> sorted file names, images/ being flat
 };
 
 export async function scanDisk() {
@@ -54,13 +54,17 @@ export async function scanDisk() {
 	disk.videos = new Set(
 		[...(await listFiles(LAYOUT.videos))].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4))
 	);
-	disk.photoDirs = new Map();
-	for (const id of await listDirs(LAYOUT.images)) {
-		disk.photoDirs.set(id, (await listFiles([...LAYOUT.images, id])).size);
+	disk.photos = new Map();
+	for (const name of [...(await listFiles(LAYOUT.images))].sort()) {
+		const id = photoOwner(name);
+		if (!id) continue;
+		const names = disk.photos.get(id);
+		if (names) names.push(name);
+		else disk.photos.set(id, [name]);
 	}
 	return {
 		videos: disk.videos.size,
-		photoSets: disk.photoDirs.size,
+		photoSets: disk.photos.size,
 	};
 }
 
@@ -68,7 +72,7 @@ export function hasVideo(id) {
 	return disk.videos.has(id);
 }
 export function hasPhotos(id, expected) {
-	const n = disk.photoDirs.get(id);
+	const n = disk.photos.get(id)?.length;
 	if (n == null) return false;
 	return expected ? n >= expected : n > 0;
 }
@@ -198,7 +202,7 @@ export function markGone(state, seenIds) {
 	let gone = 0;
 	for (const item of Object.values(state.items)) {
 		if (seenIds.has(item.id)) continue;
-		if (item.status === STATUS.saved || disk.videos.has(item.id) || disk.photoDirs.has(item.id)) continue;
+		if (item.status === STATUS.saved || disk.videos.has(item.id) || disk.photos.has(item.id)) continue;
 		if (item.status === STATUS.gone) continue;
 		item.status = STATUS.gone;
 		item.goneAt = Date.now();

@@ -29,8 +29,9 @@
 			const HISTORY = [
 				{ id: 1, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\111.mp4', fileSize: 900 },
 				{ id: 2, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\222.mp4', fileSize: 800 },
-				{ id: 3, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333\\01.jpg', fileSize: 60 },
-				{ id: 4, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333\\02.jpg', fileSize: 60 },
+				{ id: 3, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333_01.jpg', fileSize: 60 },
+				{ id: 4, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333_02.jpg', fileSize: 60 },
+				{ id: 9, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\444.jpg', fileSize: 60 },
 				{ id: 5, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\archive.json', fileSize: 40 },
 				{ id: 6, state: 'complete', exists: false, filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\999.mp4' },
 				{ id: 7, state: 'interrupted', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\888.mp4' },
@@ -84,9 +85,14 @@
 
 			// ---- listing, from download history alone -------------------------
 			check('videos on disk', await fs.listFiles(fs.LAYOUT.videos), new Set(['111.mp4', '222.mp4']));
-			check('photo post dirs', await fs.listDirs(fs.LAYOUT.images), new Set(['333']));
-			check('images in a photo post', await fs.listFiles([...fs.LAYOUT.images, '333']), new Set(['01.jpg', '02.jpg']));
-			check('listFiles does not descend', await fs.listFiles(fs.LAYOUT.images), new Set([]));
+			check(
+				'images sit flat in images/',
+				await fs.listFiles(fs.LAYOUT.images),
+				new Set(['333_01.jpg', '333_02.jpg', '444.jpg'])
+			);
+			check('photo owner from a gallery name', fs.photoOwner('333_02.jpg'), '333');
+			check('photo owner from a lone image', fs.photoOwner('444.jpg'), '444');
+			check('a foreign name has no owner', fs.photoOwner('cover.jpg'), null);
 			check('a deleted file is not listed', (await fs.listFiles(fs.LAYOUT.videos)).has('999.mp4'), false);
 			check('an unrelated download is ignored', (await fs.listFiles(fs.LAYOUT.root)).has('holiday.zip'), false);
 			check('archive.json sits at the root', await fs.listFiles(fs.LAYOUT.root), new Set(['archive.json']));

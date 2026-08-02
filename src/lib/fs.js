@@ -29,6 +29,26 @@ export const LAYOUT = {
 	root: [],
 };
 
+/**
+ * Photo posts live directly in images/, one file per image — no directory per
+ * post. A single-image post is `<id>.jpg`; a gallery gets a position suffix,
+ * `<id>_01.jpg`, `<id>_02.jpg`, … so its parts sort together and stay together
+ * when the folder is dragged somewhere else.
+ */
+export function photoName(id, index, total, ext) {
+	const at = total > 1 ? `_${String(index).padStart(2, '0')}` : '';
+	return `${id}${at}.${ext}`;
+}
+
+// Ids are numeric, so the suffix can be told from the id without guesswork.
+const PHOTO_FILE = /^(\d+)(?:_\d+)?\.[a-z0-9]{2,5}$/i;
+
+/** The post a file in images/ belongs to, or null if the name isn't ours. */
+export function photoOwner(name) {
+	const m = PHOTO_FILE.exec(name);
+	return m ? m[1] : null;
+}
+
 const backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
 
 export function supported() {
@@ -48,7 +68,7 @@ export const capabilities = backend
 	? backend.capabilities
 	: { pick: null, readBack: false, liveListing: false };
 
-function require() {
+function must() {
 	if (!backend) throw new Error('No storage backend available in this browser');
 	return backend;
 }
@@ -61,7 +81,7 @@ export function rootName() {
 
 /** Must be called from a user gesture. `opts.name` is used by the downloads backend. */
 export function pickFolder(opts) {
-	return require().pick(opts);
+	return must().pick(opts);
 }
 
 /** Returns { state: 'granted' | 'prompt' | 'denied' | 'none', label } without prompting. */
@@ -72,11 +92,11 @@ export function restoreFolder() {
 
 /** Must be called from a user gesture. */
 export function requestAccess() {
-	return require().requestAccess();
+	return must().requestAccess();
 }
 
 export function forgetFolder() {
-	return require().forget();
+	return must().forget();
 }
 
 /**
@@ -88,7 +108,7 @@ export function canScanFolder() {
 }
 
 export function scanFolder(files) {
-	return require().adoptSnapshot(files);
+	return must().adoptSnapshot(files);
 }
 
 export function hasReadableFiles() {
@@ -106,11 +126,11 @@ export async function refresh() {
 
 /** Names of every file directly inside a directory. Empty set if it doesn't exist. */
 export function listFiles(parts) {
-	return require().listFiles(parts);
+	return must().listFiles(parts);
 }
 
 export function listDirs(parts) {
-	return require().listDirs(parts);
+	return must().listDirs(parts);
 }
 
 /**
@@ -120,7 +140,7 @@ export function listDirs(parts) {
  * is write-only from here.
  */
 export function writeFile(parts, name, blob, opts) {
-	return require().writeFile(parts, name, blob, opts);
+	return must().writeFile(parts, name, blob, opts);
 }
 
 export function readTextFile(parts, name) {

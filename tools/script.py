@@ -3,8 +3,13 @@
 Convert a myfaveTT archive (or an older ttarchive one) to the flat layout.
 
     <folder>/videos/<id>.mp4
-    <folder>/images/<postId>/01.jpg
+    <folder>/images/<postId>.jpg          a single-image post
+    <folder>/images/<postId>_01.jpg       a gallery, numbered in order
     <folder>/archive.json
+
+Photo posts used to get a directory each; they don't any more. An archive
+written by an earlier version is migrated in place by the same run, so this is
+also the way to flatten `images/<postId>/01.jpg` that's already downloaded.
 
 Drop this file into the archive folder and run it:
 
@@ -53,6 +58,39 @@ B64_IN_JS = re.compile(r'=\s*"([A-Za-z0-9+/=]+)"')
 VIDEO_EXTS = {".mp4", ".webm", ".mov"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".avif", ".gif"}
 
+# `<postId>.jpg` or `<postId>_01.jpg`. Ids are numeric, so the position suffix
+# can be told from the id itself rather than guessed at.
+PHOTO_FILE = re.compile(r"^(\d+)(?:_\d+)?$")
+
+
+def photo_name(post_id: str, index: int, total: int, ext: str) -> str:
+    """One image of a photo post, in the flat layout. `index` is 1-based."""
+    at = f"_{index:02d}" if total > 1 else ""
+    return f"{post_id}{at}{ext}"
+
+
+def photo_owner(path: Path) -> str | None:
+    """The post an images/ file belongs to, or None if the name isn't ours."""
+    if path.suffix.lower() not in IMAGE_EXTS:
+        return None
+    match = PHOTO_FILE.match(path.stem)
+    return match.group(1) if match else None
+
+
+def flatten_post(post: Path, dest: Path):
+    """
+    (source, destination) for every image in one `images/<postId>/` directory.
+
+    The order on disk is the order of the post — myfaveTT and older versions of
+    this project both wrote `01.jpg`, `02.jpg`, … — so position after sorting is
+    what the number should carry over, not whatever the old stem happened to be.
+    """
+    images = sorted(f for f in post.iterdir() if f.is_file() and f.suffix.lower() in IMAGE_EXTS)
+    return [
+        (src, dest / photo_name(post.name, i, len(images), src.suffix.lower()))
+        for i, src in enumerate(images, start=1)
+    ]
+
 
 # --------------------------------------------------------------- reading input
 
@@ -93,11 +131,14 @@ def plan_media(root: Path):
     Work out every file that has to move, as (source, destination) pairs.
 
     Sources are myfaveTT's `data/Likes/videos` and this project's older
-    `data/Likes/photos`. Anything already sitting in the new location is left
-    alone, so the script is safe to re-run and safe to interrupt.
+    `data/Likes/photos`, plus any `images/<postId>/` directory left by a version
+    of this extension that nested photo posts. Anything already sitting in the
+    new location is left alone, so the script is safe to re-run and safe to
+    interrupt.
     """
     moves: list[tuple[Path, Path]] = []
     likes = root / "data" / "Likes"
+    images = root / "images"
 
     videos = likes / "videos"
     if videos.is_dir():
@@ -105,15 +146,17 @@ def plan_media(root: Path):
             if src.is_file() and src.suffix.lower() in VIDEO_EXTS:
                 moves.append((src, root / "videos" / src.name))
 
-    # Photo posts are a directory per post; keep the per-post directory intact.
+    # A directory per photo post, from either source, becomes flat files here.
     photos = likes / "photos"
     if photos.is_dir():
         for post in sorted(photos.iterdir()):
-            if not post.is_dir():
-                continue
-            for src in sorted(post.iterdir()):
-                if src.is_file() and src.suffix.lower() in IMAGE_EXTS:
-                    moves.append((src, root / "images" / post.name / src.name))
+            if post.is_dir():
+                moves += flatten_post(post, images)
+
+    if images.is_dir():
+        for post in sorted(images.iterdir()):
+            if post.is_dir():
+                moves += flatten_post(post, images)
 
     return [(s, d) for s, d in moves if not d.exists()]
 
@@ -147,6 +190,14 @@ def prune_empty(root: Path) -> None:
     on a non-empty directory, which is exactly the guard wanted here: nothing
     that still holds a file can be removed by this.
     """
+    images = root / "images"
+    if images.is_dir():
+        for path in sorted(p for p in images.iterdir() if p.is_dir()):
+            try:
+                path.rmdir()
+            except OSError:
+                pass
+
     likes = root / "data" / "Likes"
     if not likes.is_dir():
         return
@@ -181,16 +232,15 @@ def scan_disk(root: Path, also: list[Path] | None = None):
 
     idir = root / "images"
     if idir.is_dir():
-        for post in idir.iterdir():
-            if post.is_dir():
-                found += [f for f in post.iterdir() if f.is_file()]
+        found += [f for f in idir.iterdir() if f.is_file()]
 
     for f in found:
-        ext = f.suffix.lower()
-        if f.parent.name == "videos" and ext in VIDEO_EXTS:
+        if f.parent.name == "videos" and f.suffix.lower() in VIDEO_EXTS:
             videos[f.stem] = f"videos/{f.name}"
-        elif f.parent.parent.name == "images" and ext in IMAGE_EXTS:
-            images.setdefault(f.parent.name, []).append(f"images/{f.parent.name}/{f.name}")
+        elif f.parent.name == "images":
+            post_id = photo_owner(f)
+            if post_id:
+                images.setdefault(post_id, []).append(f"images/{f.name}")
 
     return videos, {k: sorted(v) for k, v in images.items()}
 
@@ -283,15 +333,22 @@ def build_archive(root: Path, dbs: dict, previous: dict | None, also: list[Path]
         item.setdefault("author", {})
         item.setdefault("stats", {})
         item.setdefault("source", "myfavett")
+        prev_status = prev_items.get(item_id, {}).get("status")
         if item.get("files"):
             item["status"] = "saved"
+        elif prev_status and prev_status != "saved":
+            # Our own last run is the better witness: myfaveTT's list can be
+            # months old, and an item it never saw is not thereby gone. A stale
+            # 'saved' is the one exception — the disk above has just said
+            # otherwise, so that one is re-derived below.
+            item["status"] = prev_status
         elif official:
             item["status"] = "pending" if item_id in official else "gone"
         else:
             # Without an officialList there is nothing that can say an item has
             # disappeared, so a status already on record is the better answer
             # than re-deriving one from no evidence.
-            item["status"] = prev_items.get(item_id, {}).get("status") or "pending"
+            item["status"] = prev_status or "pending"
 
     unavailable = sorted(i for i, it in items.items() if it["status"] in ("gone", "unavailable"))
 
@@ -355,7 +412,9 @@ def main() -> int:
     dbs = {key: load_db(appdata, name) for key, name in LEGACY_DBS.items()} if appdata.is_dir() else {}
     previous = load_previous_archive(root)
 
-    if not any(dbs.values()) and previous is None and not (root / "data").is_dir():
+    moves = plan_media(root)
+
+    if not any(dbs.values()) and previous is None and not (root / "data").is_dir() and not moves:
         print("Nothing to convert here: no data/ folder, no myfaveTT databases, no archive.json.")
         print("Is this the right folder? Pass --root PATH if not.")
         return 1
@@ -370,7 +429,6 @@ def main() -> int:
     if previous:
         print(f"Found existing metadata for {len(previous.get('items') or {})} items.")
 
-    moves = plan_media(root)
     verb = "Copying" if args.copy else "Moving"
     if moves:
         print(f"{verb} {len(moves)} media file(s) into videos/ and images/ …")

@@ -15,7 +15,7 @@
  * to their metadata and the lightbox says the file isn't readable.
  */
 
-import { LAYOUT, readBlob, listFiles, hasReadableFiles } from '../lib/fs.js';
+import { LAYOUT, readBlob, hasReadableFiles } from '../lib/fs.js';
 import { disk } from '../lib/state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -47,7 +47,7 @@ function fmtCount(n) {
 }
 
 function present(item) {
-	if (item.type === 'photo') return disk.photoDirs.has(item.id);
+	if (item.type === 'photo') return disk.photos.has(item.id);
 	return disk.videos.has(item.id);
 }
 
@@ -106,7 +106,7 @@ function tile(item) {
 	if (item.type === 'photo') {
 		const b = document.createElement('span');
 		b.className = 'badge';
-		b.textContent = `🖼 ${item.photoCount || disk.photoDirs.get(item.id) || ''}`;
+		b.textContent = `🖼 ${item.photoCount || disk.photos.get(item.id)?.length || ''}`;
 		el.appendChild(b);
 	}
 
@@ -249,10 +249,9 @@ function queueDecode(fn) {
 
 /** Exported so src/dev/thumbs.html can drive it without an IntersectionObserver. */
 export async function loadThumb(id) {
-	if (disk.photoDirs.has(id)) {
-		const files = [...(await listFiles([...LAYOUT.images, id]))].sort();
-		if (files.length) return blobURL([...LAYOUT.images, id], files[0]);
-		return null;
+	const photos = disk.photos.get(id);
+	if (photos) {
+		return photos.length ? blobURL(LAYOUT.images, photos[0]) : null;
 	}
 
 	const cached = thumbs.get(id);
@@ -286,9 +285,8 @@ async function openLightbox(item) {
 	$('lightbox').classList.remove('hidden');
 
 	if (item.type === 'photo') {
-		const files = [...(await listFiles([...LAYOUT.images, item.id]))].sort();
-		for (const f of files) {
-			const url = await blobURL([...LAYOUT.images, item.id], f);
+		for (const f of disk.photos.get(item.id) || []) {
+			const url = await blobURL(LAYOUT.images, f);
 			if (!url) continue;
 			openURLs.push(url);
 			const img = document.createElement('img');

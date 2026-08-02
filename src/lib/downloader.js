@@ -11,7 +11,7 @@
  * fetching is how you end up with a pile of 403s.
  */
 
-import { LAYOUT, writeFile } from './fs.js';
+import { LAYOUT, photoName, writeFile } from './fs.js';
 import { disk, missingParts, markSaved, markUnavailable } from './state.js';
 import { Guard, Halt, classifyStatus, retryAfterMs } from './throttle.js';
 
@@ -163,14 +163,16 @@ async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 
 	if (want.includes('photos') && rec.photos?.length) {
 		const paths = [];
+		const names = [];
 		for (let i = 0; i < rec.photos.length; i++) {
 			const { blob, url } = await fetchFirst(rec.photos[i], { signal, expect: 'image', guard });
-			const name = `${String(i + 1).padStart(2, '0')}.${extFor(blob, url, 'jpg')}`;
-			await writeFile([...LAYOUT.images, rec.id], name, blob);
-			paths.push([...LAYOUT.images, rec.id, name].join('/'));
+			const name = photoName(rec.id, i + 1, rec.photos.length, extFor(blob, url, 'jpg'));
+			await writeFile(LAYOUT.images, name, blob);
+			names.push(name);
+			paths.push([...LAYOUT.images, name].join('/'));
 			onFile?.({ id: rec.id, kind: 'photo', index: i + 1, bytes: blob.size, url });
 		}
-		disk.photoDirs.set(rec.id, paths.length);
+		disk.photos.set(rec.id, names.sort());
 		files.photos = paths;
 		saved.push('photos');
 	}

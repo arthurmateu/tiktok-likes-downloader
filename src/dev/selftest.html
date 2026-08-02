@@ -261,10 +261,10 @@
 					no('Firefox rewrote the root-level path', `wanted ${FOLDER}/archive.json, got ${tail(meta.filename, 2)}`);
 				}
 
-				const nested = await put('images/7660000000000000000/01.jpg', 'img');
+				const nested = await put('images/7660000000000000000_01.jpg', 'img');
 				nested.state === 'complete'
-					? ok('a deep nested path works', tail(nested.filename, 4))
-					: no('a deep nested path failed', `${nested.state} ${nested.error || ''}`);
+					? ok('a nested media path works', tail(nested.filename, 3))
+					: no('a nested media path failed', `${nested.state} ${nested.error || ''}`);
 
 				return true;
 			}
@@ -274,15 +274,14 @@
 				const previous = await idbGet(FOLDER_KEY);
 				try {
 					await fs.pickFolder({ name: FOLDER });
-					const files = await fs.listFiles([...fs.LAYOUT.images, '7660000000000000000']);
-					files.has('01.jpg')
+					const files = await fs.listFiles(fs.LAYOUT.images);
+					files.has('7660000000000000000_01.jpg')
 						? ok('the backend reads its own writes back out of download history')
 						: no('the backend did not see a file it just wrote', `saw {${[...files].join(', ')}}`);
 
-					const dirs = await fs.listDirs(fs.LAYOUT.images);
-					dirs.has('7660000000000000000')
-						? ok('listDirs finds the photo-post directory')
-						: no('listDirs missed the photo-post directory', `saw {${[...dirs].join(', ')}}`);
+					fs.photoOwner('7660000000000000000_01.jpg') === '7660000000000000000'
+						? ok('a gallery image is traced back to its post')
+						: no('the photo-post id could not be read off the filename');
 				} finally {
 					// Never leave the self-test's folder as the real setting.
 					if (previous) await idbSet(FOLDER_KEY, previous);
