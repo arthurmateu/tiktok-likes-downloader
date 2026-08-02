@@ -1,17 +1,23 @@
 /**
- * Service worker: a relay.
+ * Background relay (a service worker on Chromium, an event page on Gecko).
  *
  * Content scripts can't talk to the archive page directly, and the archive page
- * is where the File System Access handle lives (a service worker can't call
- * showDirectoryPicker). So everything routes through here.
+ * is where the storage backend lives — neither a service worker nor an event
+ * page can call showDirectoryPicker or hold an <input> full of File objects. So
+ * everything routes through here.
+ *
+ * Deliberately import-free: Gecko event pages load this as a classic script.
  */
 
-const ARCHIVE_URL = chrome.runtime.getURL('src/archive/archive.html');
+// See src/lib/ext.js — Gecko only returns promises from `browser.*`.
+const ext = globalThis.browser ?? globalThis.chrome;
+
+const ARCHIVE_URL = ext.runtime.getURL('src/archive/archive.html');
 
 /** @type {Set<chrome.runtime.Port>} */
 const archivePorts = new Set();
 
-chrome.runtime.onConnect.addListener((port) => {
+ext.runtime.onConnect.addListener((port) => {
 	if (port.name !== 'archive') return;
 	archivePorts.add(port);
 	port.onDisconnect.addListener(() => archivePorts.delete(port));

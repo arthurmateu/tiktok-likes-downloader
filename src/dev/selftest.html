@@ -1,0 +1,394 @@
+<!doctype html>
+<!--
+	Dev-only: the Firefox checks that can only be answered by a real browser.
+
+	src/dev/backends.html unit-tests the Gecko backend against a *stubbed*
+	downloads API, which by construction can't tell us whether Firefox actually
+	honours a leading-dot directory in a download path, whether
+	conflictAction:'overwrite' really overwrites, or whether a credentialed
+	fetch from moz-extension:// carries TikTok's cookies. This page answers
+	those against the live API.
+
+	It writes only into <Downloads>/ttarchive-selftest/ and can delete
+	everything it wrote again. It never touches a real archive folder, and it
+	saves/restores the stored folder setting around the run.
+
+	Build with:  python tools/build.py firefox --dev
+	Then open the archive page and swap the path for src/dev/selftest.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>Firefox self-test</title>
+		<link rel="stylesheet" href="../archive/archive.css" />
+		<style>
+			body { padding: 20px; max-width: 1000px; margin: 0 auto; }
+			pre { white-space: pre-wrap; word-break: break-word; }
+			.pass { color: var(--ok); }
+			.fail { color: var(--danger); }
+			.info { color: var(--accent); }
+			.skip { color: var(--fg-dim); }
+			.actions { margin: 16px 0; }
+		</style>
+	</head>
+	<body>
+		<h1>Firefox self-test</h1>
+		<p class="muted">
+			Writes only into <code>&lt;Downloads&gt;/ttarchive-selftest/</code>. Nothing else on disk is
+			touched. Have a logged-in <b>tiktok.com</b> tab open before you run it, so the content-script
+			checks have something to talk to.
+		</p>
+
+		<div class="actions">
+			<button id="run" class="btn primary">Run checks</button>
+			<button id="cleanup" class="btn" disabled>Delete what this wrote</button>
+			<button id="copy" class="btn" disabled>Copy report</button>
+		</div>
+
+		<pre id="out" class="log" style="height: auto; min-height: 340px">Press “Run checks”.</pre>
+
+		<script type="module">
+			import { ext } from '../lib/ext.js';
+			import * as fs from '../lib/fs.js';
+			import { idbGet, idbSet, idbDel } from '../lib/idb.js';
+
+			const FOLDER = 'ttarchive-selftest';
+			const FOLDER_KEY = 'downloadFolder';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let pass = 0;
+			let fail = 0;
+			/** Download ids this page created, so cleanup only ever touches its own. */
+			const mine = [];
+
+			function emit(cls, tag, label, detail) {
+				lines.push({ cls, tag, label, detail });
+				render();
+			}
+			const ok = (label, detail) => (pass++, emit('pass', 'PASS', label, detail));
+			const no = (label, detail) => (fail++, emit('fail', 'FAIL', label, detail));
+			const info = (label, detail) => emit('info', 'INFO', label, detail);
+			const skip = (label, detail) => emit('skip', 'SKIP', label, detail);
+
+			function render() {
+				out.replaceChildren();
+				for (const l of lines) {
+					const span = document.createElement('span');
+					span.className = l.cls;
+					span.textContent = `${l.tag}  ${l.label}\n`;
+					out.appendChild(span);
+					if (l.detail) {
+						const d = document.createElement('span');
+						d.className = 'skip';
+						d.textContent = `      ${l.detail}\n`;
+						out.appendChild(d);
+					}
+				}
+			}
+
+			const asText = () =>
+				lines.map((l) => `${l.tag}  ${l.label}${l.detail ? `\n      ${l.detail}` : ''}`).join('\n');
+
+			// -------------------------------------------------------------- helpers
+
+			/** Resolve when a download reaches a terminal state; never rejects. */
+			function settle(id, timeout = 30000) {
+				return new Promise((resolve) => {
+					let done = false;
+					const finish = (state, error) => {
+						if (done) return;
+						done = true;
+						ext.downloads.onChanged.removeListener(onChanged);
+						clearTimeout(timer);
+						resolve({ state, error });
+					};
+					const onChanged = (d) => {
+						if (d.id === id && d.state) finish(d.state.current, d.error && d.error.current);
+					};
+					ext.downloads.onChanged.addListener(onChanged);
+					const timer = setTimeout(() => finish('timeout'), timeout);
+					ext.downloads.search({ id }).then((r) => {
+						if (r && r[0] && r[0].state !== 'in_progress') finish(r[0].state, r[0].error);
+					}, () => {});
+				});
+			}
+
+			/** Download a blob to a path under FOLDER and report where it landed. */
+			async function put(relPath, body) {
+				const url = URL.createObjectURL(new Blob([body], { type: 'text/plain' }));
+				try {
+					const id = await ext.downloads.download({
+						url,
+						filename: `${FOLDER}/${relPath}`,
+						conflictAction: 'overwrite',
+						saveAs: false,
+					});
+					mine.push(id);
+					const res = await settle(id);
+					const [row] = await ext.downloads.search({ id });
+					return { id, state: res.state, error: res.error, filename: row ? row.filename : null };
+				} finally {
+					setTimeout(() => URL.revokeObjectURL(url), 30000);
+				}
+			}
+
+			const tail = (p, n = 3) => String(p || '').replace(/\\/g, '/').split('/').slice(-n).join('/');
+
+			// ---------------------------------------------------------------- checks
+
+			async function checkEnvironment() {
+				info('user agent', navigator.userAgent);
+
+				const gecko = typeof globalThis.browser !== 'undefined';
+				gecko
+					? ok('browser.* namespace present (Gecko)')
+					: no('browser.* namespace missing', 'this page is not running in Firefox');
+
+				typeof globalThis.showDirectoryPicker === 'function'
+					? no('showDirectoryPicker exists', 'the File System Access backend would win — unexpected on Firefox')
+					: ok('no File System Access API, as expected');
+
+				fs.backendId() === 'downloads'
+					? ok('fs.js selected the downloads backend')
+					: no('fs.js selected the wrong backend', `got ${fs.backendId()}`);
+			}
+
+			async function checkPermissions() {
+				const origins = ext.runtime.getManifest().host_permissions || [];
+				const has = await ext.permissions.contains({ origins });
+				has
+					? ok(`host permissions granted (${origins.length} origins)`)
+					: no(
+							'host permissions NOT granted',
+							'about:addons → this extension → Permissions, or use the button on the archive page. Every fetch below will fail until then.'
+						);
+				return has;
+			}
+
+			/**
+			 * The headline question. Media URLs are bound to the session that
+			 * obtained them, so the extension page's fetches have to carry the same
+			 * cookies the TikTok tab has. Firefox partitions cookies harder than
+			 * Chromium, and moz-extension:// is its own origin.
+			 */
+			async function checkCredentialedFetch() {
+				let res;
+				try {
+					res = await fetch('https://www.tiktok.com/', {
+						credentials: 'include',
+						cache: 'no-store',
+					});
+				} catch (err) {
+					no('credentialed fetch to tiktok.com threw', `${err.name}: ${err.message} — this is a CORS/host-permission failure, not a cookie one`);
+					return;
+				}
+				ok(`fetch reached tiktok.com (HTTP ${res.status})`);
+
+				const html = await res.text();
+				const m = html.match(/id="__UNIVERSAL_DATA_FOR_REHYDRATION__"[^>]*>([\s\S]*?)<\/script>/);
+				if (!m) {
+					skip('could not find the page state blob', 'TikTok may have served a challenge or a different shell');
+					return;
+				}
+				let user = null;
+				try {
+					const scope = JSON.parse(m[1]).__DEFAULT_SCOPE__ || {};
+					user = (scope['webapp.app-context'] || {}).user || null;
+				} catch (_) {
+					skip('page state blob did not parse');
+					return;
+				}
+
+				// Only ever report presence and a masked handle — never the secUid.
+				if (user && (user.uid || user.secUid)) {
+					const who = user.nickName || user.uniqueId || '';
+					ok(
+						'cookies DO reach tiktok.com from the extension origin',
+						`logged in as ${who ? who.slice(0, 2) + '…' : '(handle hidden)'} — this was the main open risk for the Firefox port`
+					);
+				} else {
+					no(
+						'the extension origin is NOT logged in',
+						'cookies are being partitioned away from moz-extension://. Signed media URLs will 403 and the port needs a different fetch strategy.'
+					);
+				}
+			}
+
+			/** A CORS rejection throws; an HTTP status means the request got out. */
+			async function checkCdnReachable() {
+				try {
+					const res = await fetch('https://www.tiktok.com/favicon.ico', {
+						credentials: 'include',
+						cache: 'no-store',
+					});
+					ok(`CDN-style request is not CORS-blocked (HTTP ${res.status})`, 'host permissions are doing their job');
+				} catch (err) {
+					no('a plain tiktok.com asset was blocked', `${err.name}: ${err.message}`);
+				}
+			}
+
+			async function checkDownloads() {
+				const plain = await put('probe.txt', 'one');
+				plain.state === 'complete'
+					? ok('downloads.download writes a blob from an extension page', tail(plain.filename))
+					: no('downloads.download failed', `${plain.state} ${plain.error || ''}`);
+				if (plain.state !== 'complete') return null;
+
+				// Does search() hand back a path our refresh() parser can match?
+				const marker = `/${FOLDER}/`;
+				const norm = String(plain.filename).replace(/\\/g, '/');
+				norm.includes(marker)
+					? ok('downloads.search returns a path the backend can parse', `finds "${marker}" as expected`)
+					: no('search path is not in the expected shape', norm);
+
+				// The archive relies on rewriting a file in place; if Firefox
+				// uniquified instead, a re-sync would silently make 111(1).mp4.
+				const again = await put('probe.txt', 'two');
+				const uniquified = /\(\d+\)\.txt$/.test(String(again.filename || ''));
+				uniquified
+					? no("conflictAction:'overwrite' uniquified instead", tail(again.filename))
+					: ok("conflictAction:'overwrite' rewrites in place", tail(again.filename));
+
+				// Flagged as a real risk in downloads.js: Firefox sanitises download
+				// filenames and a leading-dot directory is the likeliest casualty.
+				const dotted = await put('data/.ttarchive/state.json', '{"version":1}');
+				if (dotted.state !== 'complete') {
+					no('a dot-directory path failed to download', `${dotted.state} ${dotted.error || ''}`);
+				} else if (tail(dotted.filename).includes('.ttarchive')) {
+					ok('a leading-dot directory survives Firefox sanitising', tail(dotted.filename));
+				} else {
+					no('Firefox rewrote the dot-directory', `wanted data/.ttarchive/state.json, got ${tail(dotted.filename)}`);
+				}
+
+				const nested = await put('data/Likes/photos/7660000000000000000/01.jpg', 'img');
+				nested.state === 'complete'
+					? ok('a deep nested path works', tail(nested.filename, 4))
+					: no('a deep nested path failed', `${nested.state} ${nested.error || ''}`);
+
+				return true;
+			}
+
+			/** End-to-end through the real backend, not the stub. */
+			async function checkBackendListing() {
+				const previous = await idbGet(FOLDER_KEY);
+				try {
+					await fs.pickFolder({ name: FOLDER });
+					const files = await fs.listFiles(['data', 'Likes', 'photos', '7660000000000000000']);
+					files.has('01.jpg')
+						? ok('the backend reads its own writes back out of download history')
+						: no('the backend did not see a file it just wrote', `saw {${[...files].join(', ')}}`);
+
+					const dirs = await fs.listDirs(['data', 'Likes', 'photos']);
+					dirs.has('7660000000000000000')
+						? ok('listDirs finds the photo-post directory')
+						: no('listDirs missed the photo-post directory', `saw {${[...dirs].join(', ')}}`);
+				} finally {
+					// Never leave the self-test's folder as the real setting.
+					if (previous) await idbSet(FOLDER_KEY, previous);
+					else await idbDel(FOLDER_KEY);
+					info('restored the stored folder setting', previous ? `back to "${previous}"` : 'cleared (there was none)');
+				}
+			}
+
+			/**
+			 * world:"MAIN" content scripts are a Firefox 128 feature and the entire
+			 * harvest depends on one. If it silently no-ops, nothing else matters.
+			 */
+			async function checkContentScripts() {
+				const port = ext.runtime.connect({ name: 'archive' });
+				const reply = await new Promise((resolve) => {
+					const timer = setTimeout(() => resolve(null), 8000);
+					port.onMessage.addListener((msg) => {
+						if (msg.type === 'reply') {
+							clearTimeout(timer);
+							resolve(msg.payload);
+						}
+					});
+					port.postMessage({ id: 1, cmd: 'find-tiktok-tab' });
+				});
+				port.disconnect();
+
+				if (!reply) {
+					no('the background relay did not answer', 'the event page may have failed to load — check about:debugging → Inspect');
+					return;
+				}
+				ok('the background event page relays messages');
+
+				const tabs = reply.tabs || [];
+				if (!tabs.length) {
+					skip('no TikTok tab open', 'open tiktok.com in another tab and re-run for the content-script checks');
+					return;
+				}
+				const live = tabs.filter((t) => t.ok);
+				live.length
+					? ok(`the ISOLATED content script answers (${live.length}/${tabs.length} tab(s))`)
+					: no('no TikTok tab answered a ping', 'collector.js did not inject');
+
+				const hooked = live.filter((t) => t.hooked);
+				if (!live.length) return;
+				hooked.length
+					? ok('the MAIN-world hook is installed', 'world:"MAIN" works on this Firefox — the harvest can see item_list responses')
+					: no('the MAIN-world hook is NOT installed', 'hook.js did not reach the page world; the harvest would collect nothing');
+			}
+
+			// ------------------------------------------------------------------ run
+
+			/** Ends the run without reporting it as a crash. */
+			class StopRun extends Error {}
+
+			document.getElementById('run').addEventListener('click', async () => {
+				lines.length = 0;
+				pass = fail = 0;
+				mine.length = 0;
+				document.getElementById('run').disabled = true;
+				render();
+
+				try {
+					await checkEnvironment();
+					if (!ext || !ext.downloads) {
+						skip('everything else', 'this page only means anything inside the Firefox build of the extension');
+						throw new StopRun();
+					}
+					const granted = await checkPermissions();
+					if (granted) {
+						await checkCredentialedFetch();
+						await checkCdnReachable();
+					} else {
+						skip('network checks', 'skipped until host permissions are granted');
+					}
+					if (await checkDownloads()) await checkBackendListing();
+					await checkContentScripts();
+				} catch (err) {
+					if (!(err instanceof StopRun)) no('the run threw', `${err.name}: ${err.message}`);
+				}
+
+				emit(fail ? 'fail' : 'pass', '', `\n${pass} passed, ${fail} failed`);
+				document.getElementById('run').disabled = false;
+				document.getElementById('cleanup').disabled = mine.length === 0;
+				document.getElementById('copy').disabled = false;
+			});
+
+			document.getElementById('cleanup').addEventListener('click', async () => {
+				let removed = 0;
+				for (const id of mine) {
+					try {
+						await ext.downloads.removeFile(id);
+						removed++;
+					} catch (_) {
+						/* already gone */
+					}
+					try {
+						await ext.downloads.erase({ id });
+					} catch (_) {}
+				}
+				info(`deleted ${removed}/${mine.length} file(s) and cleared their history`, `the empty ${FOLDER}/ folder itself has to go by hand`);
+				document.getElementById('cleanup').disabled = true;
+			});
+
+			document.getElementById('copy').addEventListener('click', () => {
+				navigator.clipboard.writeText(asText());
+			});
+		</script>
+	</body>
+</html>

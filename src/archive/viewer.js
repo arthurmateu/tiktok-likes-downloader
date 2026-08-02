@@ -1,13 +1,17 @@
 /**
  * Library browser.
  *
- * Reads media straight off the chosen folder through the same directory handle
- * the downloader uses, so it works offline and never re-hits TikTok. Covers are
- * loaded lazily and their object URLs are revoked on scroll-out — at 6k+ items
- * holding them all alive is a few GB of blob memory.
+ * Reads media straight off the chosen folder through the same storage backend
+ * the downloader writes with, so it works offline and never re-hits TikTok.
+ * Covers are loaded lazily and their object URLs are revoked on scroll-out — at
+ * 6k+ items holding them all alive is a few GB of blob memory.
+ *
+ * On a backend that can't read its own output (Gecko's downloads folder) every
+ * read simply returns null until the user scans the folder, so tiles fall back
+ * to their metadata and the lightbox says the file isn't readable.
  */
 
-import { LAYOUT, tryGetDir, listFiles } from '../lib/fs.js';
+import { LAYOUT, readBlob, listFiles, hasReadableFiles } from '../lib/fs.js';
 import { disk } from '../lib/state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -21,14 +25,15 @@ let observer = null;
 // ------------------------------------------------------------------ helpers
 
 async function blobURL(parts, name) {
-	const dir = await tryGetDir(parts);
-	if (!dir) return null;
-	try {
-		const fh = await dir.getFileHandle(name);
-		return URL.createObjectURL(await fh.getFile());
-	} catch (_) {
-		return null;
-	}
+	const blob = await readBlob(parts, name);
+	return blob ? URL.createObjectURL(blob) : null;
+}
+
+/** Shown in place of the media when the backend can't read the folder back. */
+function unreadableNote() {
+	return hasReadableFiles()
+		? 'Not downloaded yet.'
+		: "Downloaded, but Firefox can't read it back until you use “Scan an existing folder…” on the Sync tab.";
 }
 
 function fmtCount(n) {
@@ -179,7 +184,7 @@ async function openLightbox(item) {
 			img.src = url;
 			stage.appendChild(img);
 		}
-		if (!files.length) stage.textContent = 'Not downloaded yet.';
+		if (!stage.childElementCount) stage.textContent = unreadableNote();
 	} else {
 		const url = await blobURL(LAYOUT.videos, `${item.id}.mp4`);
 		if (url) {
@@ -191,7 +196,7 @@ async function openLightbox(item) {
 			v.loop = true;
 			stage.appendChild(v);
 		} else {
-			stage.textContent = 'Not downloaded yet.';
+			stage.textContent = unreadableNote();
 		}
 	}
 

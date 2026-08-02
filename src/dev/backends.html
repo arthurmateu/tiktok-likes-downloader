@@ -1,0 +1,150 @@
+<!doctype html>
+<!--
+	Dev-only: exercises the downloads backend against a faked download history
+	and a faked directory pick. Everything the archive's skip-detection depends
+	on lives in this file's path arithmetic, and none of it is observable from
+	the syntax harness.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/backends.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>backend tests</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+		</style>
+	</head>
+	<body>
+		<h1>downloads backend</h1>
+		<pre id="out">running…</pre>
+
+		<script>
+			// Fake download history: Windows separators on purpose, plus rows that
+			// must be ignored — a deleted file, an interrupted one, and an unrelated
+			// download that happens to live elsewhere.
+			const HISTORY = [
+				{ id: 1, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\111.mp4', fileSize: 900 },
+				{ id: 2, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\222.mp4', fileSize: 800 },
+				{ id: 3, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\covers\\111.jpg', fileSize: 70 },
+				{ id: 4, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\photos\\333\\01.jpg', fileSize: 60 },
+				{ id: 5, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\photos\\333\\02.jpg', fileSize: 60 },
+				{ id: 6, state: 'complete', exists: false, filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\999.mp4' },
+				{ id: 7, state: 'interrupted', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\888.mp4' },
+				{ id: 8, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\holiday.zip', fileSize: 10 },
+			];
+
+			const started = [];
+			const noop = () => {};
+			window.browser = {
+				runtime: { getManifest: () => ({}), getURL: (p) => p },
+				downloads: {
+					search: ({ id } = {}) =>
+						Promise.resolve(
+							id != null
+								? [{ id, state: 'complete' }]
+								: HISTORY
+						),
+					download: (opts) => {
+						started.push(opts);
+						return Promise.resolve(100 + started.length);
+					},
+					onChanged: { addListener: noop, removeListener: noop },
+				},
+			};
+			delete window.showDirectoryPicker;
+		</script>
+
+		<script type="module">
+			import * as dl from '../lib/backends/downloads.js';
+			import * as fs from '../lib/fs.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let failures = 0;
+
+			const show = (v) => (v instanceof Set ? `{${[...v].sort().join(', ')}}` : JSON.stringify(v));
+
+			function check(label, actual, expected) {
+				const ok = show(actual) === show(expected);
+				if (!ok) failures++;
+				lines.push(
+					`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(ok ? '' : `\n        expected ${show(expected)}\n        got      ${show(actual)}`)
+				);
+			}
+
+			check('fs picks the downloads backend', fs.backendId(), 'downloads');
+
+			await fs.pickFolder({ name: 'TikTok likes' });
+			check('folder name is kept as given', fs.rootName(), 'TikTok likes');
+
+			// ---- listing, from download history alone -------------------------
+			check('videos on disk', await fs.listFiles(fs.LAYOUT.videos), new Set(['111.mp4', '222.mp4']));
+			check('covers on disk', await fs.listFiles(fs.LAYOUT.covers), new Set(['111.jpg']));
+			check('photo post dirs', await fs.listDirs(fs.LAYOUT.photos), new Set(['333']));
+			check('images in a photo post', await fs.listFiles([...fs.LAYOUT.photos, '333']), new Set(['01.jpg', '02.jpg']));
+			check('listFiles does not descend', await fs.listFiles(['data', 'Likes']), new Set([]));
+			check('a deleted file is not listed', (await fs.listFiles(fs.LAYOUT.videos)).has('999.mp4'), false);
+			check('an unrelated download is ignored', await fs.listFiles([]), new Set([]));
+
+			// ---- writing ------------------------------------------------------
+			await fs.writeFile(fs.LAYOUT.videos, '444.mp4', new Blob(['x'], { type: 'video/mp4' }));
+			const last = started[started.length - 1];
+			check('write target path', last.filename, 'TikTok likes/data/Likes/videos/444.mp4');
+			check('write overwrites rather than uniquifying', last.conflictAction, 'overwrite');
+			check('write does not prompt', last.saveAs, false);
+			check('a written file joins the listing', (await fs.listFiles(fs.LAYOUT.videos)).has('444.mp4'), true);
+
+			// ---- metadata mirror ----------------------------------------------
+			await fs.writeFile(fs.LAYOUT.appdata, 'state.json', new Blob(['{"version":1}']), { text: true });
+			check('state.json reads back without a folder scan', await fs.readTextFile(fs.LAYOUT.appdata, 'state.json'), '{"version":1}');
+
+			// ---- the folder scan ------------------------------------------------
+			check('nothing is readable before a scan', await fs.readBlob(fs.LAYOUT.videos, '111.mp4'), null);
+			check('hasReadableFiles is false before a scan', fs.hasReadableFiles(), false);
+
+			const fake = (path, body) => {
+				const f = new File([body], path.split('/').pop());
+				Object.defineProperty(f, 'webkitRelativePath', { value: path });
+				return f;
+			};
+			// The first segment is the folder the user picked and is stripped; note
+			// it deliberately differs from the download folder name.
+			const info = fs.scanFolder([
+				fake('My TikToks/data/Likes/videos/555.mp4', 'v'),
+				fake('My TikToks/data/.appdata/db_likes.js', 'legacy'),
+			]);
+			check('scan reports the folder it read', info, { name: 'My TikToks', files: 2 });
+			check('scanned files join the listing', (await fs.listFiles(fs.LAYOUT.videos)).has('555.mp4'), true);
+			check('history and scan are unioned', (await fs.listFiles(fs.LAYOUT.videos)).has('111.mp4'), true);
+			check('scanned files are readable', (await fs.readBlob(fs.LAYOUT.videos, '555.mp4'))?.size, 1);
+			check('a myfaveTT db is readable', await fs.readTextFile(fs.LAYOUT.legacy, 'db_likes.js'), 'legacy');
+			check('hasReadableFiles is true after a scan', fs.hasReadableFiles(), true);
+			check('the label names both folders', fs.rootName(), 'TikTok likes (reading My TikToks)');
+
+			// ---- name sanitising ------------------------------------------------
+			// Asserted on the path that reaches the browser, not on the label:
+			// this is the value the download API would act on.
+			async function targetFor(name) {
+				await dl.pick({ name });
+				await dl.writeFile(['probe'], 'p.txt', new Blob(['p']));
+				return started[started.length - 1].filename;
+			}
+			check('separators and traversal are neutralised', await targetFor('  ../Bad:Name?  '), '_Bad_Name_/probe/p.txt');
+			check('an empty name falls back to the default', await targetFor('   '), `${dl.DEFAULT_FOLDER}/probe/p.txt`);
+			check('a plain name survives untouched', await targetFor('TikTok likes'), 'TikTok likes/probe/p.txt');
+
+			lines.push(
+				failures
+					? `\n<span class="fail">${failures} failing</span>`
+					: `\n<span class="pass">all ${lines.length} passing</span>`
+			);
+			out.innerHTML = lines.join('\n');
+			console.log(`BACKENDTEST ${failures} failing`);
+		</script>
+	</body>
+</html>

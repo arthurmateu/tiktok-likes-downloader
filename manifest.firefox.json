@@ -1,0 +1,60 @@
+{
+	"manifest_version": 3,
+	"name": "TikTok Likes Archiver",
+	"version": "1.0.0",
+	"description": "Archive your liked TikToks — videos and photo posts — into a folder you choose. No limits, no purchases.",
+	"_comment_min_version": "Firefox 128 is the first release with content_scripts world:MAIN and declarativeNetRequest modifyHeaders, both of which this extension needs.",
+	"browser_specific_settings": {
+		"gecko": {
+			"id": "tiktok-likes-archiver@ttarchive",
+			"strict_min_version": "128.0"
+		}
+	},
+	"permissions": ["storage", "unlimitedStorage", "tabs", "scripting", "downloads", "declarativeNetRequest"],
+	"host_permissions": [
+		"*://*.tiktok.com/*",
+		"*://*.tiktokcdn.com/*",
+		"*://*.tiktokcdn-us.com/*",
+		"*://*.tiktokcdn-eu.com/*",
+		"*://*.tiktokcdn.us/*",
+		"*://*.tiktokv.com/*",
+		"*://*.tiktokv.us/*",
+		"*://*.ttwstatic.com/*",
+		"*://*.byteoversea.com/*",
+		"*://*.ibytedtos.com/*",
+		"*://*.muscdn.com/*",
+		"*://*.isnssdk.com/*"
+	],
+	"background": {
+		"scripts": ["src/background.js"]
+	},
+	"action": {
+		"default_title": "TikTok Likes Archiver",
+		"default_popup": "src/popup/popup.html"
+	},
+	"content_scripts": [
+		{
+			"matches": ["*://*.tiktok.com/*"],
+			"js": ["src/content/hook.js"],
+			"run_at": "document_start",
+			"world": "MAIN",
+			"all_frames": false
+		},
+		{
+			"matches": ["*://*.tiktok.com/*"],
+			"js": ["src/content/collector.js"],
+			"run_at": "document_start",
+			"world": "ISOLATED",
+			"all_frames": false
+		}
+	],
+	"declarative_net_request": {
+		"rule_resources": [
+			{
+				"id": "cdn_referer",
+				"enabled": true,
+				"path": "rules/dnr.json"
+			}
+		]
+	}
+}

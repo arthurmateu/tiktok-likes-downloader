@@ -1,15 +1,18 @@
 /**
- * File System Access helpers.
+ * Storage façade.
  *
- * Everything is relative to a single root directory handle that the user picks
- * (and can re-pick at any time, like myfaveTT does). The handle is persisted in
- * IndexedDB so a reload doesn't force another picker, but Chromium still
- * requires a user gesture to re-grant read/write on a new session.
+ * The archive needs four things from a filesystem: list a directory, write a
+ * blob, read a file back, and remember where "here" is between sessions.
+ * Chromium gives all four through File System Access; Gecko gives none of them
+ * and has to be assembled out of the downloads API and a folder the user hands
+ * over. Both are behind this one interface, so state.js, downloader.js,
+ * legacy.js and viewer.js never learn which browser they're on.
+ *
+ * The backend is chosen by feature detection, not by user agent.
  */
 
-import { idbGet, idbSet, idbDel } from './idb.js';
-
-const HANDLE_KEY = 'rootHandle';
+import * as fsa from './backends/fsa.js';
+import * as downloads from './backends/downloads.js';
 
 /** Folder layout inside the archive root. Mirrors myfaveTT so files collide by design. */
 export const LAYOUT = {
@@ -20,140 +23,111 @@ export const LAYOUT = {
 	legacy: ['data', '.appdata'],
 };
 
-let root = null;
-
-export function currentRoot() {
-	return root;
-}
-
-export function rootName() {
-	return root ? root.name : null;
-}
+const backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
 
 export function supported() {
-	return typeof window !== 'undefined' && typeof window.showDirectoryPicker === 'function';
+	return backend !== null;
 }
 
-/** Must be called from a user gesture. */
-export async function pickFolder() {
-	const handle = await window.showDirectoryPicker({
-		id: 'ttarchive-root',
-		mode: 'readwrite',
-		startIn: 'videos',
-	});
-	root = handle;
-	await idbSet(HANDLE_KEY, handle);
-	return handle;
-}
-
-/** Returns 'granted' | 'prompt' | 'denied' | 'none' without prompting. */
-export async function restoreFolder() {
-	const handle = await idbGet(HANDLE_KEY);
-	if (!handle) return { state: 'none', handle: null };
-	const state = await handle.queryPermission({ mode: 'readwrite' });
-	if (state === 'granted') root = handle;
-	return { state, handle };
-}
-
-/** Must be called from a user gesture. */
-export async function requestAccess() {
-	const handle = await idbGet(HANDLE_KEY);
-	if (!handle) return 'none';
-	const state = await handle.requestPermission({ mode: 'readwrite' });
-	if (state === 'granted') root = handle;
-	return state;
-}
-
-export async function forgetFolder() {
-	root = null;
-	await idbDel(HANDLE_KEY);
-}
-
-function requireRoot() {
-	if (!root) throw new Error('No archive folder selected');
-	return root;
-}
-
-/** @param {string[]} parts */
-export async function getDir(parts, { create = false } = {}) {
-	let dir = requireRoot();
-	for (const part of parts) {
-		dir = await dir.getDirectoryHandle(part, { create });
-	}
-	return dir;
-}
-
-export async function tryGetDir(parts) {
-	try {
-		return await getDir(parts, { create: false });
-	} catch (_) {
-		return null;
-	}
-}
-
-/** Names of every file directly inside a directory. Empty set if it doesn't exist. */
-export async function listFiles(parts) {
-	const names = new Set();
-	const dir = await tryGetDir(parts);
-	if (!dir) return names;
-	for await (const [name, handle] of dir.entries()) {
-		if (handle.kind === 'file') names.add(name);
-	}
-	return names;
-}
-
-export async function listDirs(parts) {
-	const names = new Set();
-	const dir = await tryGetDir(parts);
-	if (!dir) return names;
-	for await (const [name, handle] of dir.entries()) {
-		if (handle.kind === 'directory') names.add(name);
-	}
-	return names;
+export function backendId() {
+	return backend ? backend.id : null;
 }
 
 /**
- * Writes a blob, creating parent directories as needed.
- * Retries because writing thousands of files into a cloud-synced folder
- * (OneDrive, iCloud) intermittently fails — myfaveTT's own troubleshooting page
- * calls this out.
+ * `pick`: 'directory' (any folder) | 'name' (a folder under Downloads) | null
+ * `readBack`: true (always) | 'snapshot' (only after a folder scan) | false
+ * `liveListing`: whether a listing reflects outside changes without a refresh
  */
-export async function writeFile(parts, name, blob, { retries = 2 } = {}) {
-	let lastErr;
-	for (let attempt = 0; attempt <= retries; attempt++) {
-		try {
-			const dir = await getDir(parts, { create: true });
-			const fh = await dir.getFileHandle(name, { create: true });
-			const w = await fh.createWritable();
-			await w.write(blob);
-			await w.close();
-			return true;
-		} catch (err) {
-			lastErr = err;
-			await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
-		}
-	}
-	throw lastErr;
+export const capabilities = backend
+	? backend.capabilities
+	: { pick: null, readBack: false, liveListing: false };
+
+function require() {
+	if (!backend) throw new Error('No storage backend available in this browser');
+	return backend;
 }
 
-export async function readTextFile(parts, name) {
-	const dir = await tryGetDir(parts);
-	if (!dir) return null;
-	try {
-		const fh = await dir.getFileHandle(name);
-		return await (await fh.getFile()).text();
-	} catch (_) {
-		return null;
-	}
+// ------------------------------------------------------------------ the root
+
+export function rootName() {
+	return backend ? backend.rootLabel() : null;
 }
 
-export async function fileSize(parts, name) {
-	const dir = await tryGetDir(parts);
-	if (!dir) return null;
-	try {
-		const fh = await dir.getFileHandle(name);
-		return (await fh.getFile()).size;
-	} catch (_) {
-		return null;
-	}
+/** Must be called from a user gesture. `opts.name` is used by the downloads backend. */
+export function pickFolder(opts) {
+	return require().pick(opts);
+}
+
+/** Returns { state: 'granted' | 'prompt' | 'denied' | 'none', label } without prompting. */
+export function restoreFolder() {
+	if (!backend) return Promise.resolve({ state: 'none', label: null });
+	return backend.restore();
+}
+
+/** Must be called from a user gesture. */
+export function requestAccess() {
+	return require().requestAccess();
+}
+
+export function forgetFolder() {
+	return require().forget();
+}
+
+/**
+ * Hand the backend a folder the user picked with `<input webkitdirectory>`.
+ * Only the downloads backend needs it — File System Access already has one.
+ */
+export function canScanFolder() {
+	return !!backend && typeof backend.adoptSnapshot === 'function';
+}
+
+export function scanFolder(files) {
+	return require().adoptSnapshot(files);
+}
+
+export function hasReadableFiles() {
+	if (!backend) return false;
+	if (backend.capabilities.readBack === true) return true;
+	return typeof backend.hasSnapshot === 'function' && backend.hasSnapshot();
+}
+
+/** Re-read the directory listing. A no-op where listings are already live. */
+export async function refresh() {
+	if (backend && typeof backend.refresh === 'function') await backend.refresh();
+}
+
+// -------------------------------------------------------------------- files
+
+/** Names of every file directly inside a directory. Empty set if it doesn't exist. */
+export function listFiles(parts) {
+	return require().listFiles(parts);
+}
+
+export function listDirs(parts) {
+	return require().listDirs(parts);
+}
+
+/**
+ * Write a blob, creating parent directories as needed.
+ * Pass `text: true` for metadata that has to be readable on the next run —
+ * the downloads backend mirrors those into IndexedDB, since a download folder
+ * is write-only from here.
+ */
+export function writeFile(parts, name, blob, opts) {
+	return require().writeFile(parts, name, blob, opts);
+}
+
+export function readTextFile(parts, name) {
+	if (!backend) return Promise.resolve(null);
+	return backend.readText(parts, name);
+}
+
+export function readBlob(parts, name) {
+	if (!backend) return Promise.resolve(null);
+	return backend.readBlob(parts, name);
+}
+
+export function fileSize(parts, name) {
+	if (!backend) return Promise.resolve(null);
+	return backend.fileSize(parts, name);
 }

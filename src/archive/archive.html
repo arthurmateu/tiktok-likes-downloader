@@ -25,10 +25,45 @@
 		<main>
 			<!-- ------------------------------------------------------- sync -->
 			<section id="panel-sync" class="panel active">
+				<div id="hostAccess" class="notice warn hidden">
+					<p>
+						This extension can't reach TikTok's servers yet. Firefox treats a manifest's host
+						permissions as optional, so they have to be granted before any download will work.
+					</p>
+					<button id="grantHost" class="btn primary">Grant access to TikTok</button>
+				</div>
+
 				<div id="noFolder" class="notice">
 					Pick the folder you want to archive into. If it's an existing myfaveTT folder, its
 					<code>data/Likes</code> contents are detected automatically and nothing gets
 					re-downloaded.
+				</div>
+
+				<!-- Only shown on the downloads backend (Firefox): no folder picker exists. -->
+				<div id="dlSetup" class="notice hidden">
+					<p>
+						Firefox has no File System Access API, so files are written through the downloads
+						API. That can only write <em>inside</em> your browser's download folder — name a
+						subfolder for it here, and change the download folder itself in
+						<code>about:preferences</code> if you want the archive somewhere else.
+					</p>
+					<div class="row">
+						<label class="field grow">
+							<span>Subfolder of your download folder</span>
+							<input id="dlFolderName" type="text" value="TikTok likes" spellcheck="false" />
+						</label>
+						<button id="dlFolderSave" class="btn primary">Use this folder</button>
+					</div>
+				</div>
+
+				<div id="scanRow" class="row hidden">
+					<button id="scanFolder" class="btn">Scan an existing folder…</button>
+					<span class="muted grow">
+						Optional, and re-runnable. Lets Firefox see what's already on disk, import a
+						myfaveTT archive, and play files back in the Library — none of which it can do
+						from a download folder alone.
+					</span>
+					<input id="scanInput" type="file" webkitdirectory directory multiple class="hidden" />
 				</div>
 
 				<div id="syncBody" class="hidden">
@@ -121,6 +156,27 @@
     .ttarchive/
       state.json                  our metadata (plain JSON)
     .appdata/                     myfaveTT's files — read only, never modified</pre>
+
+				<h2>On Firefox</h2>
+				<p>
+					Firefox has no File System Access API, so this build writes through the downloads API
+					instead. Three things follow from that:
+				</p>
+				<ul>
+					<li>
+						The archive root has to sit inside your browser's download folder. Move the download
+						folder in <code>about:preferences</code> to move the archive.
+					</li>
+					<li>
+						Every file shows up in the download panel, and the list of what's already saved comes
+						from your download history. Clearing that history doesn't lose anything — the next
+						sync just re-downloads over the top of the files that are already there.
+					</li>
+					<li>
+						Firefox can't read a folder it wasn't handed, so <b>Scan an existing folder…</b> is
+						what makes the Library play back off disk and what imports a myfaveTT archive.
+					</li>
+				</ul>
 
 				<h2>Limits</h2>
 				<ul>

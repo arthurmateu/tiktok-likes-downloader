@@ -7,6 +7,9 @@
 (() => {
 	'use strict';
 
+	// See src/lib/ext.js — Gecko only returns promises from `browser.*`.
+	const ext = globalThis.browser ?? globalThis.chrome;
+
 	const state = {
 		hooked: false,
 		profileUser: null,

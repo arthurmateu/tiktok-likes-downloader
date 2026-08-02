@@ -1,10 +1,11 @@
 /**
  * Archive page controller.
  *
- * This page owns the folder handle and therefore owns all disk I/O and all
+ * This page owns the storage backend and therefore owns all disk I/O and all
  * media fetching. The content script only supplies normalized records.
  */
 
+import { ext } from '../lib/ext.js';
 import * as fs from '../lib/fs.js';
 import {
 	loadState,
@@ -32,7 +33,7 @@ const app = {
 
 // ---------------------------------------------------------------- background
 
-const port = chrome.runtime.connect({ name: 'archive' });
+const port = ext.runtime.connect({ name: 'archive' });
 let msgId = 0;
 const waiting = new Map();
 
@@ -126,7 +127,14 @@ function renderStats(counts) {
 
 $('pickFolder').addEventListener('click', async () => {
 	if (!fs.supported()) {
-		alert('This browser has no File System Access API. Use Edge or Chrome 111+.');
+		alert('This browser can neither pick a folder nor write through the downloads API.');
+		return;
+	}
+	// The downloads backend has no picker to open — it takes a folder name.
+	if (fs.capabilities.pick === 'name') {
+		$('dlSetup').classList.remove('hidden');
+		$('dlFolderName').focus();
+		$('dlFolderName').select();
 		return;
 	}
 	try {
@@ -137,10 +145,36 @@ $('pickFolder').addEventListener('click', async () => {
 	}
 });
 
+$('dlFolderSave').addEventListener('click', async () => {
+	try {
+		await fs.pickFolder({ name: $('dlFolderName').value });
+		$('dlSetup').classList.add('hidden');
+		log(`Writing into “${fs.rootName()}” under your browser's download folder.`);
+		await afterFolderReady();
+	} catch (err) {
+		log(`Could not set the folder: ${err.message || err}`, 'err');
+	}
+});
+
 $('grantFolder').addEventListener('click', async () => {
 	const state = await fs.requestAccess();
 	if (state === 'granted') await afterFolderReady();
 	else log('Access was not granted.', 'err');
+});
+
+// A directory handed over here is read-only; it's the only way a browser
+// without File System Access can see an existing archive at all.
+$('scanFolder').addEventListener('click', () => $('scanInput').click());
+
+$('scanInput').addEventListener('change', async (ev) => {
+	const files = ev.target.files;
+	ev.target.value = '';
+	if (!files || !files.length) return;
+
+	const info = fs.scanFolder(files);
+	log(`Read ${info.files.toLocaleString()} files from “${info.name}”.`, 'ok');
+	if (fs.rootName()) await afterFolderReady();
+	else log('Now set a folder name above so new downloads have somewhere to go.');
 });
 
 $('rescan').addEventListener('click', async () => {
@@ -277,21 +311,58 @@ for (const tab of document.querySelectorAll('.tab')) {
 
 // ---------------------------------------------------------------- boot
 
+/**
+ * Firefox's MV3 host permissions are optional by default: they sit in the
+ * manifest ungranted until the user says yes, and every media fetch is a CORS
+ * failure until they do. On Chromium `contains` is already true and this is a
+ * no-op.
+ */
+async function checkHostAccess() {
+	const origins = ext.runtime.getManifest().host_permissions || [];
+	if (!origins.length || !ext.permissions) return;
+
+	try {
+		if (await ext.permissions.contains({ origins })) return;
+	} catch (_) {
+		return;
+	}
+
+	$('hostAccess').classList.remove('hidden');
+	$('grantHost').addEventListener('click', async () => {
+		const granted = await ext.permissions.request({ origins });
+		if (granted) {
+			$('hostAccess').classList.add('hidden');
+			log('Access granted.', 'ok');
+		} else {
+			log('Access refused — every download will fail until it is granted.', 'err');
+		}
+	});
+}
+
 (async function boot() {
 	wireLibrary(() => app.state);
 
 	if (!fs.supported()) {
 		$('noFolder').textContent =
-			'This browser does not support the File System Access API. Load the extension in Edge or Chrome 111+.';
+			'This browser has neither the File System Access API nor a usable downloads API, so there is nowhere to write. Use Firefox 128+, Edge, or Chrome 111+.';
 		return;
 	}
 
-	const { state, handle } = await fs.restoreFolder();
+	await checkHostAccess();
+
+	const byName = fs.capabilities.pick === 'name';
+	if (byName) $('pickFolder').textContent = 'Set folder…';
+	if (fs.canScanFolder()) $('scanRow').classList.remove('hidden');
+
+	const { state, label } = await fs.restoreFolder();
 	if (state === 'granted') {
 		await afterFolderReady();
-	} else if (handle) {
-		$('folderName').textContent = `${handle.name} (access needs re-granting)`;
+	} else if (label) {
+		$('folderName').textContent = `${label} (access needs re-granting)`;
 		$('grantFolder').classList.remove('hidden');
+	} else if (byName) {
+		$('noFolder').classList.add('hidden');
+		$('dlSetup').classList.remove('hidden');
 	}
 })();
 

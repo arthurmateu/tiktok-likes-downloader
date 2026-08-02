@@ -17,6 +17,7 @@
 					onMessage: { addListener: noop },
 					onConnect: { addListener: noop },
 					onInstalled: { addListener: noop },
+					getManifest: () => ({ host_permissions: ['*://*.tiktok.com/*'] }),
 					getURL: (p) => p,
 				},
 				tabs: {
@@ -28,7 +29,23 @@
 					onUpdated: { addListener: noop, removeListener: noop },
 				},
 				windows: { update: noop },
+				permissions: {
+					contains: () => Promise.resolve(true),
+					request: () => Promise.resolve(true),
+				},
+				downloads: {
+					download: () => Promise.resolve(1),
+					search: () => Promise.resolve([]),
+					onChanged: { addListener: noop, removeListener: noop },
+				},
 			};
+
+			// `?gecko` selects the downloads backend instead of File System Access,
+			// so the Firefox path gets evaluated rather than just parsed.
+			if (new URLSearchParams(location.search).has('gecko')) {
+				delete window.showDirectoryPicker;
+				window.browser = window.chrome;
+			}
 		</script>
 
 		<!-- The archive page's own DOM, so archive.js/viewer.js can bind to it. -->
@@ -40,10 +57,12 @@
 				'concurrency','startSync','stopSync','rescan','bar','cSeen','cNew','cDone','cSkip',
 				'cFail','cBytes','log','statVideos','statPhotos','statCovers','statKnown','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta',
+				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
 			];
+			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
-				const tag = ['search','username','concurrency'].includes(id) ? 'input'
+				const tag = INPUTS.includes(id) ? 'input'
 					: ['sort','kind'].includes(id) ? 'select' : 'div';
 				const el = document.createElement(tag);
 				el.id = id;
@@ -65,6 +84,9 @@
 			const lines = [];
 			const mods = [
 				'./src/lib/idb.js',
+				'./src/lib/ext.js',
+				'./src/lib/backends/fsa.js',
+				'./src/lib/backends/downloads.js',
 				'./src/lib/fs.js',
 				'./src/lib/legacy.js',
 				'./src/lib/state.js',
@@ -91,6 +113,13 @@
 					lines.push(`FAIL    ${s}\n        ${e.name}: ${e.message}`);
 				}
 			}
+			try {
+				const fs = await import('./src/lib/fs.js');
+				lines.push(`\nbackend ${fs.backendId()}  ${JSON.stringify(fs.capabilities)}`);
+			} catch (_) {
+				lines.push('\nbackend —  (fs.js did not load)');
+			}
+
 			out.textContent = lines.join('\n');
 			console.log('SYNTAXCHECK\n' + lines.join('\n'));
 		</script>

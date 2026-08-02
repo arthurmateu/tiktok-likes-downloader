@@ -9,7 +9,7 @@
  * State is plain JSON so it stays greppable and repairable by hand.
  */
 
-import { LAYOUT, listFiles, listDirs, readTextFile, writeFile } from './fs.js';
+import { LAYOUT, listFiles, listDirs, readTextFile, writeFile, refresh } from './fs.js';
 import { importLegacy } from './legacy.js';
 
 const STATE_FILE = 'state.json';
@@ -35,6 +35,9 @@ export const disk = {
 };
 
 export async function scanDisk() {
+	// Backends whose listing isn't live (Gecko's, which reads download history)
+	// need telling that now is the time to look again.
+	await refresh();
 	disk.videos = new Set(
 		[...(await listFiles(LAYOUT.videos))].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4))
 	);
@@ -96,7 +99,12 @@ export async function loadState() {
 
 /** Pull metadata out of a sibling myfaveTT archive, once, without touching it. */
 export async function mergeLegacy(state) {
-	if (state.legacy && state.legacy.imported) return { merged: 0, skipped: true };
+	// Retried whenever a previous attempt found nothing: on Gecko the myfaveTT
+	// DBs only become readable once the user has scanned the folder, which may
+	// well happen after the first load. Six misses cost nothing.
+	if (state.legacy && state.legacy.imported && state.legacy.found) {
+		return { merged: 0, skipped: true, found: true, counts: state.legacy.counts };
+	}
 	const legacy = await importLegacy();
 	if (!legacy) {
 		state.legacy = { imported: true, found: false };
@@ -144,7 +152,9 @@ export function saveState(state, { immediate = false } = {}) {
 
 async function flush(state) {
 	const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
-	await writeFile(LAYOUT.appdata, STATE_FILE, blob);
+	// `text: true` marks this as metadata that has to survive into the next
+	// session even on a backend that can't read its own output folder.
+	await writeFile(LAYOUT.appdata, STATE_FILE, blob, { text: true });
 }
 
 // ---------------------------------------------------------------- mutations

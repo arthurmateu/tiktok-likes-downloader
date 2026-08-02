@@ -159,6 +159,18 @@ main {
 	font-size: 13px;
 	color: var(--fg-dim);
 }
+.notice.warn {
+	border-left-color: var(--danger);
+}
+.notice p {
+	margin: 0 0 10px;
+}
+.notice p:last-child {
+	margin-bottom: 0;
+}
+.notice .row:last-child {
+	margin-bottom: 0;
+}
 
 .cards {
 	display: grid;
