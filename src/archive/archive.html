@@ -137,13 +137,19 @@
 				<ol>
 					<li>Pick any folder. Everything is written straight into it — see below.</li>
 					<li>
-						Press <b>Sync likes</b>. A TikTok tab opens on your profile, switches to the Liked tab and
-						scrolls itself. The extension reads the list responses the page makes — it does not forge
-						its own API requests, so there's nothing to break when TikTok rotates its request signing.
+						Press <b>Sync likes</b>. A TikTok tab opens on your profile in the background and pages
+						through the Liked tab from there — carry on browsing, it doesn't need to be in front. It
+						may borrow the foreground for a second or two to open the Liked tab, then gives it back.
 					</li>
 					<li>
-						Media downloads run at the same time as the scroll, because TikTok's media URLs are signed
-						and expire.
+						The first request is always TikTok's own, signed by its own code; the rest are that same
+						request replayed with the next cursor. If TikTok refuses the replay the log says so and the
+						run falls back to scrolling the tab, which does need it visible — slower, but there is
+						nothing in it for a signing change to break.
+					</li>
+					<li>
+						Media downloads run at the same time as the list is read, because TikTok's media URLs are
+						signed and expire.
 					</li>
 				</ol>
 

@@ -1,0 +1,272 @@
+<!doctype html>
+<!--
+	Dev-only: drives hook.js + collector.js against a fake item_list endpoint.
+
+	Background paging can't be exercised without a logged-in TikTok session, and
+	the parts most likely to break quietly — replaying the captured URL with the
+	next cursor, refreshing msToken, and falling back to the scroll harvest when
+	TikTok refuses the replay — are exactly the parts that produce no visible
+	error when they go wrong. So they get a fake endpoint instead.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/paging.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>paging tests</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+			#stage { opacity: 0.35; margin-bottom: 16px; }
+		</style>
+	</head>
+	<body>
+		<h1>background paging</h1>
+
+		<!-- Stands in for the profile page: the tab the collector clicks, and the
+		     grid whose items it counts while scrolling. -->
+		<div id="stage">
+			<button data-e2e="liked-tab">Liked</button>
+			<div id="grid"></div>
+		</div>
+
+		<pre id="out">running…</pre>
+
+		<script>
+			// ---- fake item_list endpoint --------------------------------------
+			const API = 'https://www.tiktok.com/api/favorite/item_list/';
+			// What each cursor leads to. 'end' is the last page.
+			const NEXT = { '0': 'c1', c1: 'c2', c2: 'end' };
+
+			const server = {
+				/** 'ok' — replays are honoured. 'reject' — only the page's own requests are. */
+				mode: 'ok',
+				/** Every request the endpoint saw, in order, and who made it. */
+				calls: [],
+				/**
+				 * Set for the one call the page is about to make itself. A replay is
+				 * built from the URL of the request it follows, so it inherits every
+				 * query parameter — there is nothing in the URL that can tell the two
+				 * apart, and the caller has to say.
+				 */
+				expectPage: false,
+			};
+
+			function itemsFor(cursor) {
+				return ['a', 'b', 'c'].map((n) => ({
+					id: `${cursor}-${n}`,
+					desc: `item ${cursor}${n}`,
+					createTime: 1700000000,
+					author: { id: '1', uniqueId: 'me', nickname: 'Me', avatarThumb: 'https://cdn/av.jpg' },
+					stats: { diggCount: 1, playCount: 2, commentCount: 3, shareCount: 4, collectCount: 5 },
+					music: { id: '9', title: 'song', authorName: 'someone' },
+					video: { playAddr: `https://cdn/${cursor}${n}.mp4`, duration: 10, width: 720, height: 1280, cover: 'https://cdn/c.jpg' },
+				}));
+			}
+
+			const realFetch = window.fetch.bind(window);
+			window.fetch = async (input, init) => {
+				const url = typeof input === 'string' ? input : input.url;
+				if (!url.startsWith(API)) return realFetch(input, init);
+
+				const fromPage = server.expectPage;
+				server.expectPage = false;
+				server.calls.push({ url, fromPage });
+				const u = new URL(url);
+				const cursor = u.searchParams.get('cursor') || '0';
+
+				// A signature TikTok won't accept comes back as a well-formed 200
+				// with nothing in it — the failure this whole fallback exists for.
+				const body =
+					server.mode === 'reject' && !fromPage
+						? { statusCode: 0, itemList: [], hasMore: true, cursor }
+						: {
+								statusCode: 0,
+								itemList: itemsFor(cursor),
+								hasMore: NEXT[cursor] !== 'end',
+								cursor: NEXT[cursor] === 'end' ? cursor : NEXT[cursor],
+							};
+
+				return new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			};
+
+			// ---- the page's own requests ---------------------------------------
+			// TikTok's code, in miniature: one request when the Liked tab is opened,
+			// one more per scroll to the bottom.
+			const page = { cursor: '0', requests: 0 };
+
+			async function pageRequest() {
+				page.requests++;
+				const url = `${API}?count=3&cursor=${page.cursor}&msToken=stale&X-Bogus=seed`;
+				server.expectPage = true;
+				const res = await window.fetch(url);
+				const json = await res.json();
+				page.cursor = json.cursor;
+				for (const it of json.itemList) {
+					const el = document.createElement('div');
+					el.dataset.e2e = 'user-liked-item';
+					el.textContent = it.id;
+					document.getElementById('grid').appendChild(el);
+				}
+			}
+
+			document.querySelector('[data-e2e="liked-tab"]').addEventListener('click', pageRequest);
+			window.addEventListener('scroll', pageRequest);
+
+			// The collector scrolls a page that isn't tall enough to scroll, and a
+			// real scroll would fire our listener a second time.
+			const scrolls = { count: 0 };
+			window.scrollTo = () => scrolls.count++;
+			window.scrollBy = () => scrolls.count++;
+
+			// ---- extension API --------------------------------------------------
+			const messages = [];
+			const listeners = [];
+			window.browser = {
+				runtime: {
+					sendMessage: (msg) => {
+						if (msg.type !== 'sleep') messages.push(msg);
+						// The worker's clock, shortened so the test isn't paced by the
+						// real inter-page delay. It stays a *timer*: answering on a
+						// microtask would let the collector spin without ever handing
+						// the event loop back, which is not how the real one behaves.
+						if (msg.type === 'sleep') {
+							return new Promise((r) => setTimeout(() => r({ ok: true }), Math.min(msg.ms, 5)));
+						}
+						return Promise.resolve({ ok: true });
+					},
+					onMessage: { addListener: (fn) => listeners.push(fn) },
+				},
+			};
+
+			// The seed URL carries msToken=stale; every replay should pick this up
+			// instead, the way the page rotates it per request.
+			document.cookie = 'msToken=fresh';
+
+			// Present on TikTok's own page, so the replay path that re-signs gets
+			// covered rather than only the one that hopes the old signature holds.
+			window.byted_acrawler = {
+				sign: ({ url }) => ({ 'X-Bogus': `signed-${new URL(url).searchParams.get('cursor')}` }),
+			};
+		</script>
+
+		<script src="../content/hook.js"></script>
+		<script src="../content/collector.js"></script>
+
+		<script type="module">
+			const out = document.getElementById('out');
+			const lines = [];
+			let failures = 0;
+
+			// Without this a thrown assertion just leaves the page saying "running…"
+			// forever, which reads exactly like the collector having hung.
+			const die = (what) => {
+				out.textContent = `${what}\n\ngot as far as:\n${lines.join('\n').replace(/<[^>]+>/g, '')}`;
+			};
+			window.addEventListener('error', (e) => die(`ERROR  ${e.message}`));
+			window.addEventListener('unhandledrejection', (e) => die(`UNHANDLED  ${e.reason}`));
+
+			const show = (v) => (v instanceof Set ? `{${[...v].sort().join(', ')}}` : JSON.stringify(v));
+
+			function check(label, actual, expected) {
+				const ok = show(actual) === show(expected);
+				if (!ok) failures++;
+				lines.push(
+					`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(ok ? '' : `\n        expected ${show(expected)}\n        got      ${show(actual)}`)
+				);
+			}
+
+			const statuses = () => messages.filter((m) => m.type === 'status').map((m) => m.payload);
+			const collected = () => {
+				const ids = new Set();
+				for (const m of messages) {
+					if (m.type !== 'items') continue;
+					for (const it of m.payload.items) ids.add(it.id);
+				}
+				return ids;
+			};
+			/** Replays only, in the order the endpoint saw them. */
+			const replays = () => server.calls.filter((c) => !c.fromPage).map((c) => new URL(c.url));
+
+			async function run(opts) {
+				const before = messages.length;
+				for (const fn of listeners) fn({ cmd: 'harvest', opts }, {}, () => {});
+				const deadline = Date.now() + 15000;
+				while (Date.now() < deadline) {
+					const last = messages.slice(before).filter((m) => m.type === 'status').pop();
+					if (last && (last.payload.done || last.payload.fatal)) return last.payload;
+					await new Promise((r) => setTimeout(r, 50));
+				}
+				return { msg: 'the run never finished', timedOut: true };
+			}
+
+			function reset(mode) {
+				server.mode = mode;
+				server.calls.length = 0;
+				server.expectPage = false;
+				messages.length = 0;
+				page.cursor = '0';
+				page.requests = 0;
+				scrolls.count = 0;
+				document.getElementById('grid').replaceChildren();
+			}
+
+			// ---- the list is paged, not scrolled --------------------------------
+			reset('ok');
+			const okRun = await run({ which: 'likes' });
+
+			check('the run reaches the end of the list', okRun.done, true);
+			check('every item is collected', collected(), new Set([
+				'0-a', '0-b', '0-c', 'c1-a', 'c1-b', 'c1-c', 'c2-a', 'c2-b', 'c2-c',
+			]));
+			check('the page is only asked once, to seed', page.requests, 1);
+			check('the rest is replayed by cursor', replays().map((u) => u.searchParams.get('cursor')), ['c1', 'c2']);
+			check('nothing is scrolled', scrolls.count, 0);
+			check(
+				'each replay carries the current msToken, not the seed one',
+				replays().map((u) => u.searchParams.get('msToken')),
+				['fresh', 'fresh']
+			);
+			check(
+				'each replay is re-signed for its own cursor',
+				replays().map((u) => u.searchParams.get('X-Bogus')),
+				['signed-c1', 'signed-c2']
+			);
+			check('the count from the seed request is kept', replays()[0]?.searchParams.get('count'), '3');
+
+			// ---- a refused replay falls back to scrolling -------------------------
+			reset('reject');
+			const rejectRun = await run({ which: 'likes' });
+
+			check('the fallback run still finishes', rejectRun.done, true);
+			check('the refusal is reported', statuses().some((s) => /falling back to scrolling/i.test(s.msg)), true);
+			check('it gives up after one refused page', replays().length, 1);
+			check('the page is scrolled instead', scrolls.count > 0, true);
+			check('the list still arrives, via the page', collected().size > 0, true);
+			check('and it is the same list', collected(), new Set([
+				'0-a', '0-b', '0-c', 'c1-a', 'c1-b', 'c1-c', 'c2-a', 'c2-b', 'c2-c',
+			]));
+
+			// ---- an earlier run leaves nothing behind -----------------------------
+			// A second sync in the same tab used to inherit the first run's seen-ids,
+			// which the archive page reads as "no longer in your likes".
+			reset('ok');
+			await run({ which: 'likes' });
+			check('a repeat run reports the whole list again, not just changes', collected().size, 9);
+
+			lines.push(
+				failures
+					? `\n<span class="fail">${failures} failing</span>`
+					: `\n<span class="pass">all ${lines.length} passing</span>`
+			);
+			out.innerHTML = lines.join('\n');
+			console.log(`PAGINGTEST ${failures} failing`);
+		</script>
+	</body>
+</html>

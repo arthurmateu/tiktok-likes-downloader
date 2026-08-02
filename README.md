@@ -23,8 +23,10 @@ Either way: pin the extension, click it, **Open archive**.
 1. On the archive page, click **Choose folder…** and pick your archive folder. Chromium asks for read/write permission once per browser session. On Firefox the button instead asks for a *name*, and the archive lands in that subfolder of your browser's download folder — see [Firefox](#firefox) for why.
 2. If it's an existing myfaveTT folder, convert it first — see below. The page says so if it spots one.
 3. Enter your TikTok username and press **Sync likes**.
-4. A TikTok tab opens on your profile, switches to the **Liked** tab, and scrolls itself. **Leave that tab open and visible** — browsers throttle timers in background tabs and the scroll stalls.
-5. Downloads run while the scroll is still going. Watch the counters and log.
+4. A TikTok tab opens on your profile in the background and pages through the **Liked** tab from there. Leave it open, but you don't have to look at it — carry on browsing. It may come to the front for a second or two to open the Liked tab, then hands the foreground back.
+5. Downloads run while the list is still being read. Watch the counters and log.
+
+If TikTok rejects the paged requests, the log says so and the run falls back to scrolling the tab — that older path does need the tab visible, and it says so too.
 
 Run it again any time. Anything already on disk is skipped.
 
@@ -123,17 +125,25 @@ Every file also appears in Firefox's download panel. There's no API to suppress 
 
 TikTok's `/api/favorite/item_list/` requires `X-Bogus` / `_signature` / `msToken`, computed by an obfuscated bundle that rotates regularly. Reimplementing that signer means breaking every few weeks.
 
-Instead, `src/content/hook.js` runs in the page's MAIN world and wraps `fetch` and `XMLHttpRequest`. TikTok's own code makes its own correctly-signed paginated requests as you scroll; we read the responses. `src/content/collector.js` drives the scroll to force the pagination and normalizes each item.
+Instead, `src/content/hook.js` runs in the page's MAIN world and wraps `fetch` and `XMLHttpRequest`. TikTok's own code makes its own correctly-signed request; we read the response and keep the URL that produced it.
 
-The trade-off is honest: it's as fast as TikTok's own infinite scroll (~30 items per request) and not faster. In exchange there's nothing to break when the signing changes, and the traffic is indistinguishable from you scrolling your own likes.
+From there a sync pages the list one of two ways:
+
+**Background paging (default).** `hook.js` replays that captured URL with the next `cursor` and a fresh `msToken`, using the page's own `fetch` so cookies, `Origin` and `Referer` are whatever TikTok expects. Nothing is scrolled, so the tab can sit in the background and you keep your browser. If the bundle still exposes its signer (`window.byted_acrawler`) the replay is re-signed; if it doesn't, the plain replay is tried anyway and the response decides.
+
+**Scrolling (fallback).** The original path: scroll the page and let TikTok's own code request the next page. Slower, and it needs the tab visible — a hidden tab's rendering is suspended, so the scroll never triggers anything. Used automatically whenever paging is refused, since that's a signing change and this path has nothing to break.
+
+Both feed the same normalizer, so nothing downstream knows which one ran. A run that falls back partway just re-walks the list from the top; already-downloaded items are skipped on disk.
+
+One detail worth knowing if you touch this: Chrome clamps a hidden tab's timers to 1/s, and to 1/min once it has been hidden a while, which would throttle the paging loop to a crawl. The delay between pages is therefore taken from the service worker's clock (`{type: 'sleep'}` in `src/background.js`), which isn't clamped, raced against the local timer in case the worker has been shut down.
 
 ## Architecture
 
 | File | Role |
 | --- | --- |
-| `src/content/hook.js` | MAIN world. Wraps `fetch`/XHR, forwards `item_list` responses over `postMessage`. |
-| `src/content/collector.js` | ISOLATED world. Drives auto-scroll, normalizes items, relays to the service worker. |
-| `src/background.js` | Relay between content scripts and the archive page; manages the TikTok tab. Service worker on Chromium, event page on Gecko, so it stays import-free. |
+| `src/content/hook.js` | MAIN world. Wraps `fetch`/XHR, forwards `item_list` responses over `postMessage`, and replays the captured request by cursor on demand. |
+| `src/content/collector.js` | ISOLATED world. Pages the list (background paging, else auto-scroll), normalizes items, relays to the service worker. |
+| `src/background.js` | Relay between content scripts and the archive page; manages the TikTok tab, lends the foreground when a step needs it, and serves the collector's unthrottled clock. Service worker on Chromium, event page on Gecko, so it stays import-free. |
 | `src/archive/archive.js` | Owns the storage backend, the sync run, and all disk I/O. |
 | `src/archive/viewer.js` | Offline library browser — search, sort, thumbnails, playback from disk. |
 | `src/archive/standalone.js` | Generates the folder's own `viewer.html`, inlining `src/viewer/`. |
@@ -167,12 +177,12 @@ Two things this testing established that shape the code:
 - **Media URLs are bound to the browser session that obtained them.** A URL harvested in one browser profile returns HTTP 403 in another, even seconds later with identical headers. This is fine for normal use — the extension harvests and downloads in the same profile — but it is why `fetchFirst` sends `credentials: 'include'`, and why a URL you copy out of the log won't work in curl or another browser.
 - **A challenged request returns HTTP 200 with TikTok's captcha page.** Before this was caught, a 33 KB HTML page was written to disk as an `.mp4` and counted as a successful download. `fetchFirst` now checks magic bytes (`ftyp` for video, JPEG/PNG/WebP/GIF/HEIC for images) and rejects anything that isn't really media, moving on to the next mirror.
 
-Not yet verified end-to-end: the Liked-tab scroll harvest, which needs a logged-in account.
+Not yet verified end-to-end: the Liked-tab harvest in either mode, which needs a logged-in account. Background paging in particular rests on an untested assumption — that TikTok accepts a captured `item_list` URL with the cursor swapped. If it doesn't, the run says so in the log and falls back to scrolling, so the failure mode is the old behaviour rather than a broken sync.
 
 ## Known limits
 
 - **Deleted / privated items can't be recovered.** They never appear in the list responses. Your myfaveTT DB records 1,995 of these already; `tools/script.py` carries all of them into `archive.json` as `gone`, which is as much as can be done for them.
-- **Media URLs are signed and expire.** Downloads run concurrently with the scroll to stay ahead of it, but on a very large first run some may still time out. They're logged as failures; run **Sync likes** again and only the missing files are retried.
+- **Media URLs are signed and expire.** Downloads run concurrently with the list read to stay ahead of it, but on a very large first run some may still time out. They're logged as failures; run **Sync likes** again and only the missing files are retried.
 - **No `total` from TikTok.** The progress bar is seeded from your previous item count, so it's an estimate until the run ends.
 - Bookmarks, Following, and audio extraction are not implemented. The plumbing is there (`collector.js` already recognises the bookmarks tab) if you want them later.
 
@@ -187,6 +197,8 @@ python -m http.server 8777
 Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stub `browser.*` and hide `showDirectoryPicker`, so the Firefox backend is the one that gets selected and evaluated. It is dev-only and not referenced by the extension.
 
 `src/dev/backends.html` unit-tests the Gecko backend against a faked download history and a faked directory pick — path arithmetic, the history/snapshot union, filename sanitising, the `archive.json` mirror. Serve the repo as above and open `http://127.0.0.1:8777/src/dev/backends.html`; it prints pass/fail and needs no browser extension loaded.
+
+`src/dev/paging.html` runs `hook.js` and `collector.js` against a fake `item_list` endpoint — the only way to exercise the list harvest without a logged-in account. It covers what breaks quietly: that background paging replays the captured URL by cursor rather than making the page scroll, that each replay picks up the current `msToken` and is re-signed for its own cursor, that a refused replay falls back to scrolling and still returns the same list, and that a second sync in the same tab reports the whole list again instead of only what changed. Open `http://127.0.0.1:8777/src/dev/paging.html`.
 
 `src/dev/thumbs.html` tests the Library against a folder that exists only in memory: an import map swaps `src/dev/fake-fs.js` in for `src/lib/fs.js`, so `state.js` and `viewer.js` run exactly as shipped. It matters most for video thumbnails, which are now decoded frames rather than files — the sample clip inlined in the page is black for its first 0.2 s and colour bars after, so "we took frame 0" fails as a real assertion rather than a flaky one. Open `http://127.0.0.1:8777/src/dev/thumbs.html`.
 

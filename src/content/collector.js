@@ -1,8 +1,15 @@
 /**
  * ISOLATED-world collector.
  *
- * Bridges hook.js (MAIN world) to the service worker, and drives the page's own
- * infinite scroll so TikTok issues the paginated item_list requests we harvest.
+ * Bridges hook.js (MAIN world) to the service worker, and drives the list
+ * pagination. Two ways, in order:
+ *
+ *   1. Background paging — ask hook.js to replay the last signed item_list
+ *      request with the next cursor. No scrolling, so the tab can sit in the
+ *      background while you carry on using the browser.
+ *   2. Scrolling the page, the way this used to work throughout. Slower, needs
+ *      the tab visible, but it is TikTok's own code making the requests, so it
+ *      survives signing changes that break (1).
  */
 (() => {
 	'use strict';
@@ -16,6 +23,7 @@
 		me: null,
 		harvesting: false,
 		abort: false,
+		focusBorrowed: false,
 		lastCapture: null,
 		seen: new Set(),
 	};
@@ -119,6 +127,14 @@
 			toBackground('pagestate', d.payload);
 			return;
 		}
+		if (d.kind === 'paginate-result') {
+			const resolve = pendingPages.get(d.payload.rid);
+			if (resolve) {
+				pendingPages.delete(d.payload.rid);
+				resolve(d.payload);
+			}
+			return;
+		}
 		if (d.kind === 'capture') {
 			const p = d.payload;
 			state.lastCapture = { at: Date.now(), ...p };
@@ -144,8 +160,72 @@
 
 	const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+	/**
+	 * Hand the event loop back for one turn, without going through a timer —
+	 * `setTimeout(0)` is clamped in a background tab like every other timer.
+	 *
+	 * Every wait ends with one of these. Without it, a wait that resolves on a
+	 * microtask (the worker answering instantly, or not being there at all) turns
+	 * a polling loop into a spin that starves the page: the fetch and postMessage
+	 * callbacks it is waiting for are tasks, and tasks never get to run.
+	 */
+	function yieldToPage() {
+		return new Promise((resolve) => {
+			const ch = new MessageChannel();
+			ch.port1.onmessage = () => {
+				ch.port1.close();
+				resolve();
+			};
+			ch.port2.postMessage(0);
+		});
+	}
+
+	/**
+	 * A sleep that survives being in a background tab.
+	 *
+	 * Chrome clamps a hidden tab's timers to 1s, and to once a minute once it has
+	 * been hidden a while — which is exactly the state we want this tab to be in.
+	 * The service worker's clock isn't clamped, so race the two and take whichever
+	 * comes back first: the worker normally, the local timer if it has been shut
+	 * down between messages. A rejection means the worker is gone, which is not
+	 * the same as the wait being over — that side just never settles.
+	 */
+	function nap(ms) {
+		const local = sleep(ms);
+		let remote = null;
+		try {
+			const p = ext.runtime.sendMessage({ type: 'sleep', ms });
+			if (p && typeof p.then === 'function') {
+				remote = p.then(
+					() => true,
+					() => new Promise(() => {})
+				);
+			}
+		} catch (_) {
+			/* extension context invalidated */
+		}
+		return (remote ? Promise.race([remote, local]) : local).then(yieldToPage);
+	}
+
 	function status(msg, extra = {}) {
 		toBackground('status', { msg, seenTotal: state.seen.size, ...extra });
+	}
+
+	/** Borrow the foreground for the few seconds something needs to be rendered. */
+	async function borrowFocus() {
+		if (state.focusBorrowed) return;
+		state.focusBorrowed = true;
+		try {
+			await ext.runtime.sendMessage({ type: 'borrow-focus' });
+		} catch (_) {}
+	}
+
+	async function returnFocus() {
+		if (!state.focusBorrowed) return;
+		state.focusBorrowed = false;
+		try {
+			await ext.runtime.sendMessage({ type: 'return-focus' });
+		} catch (_) {}
 	}
 
 	async function waitFor(fn, { timeout = 15000, step = 250 } = {}) {
@@ -154,7 +234,7 @@
 			if (state.abort) return null;
 			const v = fn();
 			if (v) return v;
-			await sleep(step);
+			await nap(step);
 		}
 		return null;
 	}
@@ -165,13 +245,24 @@
 		posts: '[data-e2e="user-post-item-list"]',
 	};
 
+	/** Which item_list endpoint each profile tab pages through. */
+	const ENDPOINT = { likes: 'favorite', bookmarks: 'collect', posts: 'post' };
+
 	async function openTab(which) {
 		const sel = TAB_SELECTOR[which];
 		if (!sel) return true;
-		const el = await waitFor(() => document.querySelector(sel), { timeout: 20000 });
+		let el = await waitFor(() => document.querySelector(sel), { timeout: 8000 });
+		if (!el && document.visibilityState === 'hidden') {
+			// A hidden tab still builds its DOM, but TikTok doesn't always get
+			// that far unprompted. Showing the tab for a moment is cheaper than
+			// failing the whole sync.
+			status('Showing the TikTok tab for a moment to open the list…');
+			await borrowFocus();
+			el = await waitFor(() => document.querySelector(sel), { timeout: 15000 });
+		}
 		if (!el) return false;
 		el.click();
-		await sleep(1200);
+		await nap(1200);
 		return true;
 	}
 
@@ -184,10 +275,108 @@
 		return /liked videos are private|This user's liked videos/i.test(t);
 	}
 
-	async function harvest({ which = 'likes', maxIdleRounds = 6 } = {}) {
+	// ------------------------------------------------------------ paging mode
+
+	/** @type {Map<number, (payload: any) => void>} */
+	const pendingPages = new Map();
+	let pageReqId = 0;
+
+	function requestPage(endpoint, cursor) {
+		const rid = ++pageReqId;
+		return new Promise((resolve) => {
+			pendingPages.set(rid, resolve);
+			window.postMessage(
+				{ __ttarchiveCmd: true, kind: 'paginate', rid, payload: { endpoint, cursor } },
+				'*'
+			);
+			// Only a backstop for a hook that never answers; late is fine.
+			setTimeout(() => {
+				if (pendingPages.delete(rid)) resolve({ ok: false, error: 'the page never answered' });
+			}, 45000);
+		});
+	}
+
+	/**
+	 * Walk the list by cursor. Returns why it stopped so harvest() can decide
+	 * whether that's the end of the list or a reason to fall back to scrolling.
+	 */
+	async function harvestByPaging(which, { pageDelay = 400 } = {}) {
+		const endpoint = ENDPOINT[which];
+		if (!endpoint) return { pages: 0, error: `no list endpoint for ${which}` };
+
+		let cursor = state.lastCapture ? state.lastCapture.cursor : null;
+		if (cursor == null) return { pages: 0, error: 'TikTok did not send a cursor to continue from' };
+
+		let pages = 0;
+		while (!state.abort) {
+			const res = await requestPage(endpoint, cursor);
+			if (!res.ok) return { pages, error: res.error };
+			pages += 1;
+			status(`Collected ${state.seen.size} items…`);
+
+			if (!res.hasMore) return { pages, done: true };
+			if (res.cursor == null || res.cursor === cursor) {
+				return { pages, error: 'the cursor stopped moving' };
+			}
+			cursor = res.cursor;
+			await nap(pageDelay);
+		}
+		return { pages, aborted: true };
+	}
+
+	// ----------------------------------------------------------- scroll mode
+
+	async function harvestByScrolling({ maxIdleRounds = 6 } = {}) {
+		let idle = 0;
+		let lastSeen = state.seen.size;
+		let lastCount = itemCount();
+
+		while (!state.abort) {
+			if (state.lastCapture && state.lastCapture.hasMore === false) {
+				status('Reached the end of the list.', { done: true });
+				return;
+			}
+
+			window.scrollTo(0, document.documentElement.scrollHeight);
+			// Nudge: TikTok sometimes needs a scroll event on the grid container.
+			window.dispatchEvent(new Event('scroll'));
+			await sleep(900);
+
+			const grew = state.seen.size > lastSeen || itemCount() > lastCount;
+			if (grew) {
+				idle = 0;
+				lastSeen = state.seen.size;
+				lastCount = itemCount();
+				status(`Collected ${state.seen.size} items…`);
+			} else {
+				idle += 1;
+				// Bounce up and back down; the observer occasionally misses a hit.
+				window.scrollBy(0, -600);
+				await sleep(400);
+				if (idle >= maxIdleRounds) {
+					status(`Stopped: no new items after ${idle} attempts.`, { done: true });
+					return;
+				}
+			}
+		}
+		if (state.abort) status('Stopped.', { done: true });
+	}
+
+	// ------------------------------------------------------------- harvest
+
+	/**
+	 * @param {{which?: string, mode?: 'auto'|'paging'|'scroll', maxIdleRounds?: number}} opts
+	 */
+	async function harvest({ which = 'likes', mode = 'auto', maxIdleRounds = 6 } = {}) {
 		if (state.harvesting) return;
 		state.harvesting = true;
 		state.abort = false;
+
+		// Every run reports the whole list, not just what this page hasn't sent
+		// before: the archive page decides what's already on disk, and it needs a
+		// complete list to tell a removed like from one we simply never reached.
+		const startedAt = Date.now();
+		state.seen = new Set();
 
 		try {
 			status(`Opening ${which}…`);
@@ -196,7 +385,14 @@
 				return;
 			}
 
-			const first = await waitFor(() => state.lastCapture, { timeout: 20000 });
+			// Either mode needs one request from TikTok's own code: paging replays
+			// it with a new cursor, scrolling just waits for the next one. It has to
+			// be from this run — an older one's cursor points into the middle of the
+			// list, and everything before it would look like it had been unliked.
+			const first = await waitFor(
+				() => (state.lastCapture && state.lastCapture.at >= startedAt ? state.lastCapture : null),
+				{ timeout: 20000 }
+			);
 			if (!first) {
 				if (privateNotice()) {
 					status('TikTok says these liked videos are private. Open them in Settings → Privacy.', {
@@ -207,42 +403,36 @@
 				}
 				return;
 			}
+			// Whatever the seed cost us, the paging loop doesn't need to be watched.
+			await returnFocus();
 
-			let idle = 0;
-			let lastSeen = state.seen.size;
-			let lastCount = itemCount();
-
-			while (!state.abort) {
-				if (state.lastCapture && state.lastCapture.hasMore === false) {
+			if (mode !== 'scroll') {
+				status('Paging the list in the background — carry on browsing, nothing needs to be in front.');
+				const res = await harvestByPaging(which);
+				if (res.done) {
 					status('Reached the end of the list.', { done: true });
-					break;
+					return;
 				}
-
-				window.scrollTo(0, document.documentElement.scrollHeight);
-				// Nudge: TikTok sometimes needs a scroll event on the grid container.
-				window.dispatchEvent(new Event('scroll'));
-				await sleep(900);
-
-				const grew = state.seen.size > lastSeen || itemCount() > lastCount;
-				if (grew) {
-					idle = 0;
-					lastSeen = state.seen.size;
-					lastCount = itemCount();
-					status(`Collected ${state.seen.size} items…`);
-				} else {
-					idle += 1;
-					// Bounce up and back down; the observer occasionally misses a hit.
-					window.scrollBy(0, -600);
-					await sleep(400);
-					if (idle >= maxIdleRounds) {
-						status(`Stopped: no new items after ${idle} attempts.`, { done: true });
-						break;
-					}
+				if (res.aborted) {
+					status('Stopped.', { done: true });
+					return;
 				}
+				if (mode === 'paging') {
+					status(`Background paging stopped after ${res.pages} page(s): ${res.error}.`, { fatal: true });
+					return;
+				}
+				status(
+					`Background paging stopped after ${res.pages} page(s): ${res.error}. ` +
+						'Falling back to scrolling — the TikTok tab has to stay visible for that.'
+				);
+				// Scrolling needs a rendered tab; a background one never grows.
+				await borrowFocus();
 			}
-			if (state.abort) status('Stopped.', { done: true });
+
+			await harvestByScrolling({ maxIdleRounds });
 		} finally {
 			state.harvesting = false;
+			returnFocus();
 		}
 	}
 

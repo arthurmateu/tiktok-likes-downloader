@@ -331,16 +331,16 @@ async function startSync() {
 		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
 	});
 
-	log(`Opening https://www.tiktok.com/@${uniqueId} …`);
-	const res = await ask('ensure-profile', { uniqueId });
+	log(`Opening https://www.tiktok.com/@${uniqueId} in the background…`);
+	const res = await ask('ensure-profile', { uniqueId, background: true });
 	if (!res.ok) {
 		log(`Could not prepare the TikTok tab: ${res.error || 'unknown error'}`, 'err');
 		finishSync('error');
 		return;
 	}
 	app.tabId = res.tabId;
-	log('Tab ready. Harvesting the Liked tab — leave that tab open and visible.');
-	await ask('start-harvest', { tabId: app.tabId, opts: { which: 'likes' } });
+	log('Tab ready. Leave it open — it does not need to be in front unless the log says so.');
+	await ask('start-harvest', { tabId: app.tabId, opts: { which: 'likes', mode: 'auto' } });
 }
 
 async function finishSync(reason) {

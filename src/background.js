@@ -45,6 +45,22 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 		openArchive().then(() => sendResponse({ ok: true }));
 		return true;
 	}
+
+	// The collector's clock. Its own timers are clamped while its tab is in the
+	// background — which is where we want that tab — and ours are not.
+	if (msg.type === 'sleep') {
+		const ms = Math.max(0, Math.min(60000, Number(msg.ms) || 0));
+		setTimeout(() => sendResponse({ ok: true }), ms);
+		return true;
+	}
+	if (msg.type === 'borrow-focus') {
+		borrowFocus(sender.tab).then(sendResponse);
+		return true;
+	}
+	if (msg.type === 'return-focus') {
+		returnFocus(sender.tab).then(sendResponse);
+		return true;
+	}
 });
 
 // ----------------------------------------------------------------- from viewer
@@ -119,7 +135,7 @@ async function handleArchiveMessage(msg, port) {
 				reply(await findTikTokTab());
 				break;
 			case 'ensure-profile':
-				reply(await ensureProfileTab(msg.uniqueId));
+				reply(await ensureProfileTab(msg.uniqueId, { background: !!msg.background }));
 				break;
 			case 'start-harvest':
 				reply(await sendToTab(msg.tabId, { cmd: 'harvest', opts: msg.opts }));
@@ -140,6 +156,47 @@ async function handleArchiveMessage(msg, port) {
 	} catch (err) {
 		reply({ ok: false, error: String((err && err.message) || err) });
 	}
+}
+
+// ------------------------------------------------------------- borrowed focus
+
+/**
+ * Tabs we pulled to the front, and what was in front before.
+ *
+ * The collector borrows the foreground for the parts that genuinely need a
+ * rendered page — finding the Liked tab, and the scroll fallback — and gives it
+ * back afterwards. Best-effort: if this worker is restarted mid-sync the tab
+ * just stays where it is, which is untidy but not broken.
+ *
+ * @type {Map<number, number|null>}
+ */
+const borrowedFocus = new Map();
+
+async function borrowFocus(tab) {
+	if (!tab) return { ok: false, error: 'no tab' };
+	if (!borrowedFocus.has(tab.id)) {
+		const [active] = await ext.tabs.query({ active: true, windowId: tab.windowId });
+		borrowedFocus.set(tab.id, active && active.id !== tab.id ? active.id : null);
+	}
+	try {
+		await ext.tabs.update(tab.id, { active: true });
+	} catch (_) {
+		return { ok: false, error: 'tab is gone' };
+	}
+	return { ok: true };
+}
+
+async function returnFocus(tab) {
+	if (!tab || !borrowedFocus.has(tab.id)) return { ok: true, restored: false };
+	const previous = borrowedFocus.get(tab.id);
+	borrowedFocus.delete(tab.id);
+	if (previous == null) return { ok: true, restored: false };
+	try {
+		await ext.tabs.update(previous, { active: true });
+	} catch (_) {
+		/* the user closed it in the meantime */
+	}
+	return { ok: true, restored: true };
 }
 
 async function sendToTab(tabId, message) {
@@ -164,18 +221,30 @@ async function findTikTokTab() {
 /**
  * Make sure a tab is sitting on the given profile. Reuses an existing TikTok tab
  * so we don't pile up windows across repeated syncs.
+ *
+ * In background mode it only reuses a tab already on that profile — normally the
+ * one an earlier sync left behind. Navigating away from whatever the user is
+ * watching is exactly the interruption background mode exists to avoid.
  */
-async function ensureProfileTab(uniqueId) {
+async function ensureProfileTab(uniqueId, { background = false } = {}) {
 	const target = `https://www.tiktok.com/@${uniqueId}`;
-	const tabs = await chrome.tabs.query({ url: ['*://*.tiktok.com/*'] });
-	let tab = tabs.find((t) => (t.url || '').startsWith(target)) || tabs[0];
+	const tabs = await ext.tabs.query({ url: ['*://*.tiktok.com/*'] });
+	const onProfile = tabs.find((t) => (t.url || '').startsWith(target));
+	let tab = background ? onProfile : onProfile || tabs[0];
+	const reusedInPlace = !!tab && (tab.url || '').startsWith(target);
 
 	if (!tab) {
-		tab = await chrome.tabs.create({ url: target, active: true });
-	} else if (!(tab.url || '').startsWith(target)) {
-		tab = await chrome.tabs.update(tab.id, { url: target, active: true });
+		tab = await ext.tabs.create({ url: target, active: !background });
+	} else if (!reusedInPlace) {
+		tab = await ext.tabs.update(tab.id, { url: target, active: !background });
 	} else {
-		await chrome.tabs.update(tab.id, { active: true });
+		if (!background) await ext.tabs.update(tab.id, { active: true });
+		// A tab left behind by an earlier sync is still holding that run's cursor
+		// and its set of already-seen ids. Both are wrong now: paging would resume
+		// from the end of the last run, and anything it remembers seeing would be
+		// filtered out before the archive page ever hears about it.
+		await ext.tabs.reload(tab.id);
+		await waitForLoading(tab.id);
 	}
 
 	await waitForComplete(tab.id);
@@ -186,6 +255,23 @@ async function ensureProfileTab(uniqueId) {
 		await new Promise((r) => setTimeout(r, 500));
 	}
 	return { ok: false, tabId: tab.id, error: 'content script never responded' };
+}
+
+/**
+ * Wait for a reload to actually start, so waitForComplete doesn't return on the
+ * "complete" the tab is still reporting from the page we just told it to leave.
+ */
+async function waitForLoading(tabId, timeout = 3000) {
+	const deadline = Date.now() + timeout;
+	while (Date.now() < deadline) {
+		try {
+			const t = await ext.tabs.get(tabId);
+			if (t.status !== 'complete') return;
+		} catch (_) {
+			return;
+		}
+		await new Promise((r) => setTimeout(r, 100));
+	}
 }
 
 function waitForComplete(tabId) {
