@@ -1,0 +1,98 @@
+<!doctype html>
+<!-- Dev-only harness: parses every module + classic script so syntax errors surface. Not shipped. -->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>syntax check</title>
+	</head>
+	<body>
+		<pre id="out">running…</pre>
+		<script>
+			// Enough of the extension API surface for the files to evaluate.
+			const noop = () => {};
+			window.chrome = {
+				runtime: {
+					connect: () => ({ onMessage: { addListener: noop }, postMessage: noop, name: 'archive' }),
+					sendMessage: () => Promise.resolve(),
+					onMessage: { addListener: noop },
+					onConnect: { addListener: noop },
+					onInstalled: { addListener: noop },
+					getURL: (p) => p,
+				},
+				tabs: {
+					query: () => Promise.resolve([]),
+					sendMessage: () => Promise.resolve({}),
+					create: () => Promise.resolve({}),
+					update: () => Promise.resolve({}),
+					get: () => Promise.resolve({ status: 'complete' }),
+					onUpdated: { addListener: noop, removeListener: noop },
+				},
+				windows: { update: noop },
+			};
+		</script>
+
+		<!-- The archive page's own DOM, so archive.js/viewer.js can bind to it. -->
+		<div hidden id="dom"></div>
+
+		<script>
+			const IDS = [
+				'folderName','pickFolder','grantFolder','noFolder','syncBody','legacyNote','username',
+				'concurrency','startSync','stopSync','rescan','bar','cSeen','cNew','cDone','cSkip',
+				'cFail','cBytes','log','statVideos','statPhotos','statCovers','statKnown','search',
+				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta',
+			];
+			const host = document.getElementById('dom');
+			for (const id of IDS) {
+				const tag = ['search','username','concurrency'].includes(id) ? 'input'
+					: ['sort','kind'].includes(id) ? 'select' : 'div';
+				const el = document.createElement(tag);
+				el.id = id;
+				el.classList.add('hidden');
+				host.appendChild(el);
+			}
+			const t = document.createElement('button');
+			t.className = 'tab';
+			t.dataset.panel = 'sync';
+			host.appendChild(t);
+			const p = document.createElement('section');
+			p.id = 'panel-sync';
+			p.className = 'panel';
+			host.appendChild(p);
+		</script>
+
+		<script type="module">
+			const out = document.getElementById('out');
+			const lines = [];
+			const mods = [
+				'./src/lib/idb.js',
+				'./src/lib/fs.js',
+				'./src/lib/legacy.js',
+				'./src/lib/state.js',
+				'./src/lib/downloader.js',
+				'./src/archive/viewer.js',
+				'./src/archive/archive.js',
+				'./src/background.js',
+			];
+			for (const m of mods) {
+				try {
+					await import(m);
+					lines.push(`OK      ${m}`);
+				} catch (e) {
+					lines.push(`FAIL    ${m}\n        ${e.name}: ${e.message}`);
+				}
+			}
+			// Classic scripts (content scripts / popup) — inject and see if they parse.
+			for (const s of ['./src/content/hook.js', './src/content/collector.js', './src/popup/popup.js']) {
+				try {
+					const src = await (await fetch(s)).text();
+					new Function(src);
+					lines.push(`OK      ${s}`);
+				} catch (e) {
+					lines.push(`FAIL    ${s}\n        ${e.name}: ${e.message}`);
+				}
+			}
+			out.textContent = lines.join('\n');
+			console.log('SYNTAXCHECK\n' + lines.join('\n'));
+		</script>
+	</body>
+</html>

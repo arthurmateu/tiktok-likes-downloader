@@ -1,0 +1,17 @@
+<!doctype html>
+<!-- Dev-only. Downloads a set of media URLs from the extension's own origin and
+     ships the bytes to a local receiver so they can be inspected with ffmpeg. -->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>download verification</title>
+		<style>
+			body { background:#111; color:#ddd; font:13px ui-monospace,Consolas,monospace; padding:16px }
+			.ok { color:#63d68a } .err { color:#ff6b6b }
+		</style>
+	</head>
+	<body>
+		<pre id="out">starting…</pre>
+		<script type="module" src="verify.js"></script>
+	</body>
+</html>

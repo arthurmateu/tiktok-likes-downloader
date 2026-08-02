@@ -1,0 +1,29 @@
+[
+	{
+		"id": 1,
+		"priority": 1,
+		"_comment": "TikTok's CDN 403s some signed media URLs without a tiktok.com Referer. Only our own fetches are touched: tiktok.com's page requests are excluded so playback on the site is unaffected. Origin is deliberately NOT set — the extension bypasses CORS via host permissions, and a forged Origin can change what the CDN returns.",
+		"action": {
+			"type": "modifyHeaders",
+			"requestHeaders": [{ "header": "Referer", "operation": "set", "value": "https://www.tiktok.com/" }]
+		},
+		"condition": {
+			"requestDomains": [
+				"tiktok.com",
+				"tiktokcdn.com",
+				"tiktokcdn-us.com",
+				"tiktokcdn-eu.com",
+				"tiktokcdn.us",
+				"tiktokv.com",
+				"tiktokv.us",
+				"ttwstatic.com",
+				"byteoversea.com",
+				"ibytedtos.com",
+				"muscdn.com",
+				"isnssdk.com"
+			],
+			"excludedInitiatorDomains": ["tiktok.com"],
+			"resourceTypes": ["xmlhttprequest", "media", "image"]
+		}
+	}
+]

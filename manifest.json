@@ -1,0 +1,55 @@
+{
+	"manifest_version": 3,
+	"name": "TikTok Likes Archiver",
+	"version": "1.0.0",
+	"description": "Archive your liked TikToks — videos, covers and photo posts — into a folder you choose. No limits, no purchases.",
+	"minimum_chrome_version": "111",
+	"permissions": ["storage", "unlimitedStorage", "tabs", "scripting", "declarativeNetRequest"],
+	"host_permissions": [
+		"*://*.tiktok.com/*",
+		"*://*.tiktokcdn.com/*",
+		"*://*.tiktokcdn-us.com/*",
+		"*://*.tiktokcdn-eu.com/*",
+		"*://*.tiktokcdn.us/*",
+		"*://*.tiktokv.com/*",
+		"*://*.tiktokv.us/*",
+		"*://*.ttwstatic.com/*",
+		"*://*.byteoversea.com/*",
+		"*://*.ibytedtos.com/*",
+		"*://*.muscdn.com/*",
+		"*://*.isnssdk.com/*"
+	],
+	"background": {
+		"service_worker": "src/background.js",
+		"type": "module"
+	},
+	"action": {
+		"default_title": "TikTok Likes Archiver",
+		"default_popup": "src/popup/popup.html"
+	},
+	"content_scripts": [
+		{
+			"matches": ["*://*.tiktok.com/*"],
+			"js": ["src/content/hook.js"],
+			"run_at": "document_start",
+			"world": "MAIN",
+			"all_frames": false
+		},
+		{
+			"matches": ["*://*.tiktok.com/*"],
+			"js": ["src/content/collector.js"],
+			"run_at": "document_start",
+			"world": "ISOLATED",
+			"all_frames": false
+		}
+	],
+	"declarative_net_request": {
+		"rule_resources": [
+			{
+				"id": "cdn_referer",
+				"enabled": true,
+				"path": "rules/dnr.json"
+			}
+		]
+	}
+}

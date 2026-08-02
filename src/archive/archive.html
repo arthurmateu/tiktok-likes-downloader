@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>TikTok Likes Archiver</title>
+		<link rel="stylesheet" href="archive.css" />
+	</head>
+	<body>
+		<header class="topbar">
+			<h1>TikTok Likes Archiver</h1>
+			<div class="folder">
+				<span id="folderName" class="folder-name">No folder selected</span>
+				<button id="pickFolder" class="btn">Choose folder…</button>
+				<button id="grantFolder" class="btn hidden">Re-grant access</button>
+			</div>
+		</header>
+
+		<nav class="tabs">
+			<button class="tab active" data-panel="sync">Sync</button>
+			<button class="tab" data-panel="library">Library</button>
+			<button class="tab" data-panel="about">About</button>
+		</nav>
+
+		<main>
+			<!-- ------------------------------------------------------- sync -->
+			<section id="panel-sync" class="panel active">
+				<div id="noFolder" class="notice">
+					Pick the folder you want to archive into. If it's an existing myfaveTT folder, its
+					<code>data/Likes</code> contents are detected automatically and nothing gets
+					re-downloaded.
+				</div>
+
+				<div id="syncBody" class="hidden">
+					<div class="cards">
+						<div class="card"><span class="num" id="statVideos">–</span><span class="lbl">videos on disk</span></div>
+						<div class="card"><span class="num" id="statPhotos">–</span><span class="lbl">photo posts</span></div>
+						<div class="card"><span class="num" id="statCovers">–</span><span class="lbl">covers</span></div>
+						<div class="card"><span class="num" id="statKnown">–</span><span class="lbl">items with metadata</span></div>
+					</div>
+
+					<div id="legacyNote" class="notice small hidden"></div>
+
+					<div class="row">
+						<label class="field">
+							<span>Your TikTok username</span>
+							<input id="username" type="text" placeholder="admouse_" spellcheck="false" />
+						</label>
+						<label class="field narrow">
+							<span>Parallel downloads</span>
+							<input id="concurrency" type="number" min="1" max="8" value="4" />
+						</label>
+					</div>
+
+					<div class="actions">
+						<button id="startSync" class="btn primary">Sync likes</button>
+						<button id="stopSync" class="btn danger" disabled>Stop</button>
+						<button id="rescan" class="btn">Rescan folder</button>
+					</div>
+
+					<div class="progress">
+						<div class="bar"><div id="bar" class="bar-fill"></div></div>
+						<div class="counters">
+							<span>Seen <b id="cSeen">0</b></span>
+							<span>New <b id="cNew">0</b></span>
+							<span>Saved <b id="cDone">0</b></span>
+							<span>Skipped <b id="cSkip">0</b></span>
+							<span>Failed <b id="cFail">0</b></span>
+							<span><b id="cBytes">0 B</b></span>
+						</div>
+					</div>
+
+					<pre id="log" class="log"></pre>
+				</div>
+			</section>
+
+			<!-- ---------------------------------------------------- library -->
+			<section id="panel-library" class="panel">
+				<div class="row toolbar">
+					<input id="search" class="grow" type="search" placeholder="Search caption, hashtag, author…" />
+					<select id="sort">
+						<option value="date-desc">Newest first</option>
+						<option value="date-asc">Oldest first</option>
+						<option value="likes-desc">Most liked</option>
+						<option value="plays-desc">Most played</option>
+					</select>
+					<select id="kind">
+						<option value="all">All types</option>
+						<option value="video">Videos</option>
+						<option value="photo">Photo posts</option>
+					</select>
+					<span id="libCount" class="muted"></span>
+				</div>
+				<div id="grid" class="grid"></div>
+				<div id="libMore" class="center hidden"><button id="loadMore" class="btn">Load more</button></div>
+			</section>
+
+			<!-- ------------------------------------------------------ about -->
+			<section id="panel-about" class="panel">
+				<h2>How it works</h2>
+				<ol>
+					<li>Pick any folder. Everything is written under <code>data/Likes/</code> in that folder.</li>
+					<li>
+						Press <b>Sync likes</b>. A TikTok tab opens on your profile, switches to the Liked tab and
+						scrolls itself. The extension reads the list responses the page makes — it does not forge
+						its own API requests, so there's nothing to break when TikTok rotates its request signing.
+					</li>
+					<li>
+						Media downloads run at the same time as the scroll, because TikTok's media URLs are signed
+						and expire.
+					</li>
+				</ol>
+
+				<h2>Where files go</h2>
+				<pre class="tree">&lt;your folder&gt;/
+  data/
+    Likes/
+      videos/&lt;videoId&gt;.mp4        same naming as myfaveTT
+      covers/&lt;videoId&gt;.jpg        same naming as myfaveTT
+      photos/&lt;postId&gt;/01.jpg      new — photo posts, one folder per post
+    .ttarchive/
+      state.json                  our metadata (plain JSON)
+    .appdata/                     myfaveTT's files — read only, never modified</pre>
+
+				<h2>Limits</h2>
+				<ul>
+					<li>No download cap and no paid tiers.</li>
+					<li>
+						Items that TikTok no longer serves (deleted, or the author went private) cannot be
+						recovered — they never appear in the list responses.
+					</li>
+					<li>
+						If a media URL expires mid-run you'll see failures. Run <b>Sync likes</b> again; only the
+						missing files are retried.
+					</li>
+				</ul>
+			</section>
+		</main>
+
+		<div id="lightbox" class="lightbox hidden">
+			<button id="lbClose" class="lb-close">✕</button>
+			<div id="lbStage" class="lb-stage"></div>
+			<div id="lbMeta" class="lb-meta"></div>
+		</div>
+
+		<script type="module" src="archive.js"></script>
+	</body>
+</html>
