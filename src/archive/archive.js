@@ -83,12 +83,22 @@ async function afterFolderReady() {
 	$('folderName').textContent = fs.rootName();
 	$('grantFolder').classList.add('hidden');
 	$('noFolder').classList.add('hidden');
-	$('syncBody').classList.remove('hidden');
 	$('pickFolder').textContent = 'Change folder…';
 
 	log('Scanning folder…');
-	const counts = await scanDisk();
-	app.state = await loadState();
+	let counts;
+	try {
+		counts = await scanDisk();
+		app.state = await loadState();
+	} catch (err) {
+		// Leave syncBody hidden: every control in it assumes app.state exists.
+		log(`Could not read the folder: ${err.message || err}`, 'err');
+		return;
+	}
+
+	// Only now. The scan above takes seconds on a large folder, and revealing the
+	// buttons before there is a state means a click in that window crashes.
+	$('syncBody').classList.remove('hidden');
 
 	// A folder still in the old data/Likes shape has media the flat layout can't
 	// see. Saying so beats silently offering to re-download all of it.
@@ -109,7 +119,7 @@ async function afterFolderReady() {
 }
 
 function renderStats(counts) {
-	const items = Object.values(app.state.items);
+	const items = Object.values(app.state?.items || {});
 	$('statVideos').textContent = counts.videos.toLocaleString();
 	$('statPhotos').textContent = counts.photoSets.toLocaleString();
 	$('statGone').textContent = items.filter((i) => i.status === 'gone').length.toLocaleString();
@@ -169,6 +179,10 @@ $('scanInput').addEventListener('change', async (ev) => {
 });
 
 $('rescan').addEventListener('click', async () => {
+	if (!app.state) {
+		log('Pick a folder first.', 'err');
+		return;
+	}
 	const counts = await scanDisk();
 	renderStats(counts);
 	renderLibrary(app.state);
@@ -327,6 +341,10 @@ function onContentMessage(type, payload) {
 }
 
 async function startSync() {
+	if (!app.state) {
+		log('Pick a folder first.', 'err');
+		return;
+	}
 	const uniqueId = $('username').value.trim().replace(/^@/, '');
 	if (!uniqueId) {
 		log('Enter your TikTok username first.', 'err');
