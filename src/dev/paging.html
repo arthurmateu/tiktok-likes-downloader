@@ -41,7 +41,15 @@
 			const NEXT = { '0': 'c1', c1: 'c2', c2: 'end' };
 
 			const server = {
-				/** 'ok' — replays are honoured. 'reject' — only the page's own requests are. */
+				/**
+				 * How the endpoint answers a *replay*; the page's own requests always
+				 * succeed, the way a seed request does in practice.
+				 *
+				 *   ok         honoured
+				 *   reject     a signature TikTok won't accept
+				 *   captcha    the challenge page, HTML under HTTP 200
+				 *   ratelimit  HTTP 429
+				 */
 				mode: 'ok',
 				/** Every request the endpoint saw, in order, and who made it. */
 				calls: [],
@@ -76,6 +84,18 @@
 				server.calls.push({ url, fromPage });
 				const u = new URL(url);
 				const cursor = u.searchParams.get('cursor') || '0';
+
+				if (!fromPage && server.mode === 'ratelimit') {
+					return new Response('', { status: 429, headers: { 'Retry-After': '1' } });
+				}
+				// The captcha arrives as HTML under a 200, not as an error status —
+				// which is why it has to be caught by the shape of the reply.
+				if (!fromPage && server.mode === 'captcha') {
+					return new Response('<!DOCTYPE html><html><body>verify</body></html>', {
+						status: 200,
+						headers: { 'content-type': 'text/html' },
+					});
+				}
 
 				// A signature TikTok won't accept comes back as a well-formed 200
 				// with nothing in it — the failure this whole fallback exists for.
@@ -194,11 +214,27 @@
 			/** Replays only, in the order the endpoint saw them. */
 			const replays = () => server.calls.filter((c) => !c.fromPage).map((c) => new URL(c.url));
 
+			/**
+			 * Back-off is measured against the wall clock, and the real intervals are
+			 * tens of seconds — deliberately, since the whole point is to stop asking
+			 * for a while. So the clock is what gets sped up, not the code under test.
+			 * Monotonic and forward-only, so nothing else notices.
+			 */
+			const realNow = Date.now.bind(Date);
+			const clock = { from: realNow(), rate: 1 };
+			Date.now = () => clock.from + (realNow() - clock.from) * clock.rate;
+			const accelerate = (rate) => {
+				clock.from = Date.now();
+				clock.rate = rate;
+			};
+
 			async function run(opts) {
 				const before = messages.length;
 				for (const fn of listeners) fn({ cmd: 'harvest', opts }, {}, () => {});
-				const deadline = Date.now() + 15000;
-				while (Date.now() < deadline) {
+				// performance.now, not Date.now: this deadline is real time, and must
+				// not move when a test speeds the clock up.
+				const deadline = performance.now() + 15000;
+				while (performance.now() < deadline) {
 					const last = messages.slice(before).filter((m) => m.type === 'status').pop();
 					if (last && (last.payload.done || last.payload.fatal)) return last.payload;
 					await new Promise((r) => setTimeout(r, 50));
@@ -259,6 +295,47 @@
 			reset('ok');
 			await run({ which: 'likes' });
 			check('a repeat run reports the whole list again, not just changes', collected().size, 9);
+
+			// ---- a captcha stops the run, it does not reroute it -------------------
+			// The distinction this checks is the whole point: a *signature* refusal
+			// falls back to scrolling (above), because scrolling has nothing to do
+			// with signing. A *challenge* must not, because scrolling would go on
+			// making the same requests from the same session while TikTok objects.
+			reset('captcha');
+			const captchaRun = await run({ which: 'likes' });
+
+			check('a challenged run stops', captchaRun.fatal, true);
+			check('it says a captcha is why', /captcha/i.test(captchaRun.msg), true);
+			check('it does not fall back to scrolling', scrolls.count, 0);
+			check('it asks once and stops', replays().length, 1);
+			check('the halt is shared with the downloads', messages.some((m) => m.type === 'throttle' && m.payload.halted), true);
+
+			// ---- a 429 backs off and retries, then gives up ------------------------
+			reset('ratelimit');
+			accelerate(400);
+			const limitedRun = await run({ which: 'likes' });
+			accelerate(1);
+
+			check('a rate-limited run stops', limitedRun.fatal, true);
+			check('after the retry budget', replays().length, 4);
+			check(
+				'retrying the same cursor, never advancing',
+				new Set(replays().map((u) => u.searchParams.get('cursor'))),
+				new Set(['c1'])
+			);
+			check('the wait is reported', statuses().some((s) => /slow down/i.test(s.msg)), true);
+			check('and it does not scroll instead', scrolls.count, 0);
+			check(
+				'each wait is longer than the last',
+				(() => {
+					const secs = statuses()
+						.map((s) => /Waiting (\d+)s/.exec(s.msg))
+						.filter(Boolean)
+						.map((m) => Number(m[1]));
+					return secs.length === 3 && secs[0] < secs[1] && secs[1] < secs[2];
+				})(),
+				true
+			);
 
 			lines.push(
 				failures

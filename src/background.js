@@ -36,10 +36,18 @@ function broadcast(type, payload) {
 
 // ---------------------------------------------------------------- from content
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	if (!msg || !msg.type) return;
-	if (sender.tab) {
-		broadcast(msg.type, { ...msg.payload, tabId: sender.tab.id });
+
+	// Checked before the broadcast below: these come from a tab too, but they are
+	// requests with an answer, not collector output to fan out.
+	if (msg.type === 'viewer-token') {
+		viewerToken().then((token) => sendResponse({ ok: true, token }));
+		return true;
+	}
+	if (msg.type === 'viewer-request') {
+		handleViewerRequest(msg).then(sendResponse);
+		return true;
 	}
 	if (msg.type === 'open-archive') {
 		openArchive().then(() => sendResponse({ ok: true }));
@@ -60,6 +68,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	if (msg.type === 'return-focus') {
 		returnFocus(sender.tab).then(sendResponse);
 		return true;
+	}
+
+	if (sender.tab) {
+		broadcast(msg.type, { ...msg.payload, tabId: sender.tab.id });
 	}
 });
 
@@ -143,11 +155,16 @@ async function handleArchiveMessage(msg, port) {
 			case 'stop-harvest':
 				reply(await sendToTab(msg.tabId, { cmd: 'stop' }));
 				break;
+			// Downloads run on the archive page and the list is paged in the tab, so
+			// a refusal met by one is news the other can't get any other way.
+			case 'throttle':
+				reply(await sendToTab(msg.tabId, { cmd: 'throttle', payload: msg.payload }));
+				break;
 			case 'ping-tab':
 				reply(await sendToTab(msg.tabId, { cmd: 'ping' }));
 				break;
 			case 'focus-tab':
-				await chrome.tabs.update(msg.tabId, { active: true });
+				await ext.tabs.update(msg.tabId, { active: true });
 				reply({ ok: true });
 				break;
 			default:
@@ -201,7 +218,7 @@ async function returnFocus(tab) {
 
 async function sendToTab(tabId, message) {
 	try {
-		const res = await chrome.tabs.sendMessage(tabId, message);
+		const res = await ext.tabs.sendMessage(tabId, message);
 		return res || { ok: false, error: 'no response' };
 	} catch (err) {
 		return { ok: false, error: String((err && err.message) || err) };
@@ -209,7 +226,7 @@ async function sendToTab(tabId, message) {
 }
 
 async function findTikTokTab() {
-	const tabs = await chrome.tabs.query({ url: ['*://*.tiktok.com/*'] });
+	const tabs = await ext.tabs.query({ url: ['*://*.tiktok.com/*'] });
 	const results = [];
 	for (const t of tabs) {
 		const ping = await sendToTab(t.id, { cmd: 'ping' });
@@ -278,14 +295,14 @@ function waitForComplete(tabId) {
 	return new Promise((resolve) => {
 		const check = async () => {
 			try {
-				const t = await chrome.tabs.get(tabId);
+				const t = await ext.tabs.get(tabId);
 				if (t.status === 'complete') {
-					chrome.tabs.onUpdated.removeListener(listener);
+					ext.tabs.onUpdated.removeListener(listener);
 					resolve();
 					return true;
 				}
 			} catch (_) {
-				chrome.tabs.onUpdated.removeListener(listener);
+				ext.tabs.onUpdated.removeListener(listener);
 				resolve();
 				return true;
 			}
@@ -294,10 +311,10 @@ function waitForComplete(tabId) {
 		const listener = (id) => {
 			if (id === tabId) check();
 		};
-		chrome.tabs.onUpdated.addListener(listener);
+		ext.tabs.onUpdated.addListener(listener);
 		check();
 		setTimeout(() => {
-			chrome.tabs.onUpdated.removeListener(listener);
+			ext.tabs.onUpdated.removeListener(listener);
 			resolve();
 		}, 30000);
 	});
@@ -306,15 +323,15 @@ function waitForComplete(tabId) {
 // ---------------------------------------------------------------- archive tab
 
 async function openArchive() {
-	const existing = await chrome.tabs.query({ url: ARCHIVE_URL });
+	const existing = await ext.tabs.query({ url: ARCHIVE_URL });
 	if (existing.length) {
-		await chrome.tabs.update(existing[0].id, { active: true });
-		await chrome.windows.update(existing[0].windowId, { focused: true });
+		await ext.tabs.update(existing[0].id, { active: true });
+		await ext.windows.update(existing[0].windowId, { focused: true });
 		return existing[0];
 	}
-	return chrome.tabs.create({ url: ARCHIVE_URL, active: true });
+	return ext.tabs.create({ url: ARCHIVE_URL, active: true });
 }
 
-chrome.runtime.onInstalled.addListener(({ reason }) => {
+ext.runtime.onInstalled.addListener(({ reason }) => {
 	if (reason === 'install') openArchive();
 });

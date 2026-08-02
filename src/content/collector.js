@@ -211,6 +211,63 @@
 		toBackground('status', { msg, seenTotal: state.seen.size, ...extra });
 	}
 
+	// ---------------------------------------------------------------- throttling
+	//
+	// The same rules as src/lib/throttle.js, restated rather than imported: a
+	// content script can't be an ES module, and neither can the MAIN-world hook.
+	// The archive page holds the real Guard; these two halves keep each other
+	// informed through the background, so a limit met while downloading media
+	// also stops the list being paged, and vice versa.
+
+	const BASE_PAUSE_MS = 20000;
+	const MAX_PAUSE_MS = 10 * 60000;
+	const MAX_PAGE_RETRIES = 3;
+	/** Backstop on a single run: ~30 items a page, so far past any real list. */
+	const MAX_PAGES = 1200;
+
+	const throttle = { until: 0, level: 0, halted: null };
+
+	const jitter = (ms) => Math.round(ms * (1 + (Math.random() * 2 - 1) * 0.3));
+	const waitMs = () => Math.max(0, throttle.until - Date.now());
+
+	/**
+	 * A fixed 400ms between pages was its own tell — no one scrolls on a metronome
+	 * for three hundred pages. This is both slower and irregular.
+	 */
+	const pageDelay = () => 800 + Math.floor(Math.random() * 1700);
+
+	function classifyStatus(s) {
+		if (s === 429) return 'rate-limit';
+		if (s === 502 || s === 503 || s === 504) return 'server';
+		return null;
+	}
+
+	function share(kind) {
+		toBackground('throttle', { ...throttle, kind });
+	}
+
+	function penalise(kind, hintMs = 0) {
+		throttle.level = Math.min(throttle.level + 1, 8);
+		const backoff = Math.min(BASE_PAUSE_MS * 2 ** (throttle.level - 1), MAX_PAUSE_MS);
+		throttle.until = Math.max(throttle.until, Date.now() + jitter(Math.max(backoff, hintMs)));
+		share(kind);
+		return waitMs();
+	}
+
+	function halt(reason) {
+		if (throttle.halted) return;
+		throttle.halted = reason;
+		share('challenge');
+	}
+
+	/** Park until the pause is over. False means the run has been halted. */
+	async function passThrottle() {
+		while (!state.abort && !throttle.halted && waitMs() > 0) {
+			await nap(Math.min(waitMs(), 5000));
+		}
+		return !throttle.halted;
+	}
+
 	/** Borrow the foreground for the few seconds something needs to be rendered. */
 	async function borrowFocus() {
 		if (state.focusBorrowed) return;
@@ -300,7 +357,7 @@
 	 * Walk the list by cursor. Returns why it stopped so harvest() can decide
 	 * whether that's the end of the list or a reason to fall back to scrolling.
 	 */
-	async function harvestByPaging(which, { pageDelay = 400 } = {}) {
+	async function harvestByPaging(which, { maxPages = MAX_PAGES } = {}) {
 		const endpoint = ENDPOINT[which];
 		if (!endpoint) return { pages: 0, error: `no list endpoint for ${which}` };
 
@@ -308,9 +365,39 @@
 		if (cursor == null) return { pages: 0, error: 'TikTok did not send a cursor to continue from' };
 
 		let pages = 0;
+		let retries = 0;
 		while (!state.abort) {
+			if (pages >= maxPages) {
+				return { pages, error: `hit the ${maxPages}-page ceiling for one run` };
+			}
+			if (!(await passThrottle())) return { pages, halted: throttle.halted };
+
 			const res = await requestPage(endpoint, cursor);
-			if (!res.ok) return { pages, error: res.error };
+
+			if (!res.ok) {
+				// A captcha is not something waiting fixes, and it is emphatically not
+				// a reason to fall back to scrolling — that would go on making the
+				// same requests from the same session while TikTok is objecting.
+				if (res.challenged) {
+					halt(res.error || 'TikTok is asking for a captcha');
+					return { pages, halted: throttle.halted };
+				}
+				const kind = classifyStatus(res.status);
+				if (kind) {
+					if (++retries > MAX_PAGE_RETRIES) {
+						halt(`TikTok kept refusing the list (HTTP ${res.status}) after ${MAX_PAGE_RETRIES} backoffs`);
+						return { pages, halted: throttle.halted };
+					}
+					const ms = penalise(kind, res.retryAfter || 0);
+					status(`TikTok asked us to slow down (HTTP ${res.status}). Waiting ${Math.round(ms / 1000)}s…`);
+					continue; // same cursor: nothing was collected
+				}
+				// Anything else is a signing or shape problem, which scrolling fixes.
+				return { pages, error: res.error };
+			}
+
+			retries = 0;
+			if (throttle.level) throttle.level -= 1;
 			pages += 1;
 			status(`Collected ${state.seen.size} items…`);
 
@@ -319,7 +406,7 @@
 				return { pages, error: 'the cursor stopped moving' };
 			}
 			cursor = res.cursor;
-			await nap(pageDelay);
+			await nap(pageDelay());
 		}
 		return { pages, aborted: true };
 	}
@@ -334,6 +421,13 @@
 		while (!state.abort) {
 			if (state.lastCapture && state.lastCapture.hasMore === false) {
 				status('Reached the end of the list.', { done: true });
+				return;
+			}
+			// Covers a challenge the *downloads* ran into: this loop never sees a
+			// status code of its own, so the archive page's Guard is the only
+			// warning it gets.
+			if (!(await passThrottle())) {
+				status(`Paused: ${throttle.halted}`, { fatal: true });
 				return;
 			}
 
@@ -377,6 +471,10 @@
 		// complete list to tell a removed like from one we simply never reached.
 		const startedAt = Date.now();
 		state.seen = new Set();
+		// A new run is the user's answer to whatever stopped the last one.
+		throttle.until = 0;
+		throttle.level = 0;
+		throttle.halted = null;
 
 		try {
 			status(`Opening ${which}…`);
@@ -415,6 +513,14 @@
 				}
 				if (res.aborted) {
 					status('Stopped.', { done: true });
+					return;
+				}
+				if (res.halted) {
+					status(
+						`Stopped after ${res.pages} page(s): ${res.halted}. Open the TikTok tab and clear it, ` +
+							'then Sync again — everything already downloaded is kept.',
+						{ fatal: true }
+					);
 					return;
 				}
 				if (mode === 'paging') {
@@ -459,6 +565,16 @@
 		}
 		if (msg.cmd === 'stop') {
 			state.abort = true;
+			sendResponse({ ok: true });
+			return true;
+		}
+		// The archive page's downloads were refused. Adopt the longer pause of the
+		// two; never notify back, or the two sides echo each other indefinitely.
+		if (msg.cmd === 'throttle') {
+			const p = msg.payload || {};
+			if (p.until > throttle.until) throttle.until = p.until;
+			if (p.level > throttle.level) throttle.level = p.level;
+			if (p.halted && !throttle.halted) throttle.halted = p.halted;
 			sendResponse({ ok: true });
 			return true;
 		}

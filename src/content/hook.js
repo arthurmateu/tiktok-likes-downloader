@@ -109,6 +109,27 @@
 
 	// --- background paging -------------------------------------------------
 
+	/**
+	 * TikTok status codes that mean "prove you're human".
+	 *
+	 * Only 10000 is in here, and on reputation rather than observation — this has
+	 * not been seen against a live account. It fails safe either way: an
+	 * unrecognised code takes the old path (report the error, let the collector
+	 * fall back to scrolling), and the non-JSON check above catches the captcha
+	 * page itself, which is the form the challenge was actually observed to take.
+	 */
+	const CHALLENGE_CODES = new Set([10000]);
+
+	/** `Retry-After` in ms — seconds or an HTTP date, both are legal. */
+	function retryAfterMs(headers) {
+		const raw = headers && typeof headers.get === 'function' ? headers.get('Retry-After') : null;
+		if (!raw) return 0;
+		const secs = Number(raw);
+		if (Number.isFinite(secs)) return Math.max(0, secs * 1000);
+		const at = Date.parse(raw);
+		return Number.isFinite(at) ? Math.max(0, at - Date.now()) : 0;
+	}
+
 	function cookie(name) {
 		const m = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
 		return m ? decodeURIComponent(m[1]) : null;
@@ -169,8 +190,16 @@
 			reply({ ok: false, error: String((err && err.message) || err) });
 			return;
 		}
+		// `status` and `retryAfter` are what let the collector tell "slow down" from
+		// "this request was malformed" — one wants a back-off, the other wants the
+		// scroll fallback, and they used to arrive as the same opaque string.
 		if (!res.ok) {
-			reply({ ok: false, error: `HTTP ${res.status}` });
+			reply({
+				ok: false,
+				status: res.status,
+				retryAfter: retryAfterMs(res.headers),
+				error: `HTTP ${res.status}`,
+			});
 			return;
 		}
 
@@ -179,13 +208,22 @@
 			json = JSON.parse(text);
 		} catch (_) {
 			// A captcha or login wall comes back as HTML, not JSON.
-			reply({ ok: false, error: 'the reply was not JSON — TikTok may be asking for a captcha' });
+			reply({
+				ok: false,
+				challenged: true,
+				error: 'the reply was not JSON — TikTok is asking for a captcha',
+			});
 			return;
 		}
 
 		const status = json.statusCode ?? json.status_code ?? 0;
 		if (status !== 0) {
-			reply({ ok: false, error: `TikTok returned status ${status}` });
+			reply({
+				ok: false,
+				tiktokStatus: status,
+				challenged: CHALLENGE_CODES.has(status),
+				error: `TikTok returned status ${status}`,
+			});
 			return;
 		}
 		const items = json.itemList || [];

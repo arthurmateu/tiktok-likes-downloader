@@ -137,6 +137,29 @@ Both feed the same normalizer, so nothing downstream knows which one ran. A run 
 
 One detail worth knowing if you touch this: Chrome clamps a hidden tab's timers to 1/s, and to 1/min once it has been hidden a while, which would throttle the paging loop to a crawl. The delay between pages is therefore taken from the service worker's clock (`{type: 'sleep'}` in `src/background.js`), which isn't clamped, raced against the local timer in case the worker has been shut down.
 
+## Being refused
+
+Every request a sync makes carries your own logged-in session and TikTok's own signing. That is what makes the archive possible, and it is also why being rate-limited here is attributable to the **account** and not just the IP. The rule the code follows, in `src/lib/throttle.js`, is that a refusal has to make the extension quieter — never louder.
+
+It did the opposite before this existed. `fetchFirst` treated any non-2xx as "this mirror is stale, try the next one", and TikTok hands out four to six mirrors per asset; they resolve to the same edge fleet, so one 429 became five more immediate requests into a limit already hit, times four parallel downloads. The list pager, separately, had a flat 400 ms between pages and no notion of a refusal at all.
+
+Two outcomes now, deliberately different:
+
+| | | |
+| --- | --- | --- |
+| **Pause** | 429, 502/503/504 | Everything parks — downloads *and* the pager — for 20 s, doubling per consecutive refusal to a 10-minute ceiling, jittered. A `Retry-After` wins whenever it asks for longer. Twenty clean requests walk the back-off down again. Four parallel downloads meeting one limit count as one event, not four. |
+| **Halt** | a captcha or challenge page | No interval fixes this; it needs a human in the tab. The run stops, says so, and asks you to clear the check and press Sync again. |
+
+The halt case is the one worth being careful about. A challenge and a *signing* failure both look like "the replay didn't work", but they want opposite responses: a signing failure should fall back to scrolling, because scrolling has nothing to do with signing, whereas falling back to scrolling during a challenge would go on making the same requests from the same session while TikTok is objecting. `hook.js` therefore reports a status code and a `challenged` flag rather than one opaque error string, and only the former reroutes.
+
+Nothing a halt touches is marked `unavailable`. That status is a claim about the media — that it was fetched and could not be had — and a stopped run has no business making it; a run that resumed tomorrow would skip everything the halt caught. Parked items are simply left `pending` and picked up by the next sync.
+
+The two halves keep each other informed. Downloads run on the archive page and the list is paged in the content script, so a refusal met by one is news the other cannot otherwise get; it travels over the background relay and each side adopts the longer pause. A challenge met while downloading stops the pager, and vice versa.
+
+The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its own tell — nothing human requests a page on a metronome three hundred times — and this is both slower and irregular. There is also a 1200-page ceiling on a single run as a backstop, far past any real likes list.
+
+`src/dev/throttle.html` and the last two sections of `src/dev/paging.html` are where this is checked.
+
 ## Architecture
 
 | File | Role |
@@ -155,6 +178,7 @@ One detail worth knowing if you touch this: Chrome clamps a hidden tab's timers 
 | `src/lib/ext.js` | `browser ?? chrome`, so every call site can `await`. |
 | `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status. |
 | `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
+| `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
 | `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
 
 All fetching happens on the extension page rather than in a content script: since Chrome 85 content-script requests obey the page's CORS policy, while extension pages get host-permission-based access.
@@ -175,7 +199,7 @@ Checked on 2026-08-02 by loading this extension into Edge with `--load-extension
 Two things this testing established that shape the code:
 
 - **Media URLs are bound to the browser session that obtained them.** A URL harvested in one browser profile returns HTTP 403 in another, even seconds later with identical headers. This is fine for normal use — the extension harvests and downloads in the same profile — but it is why `fetchFirst` sends `credentials: 'include'`, and why a URL you copy out of the log won't work in curl or another browser.
-- **A challenged request returns HTTP 200 with TikTok's captcha page.** Before this was caught, a 33 KB HTML page was written to disk as an `.mp4` and counted as a successful download. `fetchFirst` now checks magic bytes (`ftyp` for video, JPEG/PNG/WebP/GIF/HEIC for images) and rejects anything that isn't really media, moving on to the next mirror.
+- **A challenged request returns HTTP 200 with TikTok's captcha page.** Before this was caught, a 33 KB HTML page was written to disk as an `.mp4` and counted as a successful download. `fetchFirst` checks magic bytes (`ftyp` for video, JPEG/PNG/WebP/GIF/HEIC for images) and rejects anything that isn't really media. A body that is *not* media but also isn't HTML is a stale mirror, and the next mirror gets a turn; a body that looks like a challenge page stops the whole run instead — see [Being refused](#being-refused).
 
 Not yet verified end-to-end: the Liked-tab harvest in either mode, which needs a logged-in account. Background paging in particular rests on an untested assumption — that TikTok accepts a captured `item_list` URL with the cursor swapped. If it doesn't, the run says so in the log and falls back to scrolling, so the failure mode is the old behaviour rather than a broken sync.
 
@@ -198,7 +222,9 @@ Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stu
 
 `src/dev/backends.html` unit-tests the Gecko backend against a faked download history and a faked directory pick — path arithmetic, the history/snapshot union, filename sanitising, the `archive.json` mirror. Serve the repo as above and open `http://127.0.0.1:8777/src/dev/backends.html`; it prints pass/fail and needs no browser extension loaded.
 
-`src/dev/paging.html` runs `hook.js` and `collector.js` against a fake `item_list` endpoint — the only way to exercise the list harvest without a logged-in account. It covers what breaks quietly: that background paging replays the captured URL by cursor rather than making the page scroll, that each replay picks up the current `msToken` and is re-signed for its own cursor, that a refused replay falls back to scrolling and still returns the same list, and that a second sync in the same tab reports the whole list again instead of only what changed. Open `http://127.0.0.1:8777/src/dev/paging.html`.
+`src/dev/paging.html` runs `hook.js` and `collector.js` against a fake `item_list` endpoint — the only way to exercise the list harvest without a logged-in account. It covers what breaks quietly: that background paging replays the captured URL by cursor rather than making the page scroll, that each replay picks up the current `msToken` and is re-signed for its own cursor, that a refused replay falls back to scrolling and still returns the same list, and that a second sync in the same tab reports the whole list again instead of only what changed. Its last two sections cover the opposite case — that a captcha and a 429 *don't* fall back to scrolling, that a rate-limited page is retried at the same cursor with a growing wait rather than skipped, and that the halt reaches the download side. Back-off is measured against the wall clock, so those tests speed `Date.now` up rather than shortening the intervals in the code. Open `http://127.0.0.1:8777/src/dev/paging.html`.
+
+`src/dev/throttle.html` unit-tests `src/lib/throttle.js` and `fetchFirst` against a scripted `fetch`. The behaviour it covers is almost entirely about requests *not* made — that a 429 stops the round instead of walking the remaining mirrors, that four parallel downloads meeting one limit back off once rather than four times, that a challenge page throws before trying anything else and under any content type, that a halted or stopped item is never marked `unavailable`, and that an ordinary 404 still walks the mirror list exactly as it used to. Open `http://127.0.0.1:8777/src/dev/throttle.html`.
 
 `src/dev/thumbs.html` tests the Library against a folder that exists only in memory: an import map swaps `src/dev/fake-fs.js` in for `src/lib/fs.js`, so `state.js` and `viewer.js` run exactly as shipped. It matters most for video thumbnails, which are now decoded frames rather than files — the sample clip inlined in the page is black for its first 0.2 s and colour bars after, so "we took frame 0" fails as a real assertion rather than a flaky one. Open `http://127.0.0.1:8777/src/dev/thumbs.html`.
 

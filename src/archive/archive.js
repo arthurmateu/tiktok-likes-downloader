@@ -269,9 +269,28 @@ function updateCounters() {
 	$('bar').style.width = total ? `${Math.min(100, (app.seen / total) * 100).toFixed(1)}%` : '0%';
 }
 
+/** Tell the collector what the downloads have just run into. */
+function shareThrottle() {
+	if (!app.tabId || !app.queue) return;
+	ask('throttle', { tabId: app.tabId, payload: app.queue.guard.snapshot() });
+}
+
 function onContentMessage(type, payload) {
 	if (type === 'viewer-request') {
 		onViewerRequest(payload || {});
+		return;
+	}
+
+	// The other direction: the list run into a limit, so the downloads adopt it.
+	// A halt reaches the queue on its next request, which parks it and fires
+	// onHalt — no separate path needed here.
+	if (type === 'throttle') {
+		if (!app.queue) return;
+		app.queue.guard.adopt(payload);
+		if (!payload.halted && payload.until > Date.now()) {
+			const secs = Math.round((payload.until - Date.now()) / 1000);
+			log(`The list was refused (${payload.kind || 'throttled'}); downloads pause for ${secs}s too.`);
+		}
 		return;
 	}
 
@@ -329,6 +348,26 @@ async function startSync() {
 		state: app.state,
 		onProgress: updateCounters,
 		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
+		onThrottle: (ev) => {
+			if (!ev.halted) {
+				log(
+					`TikTok refused a download (${ev.kind}). Pausing ${Math.round(ev.waitMs / 1000)}s ` +
+						`before trying again — the list stops too.`
+				);
+			}
+			shareThrottle();
+		},
+		onHalt: (reason) => {
+			log(`${reason}. Stopping the whole run rather than asking again.`, 'err');
+			log('Open the TikTok tab, clear the check, then press Sync — nothing already saved is lost.');
+			shareThrottle();
+			if (app.tabId) ask('stop-harvest', { tabId: app.tabId });
+			// Clears the parked items so finishSync's `idle()` can resolve — a paused
+			// queue never drains. Nothing is lost: none of them were marked, so the
+			// next sync finds them missing on disk and queues them again.
+			app.queue.stop();
+			finishSync('error');
+		},
 	});
 
 	log(`Opening https://www.tiktok.com/@${uniqueId} in the background…`);

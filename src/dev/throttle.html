@@ -1,0 +1,277 @@
+<!doctype html>
+<!--
+	Dev-only: exercises the back-off against a stubbed fetch.
+
+	The behaviour under test is entirely about what the extension does *not* do —
+	how many requests it declines to make once TikTok has objected — and none of
+	that is visible from a successful sync. So it is checked here, against a fetch
+	that counts and scripts every call, rather than against TikTok.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/throttle.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>throttle tests</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+			h2 { font-size: 13px; color: #8b8d93; font-weight: normal; margin: 18px 0 4px; }
+		</style>
+	</head>
+	<body>
+		<h1>back-off</h1>
+		<pre id="out">running…</pre>
+
+		<script>
+			// fs.js picks a backend at module load. Neither is present on a plain
+			// page, which is fine — nothing here writes — but the stub keeps the
+			// selection deterministic rather than dependent on the dev browser.
+			window.browser = { runtime: { getManifest: () => ({}), getURL: (p) => p } };
+			delete window.showDirectoryPicker;
+
+			// --- scripted fetch ------------------------------------------------
+			// Each entry is consumed in order; the last one repeats forever.
+			const calls = [];
+			let script = [];
+
+			const bytes = (arr) => new Blob([new Uint8Array(arr)], { type: 'video/mp4' });
+			/** A real mp4 head: 4 bytes of length, then 'ftyp'. */
+			const MP4 = bytes([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+			window.fetch = async (url) => {
+				calls.push(String(url));
+				const step = script[Math.min(calls.length - 1, script.length - 1)];
+				if (typeof step === 'function') return step(url);
+				return step;
+			};
+
+			const ok = (blob) => ({ ok: true, status: 200, headers: new Headers(), blob: async () => blob });
+			const fail = (status, headers = {}) => ({
+				ok: false,
+				status,
+				headers: new Headers(headers),
+				blob: async () => new Blob([]),
+			});
+			/** The captcha page, under HTTP 200, as TikTok actually serves it. */
+			const captcha = (type) => ok(new Blob(['<!DOCTYPE html><html>verify</html>'], { type }));
+		</script>
+
+		<script type="module">
+			import { Guard, Halt, classifyStatus, retryAfterMs, BASE_PAUSE_MS } from '../lib/throttle.js';
+			import { fetchFirst, DownloadQueue } from '../lib/downloader.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let failures = 0;
+
+			const show = (v) => JSON.stringify(v);
+
+			// Rendered as it goes, not at the end: a test that hangs is a real
+			// possibility here — everything under test is about waiting — and a page
+			// stuck on "running…" says nothing about where it got to.
+			const render = () => (out.innerHTML = lines.join('\n'));
+
+			function check(label, actual, expected) {
+				const good = show(actual) === show(expected);
+				if (!good) failures++;
+				lines.push(
+					`<span class="${good ? 'pass' : 'fail'}">${good ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(good ? '' : `\n        expected ${show(expected)}\n        got      ${show(actual)}`)
+				);
+				render();
+			}
+			const head = (t) => {
+				lines.push(`\n<h2>${t}</h2>`);
+				render();
+			};
+
+			addEventListener('unhandledrejection', (e) => {
+				lines.push(`<span class="fail">THREW</span>  ${(e.reason && e.reason.stack) || e.reason}`);
+				render();
+			});
+
+			/**
+			 * A guard that records its pauses and then clears them, so the tests
+			 * assert on the interval that *was* chosen without waiting it out.
+			 */
+			function testGuard() {
+				const seen = [];
+				const g = new Guard({
+					onNotice: (ev) => {
+						seen.push({ kind: ev.kind, waitMs: ev.waitMs, level: ev.level });
+						g.until = 0;
+					},
+				});
+				g.events = seen;
+				return g;
+			}
+
+			const MIRRORS = ['https://a/1.mp4', 'https://b/1.mp4', 'https://c/1.mp4'];
+			const reset = (s) => {
+				calls.length = 0;
+				script = s;
+			};
+
+			// ---- classification ------------------------------------------------
+			head('classification');
+			check('429 is a rate limit', classifyStatus(429), 'rate-limit');
+			check('503 is a server refusal', classifyStatus(503), 'server');
+			check('404 is not a throttle', classifyStatus(404), null);
+			check('403 is not a throttle', classifyStatus(403), null);
+			check('Retry-After in seconds', retryAfterMs(new Headers({ 'Retry-After': '90' })), 90000);
+			check('Retry-After absent', retryAfterMs(new Headers()), 0);
+
+			// ---- a 429 must not walk the mirror list ----------------------------
+			head('a refusal makes fewer requests, not more');
+			{
+				const g = testGuard();
+				reset([fail(429), ok(MP4)]);
+				const res = await fetchFirst(MIRRORS, { expect: 'video', guard: g });
+				// The old code answered a 429 by trying mirrors 2 and 3 immediately.
+				check('stops the round at the 429', calls[1], MIRRORS[0]);
+				check('two requests, not four', calls.length, 2);
+				check('backed off once', g.events.length, 1);
+				check('the retry succeeds', res.blob.size, MP4.size);
+			}
+			{
+				const g = testGuard();
+				reset([fail(429, { 'Retry-After': '600' }), ok(MP4)]);
+				await fetchFirst(MIRRORS, { expect: 'video', guard: g });
+				const waited = g.events[0].waitMs;
+				check('Retry-After beats our own schedule', waited > 400000, true);
+			}
+			{
+				const g = testGuard();
+				reset([fail(429)]);
+				let err = null;
+				await fetchFirst(MIRRORS, { expect: 'video', guard: g }).catch((e) => (err = e));
+				check('gives up rather than looping', err.message, 'HTTP 429');
+				check('four rounds, one request each', calls.length, 4);
+				check('escalating back-off', g.events.map((e) => e.level), [1, 2, 3, 4]);
+				check('doubles from the base', g.events[1].waitMs > BASE_PAUSE_MS, true);
+			}
+
+			// ---- an ordinary failure still walks the list ------------------------
+			head('an ordinary failure is unchanged');
+			{
+				const g = testGuard();
+				reset([fail(404), fail(403), ok(MP4)]);
+				const res = await fetchFirst(MIRRORS, { expect: 'video', guard: g });
+				check('tries each mirror in turn', calls.length, 3);
+				check('never backs off', g.events.length, 0);
+				check('returns the mirror that worked', res.url, MIRRORS[2]);
+			}
+			{
+				const g = testGuard();
+				reset([fail(404)]);
+				let err = null;
+				await fetchFirst(MIRRORS, { expect: 'video', guard: g }).catch((e) => (err = e));
+				check('one round only', calls.length, 3);
+				check('reports the last error', err.message, 'HTTP 404');
+			}
+
+			// ---- a challenge stops everything ------------------------------------
+			head('a challenge halts instead of retrying');
+			for (const type of ['text/html', 'application/octet-stream', '']) {
+				const g = testGuard();
+				reset([captcha(type)]);
+				let err = null;
+				await fetchFirst(MIRRORS, { expect: 'video', guard: g }).catch((e) => (err = e));
+				check(`captcha as ${type || 'no type'} throws Halt`, err instanceof Halt, true);
+				check(`captcha as ${type || 'no type'} tries nothing else`, calls.length, 1);
+				check(`captcha as ${type || 'no type'} halts the guard`, !!g.halted, true);
+			}
+			{
+				const g = testGuard();
+				g.halt('captcha');
+				reset([ok(MP4)]);
+				let err = null;
+				await fetchFirst(MIRRORS, { expect: 'video', guard: g }).catch((e) => (err = e));
+				check('a halted guard makes no request at all', calls.length, 0);
+				check('and says why', err.message, 'captcha');
+			}
+			{
+				// The magic-byte check must still reject a non-media body that isn't
+				// HTML either — that one is a bad mirror, not a challenge.
+				const g = testGuard();
+				reset([ok(bytes([1, 2, 3, 4, 5, 6, 7, 8])), ok(MP4)]);
+				const res = await fetchFirst(MIRRORS, { expect: 'video', guard: g });
+				check('junk body moves to the next mirror', calls.length, 2);
+				check('and does not halt', g.halted, null);
+				check('second mirror returned', res.url, MIRRORS[1]);
+			}
+
+			// ---- parallel downloads are one event --------------------------------
+			head('coalescing and decay');
+			{
+				const g = new Guard();
+				g.penalise('rate-limit');
+				const first = g.level;
+				g.penalise('rate-limit');
+				g.penalise('rate-limit');
+				g.penalise('rate-limit');
+				check('four workers, one level of back-off', g.level, first);
+			}
+			{
+				const g = new Guard();
+				g.penalise('rate-limit');
+				g.until = 0;
+				for (let i = 0; i < 20; i++) g.ok();
+				check('clean requests walk it back down', g.level, 0);
+			}
+			{
+				const a = new Guard();
+				const b = new Guard();
+				a.penalise('rate-limit');
+				b.adopt(a.snapshot());
+				check('the other side adopts the pause', b.waitMs > 0, true);
+				a.halt('captcha');
+				b.adopt(a.snapshot());
+				check('and the halt', b.halted, 'captcha');
+				b.reset();
+				check('a new run clears it', b.halted, null);
+			}
+
+			// ---- the queue's handling of a halt ----------------------------------
+			head('queue');
+			{
+				const state = { items: {}, unavailable: [] };
+				const rec = { id: '1', type: 'video', video: MIRRORS, photos: [] };
+				state.items['1'] = { id: '1', status: 'pending' };
+
+				let halted = null;
+				const q = new DownloadQueue({ state, onHalt: (r) => (halted = r) });
+				reset([captcha('text/html')]);
+				q.add(rec);
+				await new Promise((r) => setTimeout(r, 50));
+
+				check('the halt is reported once', typeof halted, 'string');
+				check('the item is not marked unavailable', state.unavailable, []);
+				check('its status is untouched', state.items['1'].status, 'pending');
+				check('nothing counted as failed', q.stats.failed, 0);
+				check('the queue parks', q.paused, true);
+				check('the item is kept for next time', q.queue.length, 1);
+			}
+			{
+				// Stopping mid-flight must not condemn the item either.
+				const state = { items: { 1: { id: '1', status: 'pending' } }, unavailable: [] };
+				const q = new DownloadQueue({ state });
+				reset([() => new Promise(() => {})]);
+				q.add({ id: '1', type: 'video', video: MIRRORS, photos: [] });
+				await new Promise((r) => setTimeout(r, 20));
+				q.stop();
+				await new Promise((r) => setTimeout(r, 20));
+				check('a stopped download is not marked unavailable', state.unavailable, []);
+				check('and is not counted as failed', q.stats.failed, 0);
+			}
+
+			out.innerHTML =
+				lines.join('\n') +
+				`\n\n<span class="${failures ? 'fail' : 'pass'}">${failures ? failures + ' FAILED' : 'all passed'}</span>`;
+			document.title = failures ? `${failures} failed` : 'throttle: all passed';
+		</script>
+	</body>
+</html>

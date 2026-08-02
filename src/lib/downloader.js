@@ -13,6 +13,7 @@
 
 import { LAYOUT, writeFile } from './fs.js';
 import { disk, missingParts, markSaved, markUnavailable } from './state.js';
+import { Guard, Halt, classifyStatus, retryAfterMs } from './throttle.js';
 
 const EXT_BY_TYPE = {
 	'image/jpeg': 'jpg',
@@ -57,39 +58,85 @@ async function looksLike(blob, kind) {
 	return MAGIC[kind].some(([off, sig]) => sig.every((b, i) => head[off + i] === b));
 }
 
+const HTML_PREFIXES = ['<!doctype', '<html', '<?xml', '<head'];
+
+/**
+ * Distinguishes "TikTok is challenging us" from "this mirror is stale".
+ *
+ * Worth the extra sniff rather than trusting the Content-Type: the captcha page
+ * arrives under HTTP 200, and has been seen served as octet-stream as well as
+ * text/html. The two cases need opposite responses — a stale mirror means try
+ * the next one, a challenge means stop the run — so guessing is not an option.
+ */
+async function looksChallenged(blob) {
+	if ((blob.type || '').startsWith('text/')) return true;
+	const head = new TextDecoder().decode(await blob.slice(0, 64).arrayBuffer()).trim().toLowerCase();
+	return HTML_PREFIXES.some((p) => head.startsWith(p));
+}
+
+/** Rounds through the mirror list, but only when a throttle caused the retry. */
+const MAX_ROUNDS = 4;
+
 /**
  * Try each candidate URL in turn; TikTok hands out several mirrors per asset.
  * `expect` is 'video' or 'image' — a response that isn't actually that is
  * treated as a failure so the next mirror gets a turn.
+ *
+ * A 429 is the one case that does *not* move to the next mirror: they resolve to
+ * the same edge fleet, so the next one is another request into a limit we have
+ * already hit. It backs off and re-tries the whole list instead.
  */
-export async function fetchFirst(urls, { signal, expect } = {}) {
+export async function fetchFirst(urls, { signal, expect, guard } = {}) {
+	const list = urls.filter(Boolean);
+	if (!list.length) throw new Error('no candidate URLs');
 	let lastErr = null;
-	for (const url of urls) {
-		if (!url) continue;
-		try {
-			const res = await fetch(url, { credentials: 'include', signal, cache: 'no-store' });
-			if (!res.ok) {
-				lastErr = new Error(`HTTP ${res.status}`);
-				continue;
+
+	for (let round = 0; round < MAX_ROUNDS; round++) {
+		let throttled = false;
+
+		for (const url of list) {
+			if (guard) await guard.pass(signal);
+			try {
+				const res = await fetch(url, { credentials: 'include', signal, cache: 'no-store' });
+				if (!res.ok) {
+					lastErr = new Error(`HTTP ${res.status}`);
+					const kind = classifyStatus(res.status);
+					if (kind) {
+						guard?.penalise(kind, retryAfterMs(res.headers));
+						throttled = true;
+						break;
+					}
+					continue;
+				}
+				const blob = await res.blob();
+				if (blob.size === 0) {
+					lastErr = new Error('empty body');
+					continue;
+				}
+				if (await looksChallenged(blob)) {
+					// Every remaining mirror would answer the same way, and so would
+					// every other item in the queue.
+					const why = 'TikTok served a challenge page instead of media';
+					guard?.halt(why);
+					throw new Halt(why);
+				}
+				if (!(await looksLike(blob, expect))) {
+					lastErr = new Error(`payload is not ${expect} (${blob.size}B, ${blob.type || 'no type'})`);
+					continue;
+				}
+				guard?.ok();
+				return { blob, url };
+			} catch (err) {
+				if (err instanceof Halt || err?.name === 'AbortError') throw err;
+				lastErr = err;
 			}
-			const blob = await res.blob();
-			if (blob.size === 0) {
-				lastErr = new Error('empty body');
-				continue;
-			}
-			if ((blob.type || '').startsWith('text/')) {
-				lastErr = new Error(`got ${blob.type} — TikTok served a challenge page, not media`);
-				continue;
-			}
-			if (!(await looksLike(blob, expect))) {
-				lastErr = new Error(`payload is not ${expect} (${blob.size}B, ${blob.type || 'no type'})`);
-				continue;
-			}
-			return { blob, url };
-		} catch (err) {
-			lastErr = err;
 		}
+
+		// Mirrors genuinely exhausted rather than refused — another round would
+		// just repeat the same failures against the same URLs.
+		if (!throttled) break;
 	}
+
 	throw lastErr || new Error('no candidate URLs');
 }
 
@@ -97,7 +144,7 @@ export async function fetchFirst(urls, { signal, expect } = {}) {
  * @param {object} rec normalized record from the collector
  * @returns {Promise<{saved: string[], skipped: string[]}>}
  */
-async function saveRecord(rec, state, { signal, onFile } = {}) {
+async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 	const want = missingParts(rec);
 	const saved = [];
 	const files = {};
@@ -105,7 +152,7 @@ async function saveRecord(rec, state, { signal, onFile } = {}) {
 	// Paths recorded in archive.json are archive-relative, so the JSON is useful
 	// to anything reading the folder without knowing this code's layout rules.
 	if (want.includes('video') && rec.video?.length) {
-		const { blob, url } = await fetchFirst(rec.video, { signal, expect: 'video' });
+		const { blob, url } = await fetchFirst(rec.video, { signal, expect: 'video', guard });
 		const name = `${rec.id}.mp4`;
 		await writeFile(LAYOUT.videos, name, blob);
 		disk.videos.add(rec.id);
@@ -117,7 +164,7 @@ async function saveRecord(rec, state, { signal, onFile } = {}) {
 	if (want.includes('photos') && rec.photos?.length) {
 		const paths = [];
 		for (let i = 0; i < rec.photos.length; i++) {
-			const { blob, url } = await fetchFirst(rec.photos[i], { signal, expect: 'image' });
+			const { blob, url } = await fetchFirst(rec.photos[i], { signal, expect: 'image', guard });
 			const name = `${String(i + 1).padStart(2, '0')}.${extFor(blob, url, 'jpg')}`;
 			await writeFile([...LAYOUT.images, rec.id], name, blob);
 			paths.push([...LAYOUT.images, rec.id, name].join('/'));
@@ -136,11 +183,15 @@ async function saveRecord(rec, state, { signal, onFile } = {}) {
  * Bounded-concurrency queue that accepts work while it's already draining.
  */
 export class DownloadQueue {
-	constructor({ concurrency = 4, state, onProgress, onError } = {}) {
+	constructor({ concurrency = 4, state, onProgress, onError, onThrottle, onHalt } = {}) {
 		this.concurrency = concurrency;
 		this.state = state;
 		this.onProgress = onProgress || (() => {});
 		this.onError = onError || (() => {});
+		this.onHalt = onHalt || (() => {});
+		// The collector holds a Guard of its own; `onThrottle` is how the two are
+		// kept in step, so a limit met here also stops the list being paged.
+		this.guard = new Guard({ onNotice: onThrottle || (() => {}) });
 		this.queue = [];
 		this.active = 0;
 		this.controller = new AbortController();
@@ -148,6 +199,7 @@ export class DownloadQueue {
 		this.failed = [];
 		this._idleResolvers = [];
 		this.paused = false;
+		this._halted = false;
 	}
 
 	add(rec) {
@@ -212,6 +264,7 @@ export class DownloadQueue {
 		try {
 			const res = await saveRecord(rec, this.state, {
 				signal: this.controller.signal,
+				guard: this.guard,
 				onFile: (f) => {
 					this.stats.bytes += f.bytes || 0;
 				},
@@ -219,6 +272,20 @@ export class DownloadQueue {
 			if (res.saved.length) this.stats.done++;
 			else this.stats.skipped++;
 		} catch (err) {
+			// Neither a halt nor a stop says anything about this item, so neither
+			// may mark it `unavailable` — that status is a claim about the media,
+			// and a run that resumes tomorrow would skip everything it touched.
+			if (err instanceof Halt) {
+				this.queue.unshift(rec);
+				this.pause();
+				if (!this._halted) {
+					this._halted = true;
+					this.onHalt(err.message);
+				}
+				return;
+			}
+			if (err?.name === 'AbortError') return;
+
 			this.stats.failed++;
 			this.failed.push({ id: rec.id, error: String((err && err.message) || err) });
 			markUnavailable(this.state, rec.id, String((err && err.message) || err));
