@@ -804,6 +804,94 @@
 		renderCount();
 	}
 
+	/**
+	 * Wrap the loop when the pictures run out rather than when the file does.
+	 *
+	 * TikTok's MP4s nearly always carry an audio track that outlasts the video
+	 * track by 150–250ms — AAC encoder padding, mostly. The container's duration
+	 * is the longer of the two, so `loop` holds the final frame frozen for a
+	 * fifth of a second before it wraps, which reads as the clip stopping a few
+	 * frames short and then hesitating.
+	 *
+	 * Where the video track ends isn't exposed anywhere, so it's learned by
+	 * watching frames arrive: once playback has run past the newest frame by
+	 * more than a couple of frame intervals, and it's near the end of the file
+	 * at that, the tail has started. The point is remembered so later laps wrap
+	 * on time instead of finding it again. `loop` is left on throughout — this
+	 * only ever wraps *early*, so a file whose tracks do end together, or a
+	 * browser that can't report frames at all, keeps the plain behaviour.
+	 *
+	 * Both ways of hearing that a frame happened are wired up, because neither
+	 * is everywhere: `requestVideoFrameCallback`, which Chrome has had since 83
+	 * and Firefox only since 132, and the playback-quality counter, which goes
+	 * back much further. Either way it's only the *news* that is taken from
+	 * them — where the clip had got to is read off `currentTime` at that moment.
+	 *
+	 * The frame callback does carry a timestamp of its own, and using it is the
+	 * obvious thing, but it can't be trusted to mean what it says: measured on
+	 * Firefox 153, `mediaTime` keeps climbing across a native loop instead of
+	 * starting the new lap over — 36.6s into a 7.1s clip, five laps in. Reading
+	 * it would put the newest frame permanently ahead of playback and the tail
+	 * would never be noticed at all. `currentTime` is late by up to a paint,
+	 * which the slack in the threshold covers, but it is always this lap's.
+	 */
+	function loopOnLastFrame(v) {
+		const exact = !!v.requestVideoFrameCallback;
+		if (!exact && !v.getVideoPlaybackQuality) return;
+
+		let frameAt = 0; // Where the newest frame to appear sits in the clip.
+		let gap = 1 / 30; // And how far apart those have been arriving.
+		let seeded = false; // Whether frameAt is this lap's rather than the last's.
+		let made = -1; // Frames produced so far, when that's all there is to go on.
+		let tail = Infinity; // The first instant with no picture behind it,
+		let guess = 0; // once a second lap has agreed with the first one's answer.
+
+		/** A picture has appeared, and it sits at `at` in the clip. */
+		function mark(at) {
+			const step = at - frameAt;
+			// A negative step is the wrap itself; an implausible one is a seek.
+			if (seeded && step > 0 && step < 0.5) gap = step;
+			seeded = true;
+			frameAt = at;
+		}
+
+		if (exact) {
+			v.requestVideoFrameCallback(function seen() {
+				if (!v.isConnected) return;
+				mark(v.currentTime);
+				v.requestVideoFrameCallback(seen);
+			});
+		}
+
+		(function watch() {
+			if (!v.isConnected) return;
+			requestAnimationFrame(watch);
+			if (v.paused || v.seeking) return;
+
+			if (!exact) {
+				const n = v.getVideoPlaybackQuality().totalVideoFrames;
+				if (n !== made) {
+					if (made >= 0) mark(v.currentTime);
+					made = n;
+				}
+			}
+
+			// Only ever the last second of the clip: a frame dropped in the middle
+			// of one, or a callback starved by a hidden tab, isn't a tail.
+			if (!(v.duration - v.currentTime < 1)) return;
+			if (v.currentTime < tail && v.currentTime - frameAt < gap * 1.5 + 0.03) return;
+			// A single lap's answer can be a stutter rather than the tail, and a
+			// memo taken from one would trim every lap after it short. It's held
+			// until a second lap lands in the same place, and trusted only then.
+			const end = frameAt + gap;
+			if (Math.abs(end - guess) < gap * 1.5) tail = Math.min(tail, end);
+			guess = end;
+			frameAt = 0;
+			seeded = false;
+			v.currentTime = 0;
+		})();
+	}
+
 	function renderStage(item) {
 		const stage = $('lbStage');
 		clearStage();
@@ -851,6 +939,7 @@
 			{ once: true }
 		);
 		stage.appendChild(v);
+		loopOnLastFrame(v);
 
 		// Sound needs a gesture behind it, and stepping with the wheel or the keys
 		// isn't always counted as one. A refused play is retried muted rather than
