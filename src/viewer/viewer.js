@@ -476,9 +476,76 @@
 	let lbSheet = false;
 	/** Carried between items, so muting once stays muted for the rest of the run. */
 	let lbMuted = false;
+	/** The other two a fresh element resets: speed and level both carry the same way. */
+	let lbRate = 1;
+	let lbVolume = 1;
 
 	function lbOpen() {
 		return lbIndex >= 0;
+	}
+
+	// ------------------------------------------------------------------ playback
+
+	/**
+	 * The rungs a player's own speed menu offers, and what [ and ] step through.
+	 * A ladder rather than arithmetic: 1.25 and 1.75 are worth having either side
+	 * of 1×, and nothing past 2× is worth a quarter of.
+	 */
+	const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
+	const STORE = 'ttarchive-playback';
+
+	/** Everything a new <video> defaults away from, applied in one place. */
+	function applyPlayback(v) {
+		// Both, because `load()` resets playbackRate to whatever the default is.
+		v.defaultPlaybackRate = lbRate;
+		v.playbackRate = lbRate;
+		v.volume = lbVolume;
+		v.muted = lbMuted;
+	}
+
+	function eachVideo(fn) {
+		for (const v of $('lbStage').querySelectorAll('video')) fn(v);
+	}
+
+	/**
+	 * Best-effort and no more: a file:// document has an opaque origin, and a
+	 * browser is within its rights to refuse it storage. Where that happens the
+	 * settings still carry between items — the run just starts at 1× again.
+	 *
+	 * Mute is deliberately not kept. The autoplay fallback below sets it on the
+	 * viewer's behalf, so persisting it would mostly persist a mute nobody asked
+	 * for, and a silent archive with the control reading unmuted is a puzzle.
+	 */
+	function remember() {
+		try {
+			localStorage.setItem(STORE, JSON.stringify({ rate: lbRate, volume: lbVolume }));
+		} catch (_) {}
+	}
+
+	function recall() {
+		try {
+			const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
+			// Comparisons rather than truthiness: a stored null or string is out on
+			// the same test, and a stored 0 volume is silence dressed as a setting.
+			if (saved.rate > 0) lbRate = Math.min(4, saved.rate);
+			if (saved.volume > 0 && saved.volume <= 1) lbVolume = saved.volume;
+		} catch (_) {}
+	}
+
+	function setRate(rate) {
+		lbRate = rate;
+		remember();
+		eachVideo(applyPlayback);
+		renderCount();
+	}
+
+	function stepRate(delta) {
+		// An off-ladder rate can arrive from the player's own menu; step from the
+		// rung next to it rather than snapping back to the start of the ladder.
+		let at = RATES.findIndex((r) => r >= lbRate);
+		if (at < 0) at = RATES.length - 1;
+		else if (delta > 0 && RATES[at] > lbRate) at--;
+		setRate(RATES[Math.min(RATES.length - 1, Math.max(0, at + delta))]);
 	}
 
 	function clearStage() {
@@ -572,7 +639,10 @@
 		const n = item && item.type === 'photo' ? photoPaths(item).length : 0;
 		const where = `${(lbIndex + 1).toLocaleString()} / ${filtered.length.toLocaleString()}`;
 		const shot = lbSheet ? `all ${n} images` : `image ${lbPhoto + 1} of ${n}`;
-		$('lbCount').textContent = n > 1 ? `${where} · ${shot}` : where;
+		// The rate is a setting with no control of its own on screen, so the counter
+		// is where it says so — and only where there is something for it to act on.
+		const speed = lbRate !== 1 && item && item.type !== 'photo' ? ` · ${lbRate}×` : '';
+		$('lbCount').textContent = (n > 1 ? `${where} · ${shot}` : where) + speed;
 		$('lbPrev').disabled = nextIndex(-1) < 0;
 		$('lbNext').disabled = nextIndex(1) < 0;
 	}
@@ -758,8 +828,19 @@
 		v.src = src(path);
 		v.controls = true;
 		v.loop = true;
-		v.muted = lbMuted;
-		v.addEventListener('volumechange', () => (lbMuted = v.muted));
+		applyPlayback(v);
+		// The element's own controls are the other way to set these, and what they
+		// set has to carry onward exactly as what the keys set does.
+		v.addEventListener('volumechange', () => {
+			lbMuted = v.muted;
+			lbVolume = v.volume;
+			remember();
+		});
+		v.addEventListener('ratechange', () => {
+			lbRate = v.playbackRate;
+			remember();
+			renderCount();
+		});
 		// `isConnected` because tearing this element down to step onward can itself
 		// raise an error, and a stale handler would blank the item now on the stage.
 		v.addEventListener(
@@ -903,7 +984,25 @@
 				break;
 			case 'm':
 				lbMuted = !lbMuted;
-				for (const v of $('lbStage').querySelectorAll('video')) v.muted = lbMuted;
+				// Unmuting into a level of zero is silence with the control saying
+				// otherwise. The player's own slider and its mute flag move together;
+				// so do these.
+				if (!lbMuted && !lbVolume) lbVolume = 1;
+				remember();
+				eachVideo(applyPlayback);
+				break;
+			// Speed, on the two keys next to each other and on YouTube's pair for the
+			// same job. Nothing else here wants them.
+			case '[':
+			case '<':
+				stepRate(-1);
+				break;
+			case ']':
+			case '>':
+				stepRate(1);
+				break;
+			case '\\':
+				setRate(1);
 				break;
 			case 'g':
 				toggleSheet();
@@ -965,6 +1064,7 @@
 		{ passive: true }
 	);
 
+	recall();
 	applyFilters();
 	setSub();
 
