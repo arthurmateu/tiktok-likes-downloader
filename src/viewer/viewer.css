@@ -436,25 +436,39 @@ select:focus {
  * leaves a post of three small and shoved into the left-hand corner. Each image
  * keeps its own shape and a share of the height, so three fill a row and nine
  * stack into three.
+ *
+ * How big that share is comes from the post itself: the script measures the room
+ * beside the metadata panel, tries every way of dividing it up, and writes back
+ * the one that shows an image biggest. The values here are what stands until the
+ * first image has loaded and there is something to measure.
  */
 .lb-sheet {
+	--gap: 10px;
+	--cell-h: clamp(150px, 34vh, 300px);
+	--cell-w: 100%;
 	position: relative;
 	max-height: 88vh;
 	max-width: 60vw;
 	overflow: auto;
 	display: flex;
 	flex-wrap: wrap;
-	gap: 10px;
+	gap: var(--gap);
 	justify-content: center;
 	/* `safe`: a centred row that overflows is clipped at a top no scroll can
 	   reach, which on a nine-image post hides the first row outright. */
 	align-content: safe center;
 	padding: 4px;
 }
+/*
+ * A share of the stage rather than a fixed size: a post of two then fills the
+ * height the carousel would have had, instead of sitting in the middle of the
+ * screen at thumbnail size. The floor is what makes a post of thirty scroll
+ * rather than shrink to stamps.
+ */
 .lb-sheet img {
-	height: clamp(150px, 34vh, 300px);
+	height: max(140px, var(--cell-h));
 	width: auto;
-	max-width: 100%;
+	max-width: var(--cell-w);
 	max-height: none;
 	object-fit: contain;
 	cursor: pointer;

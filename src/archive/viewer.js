@@ -430,6 +430,72 @@ function sheetToggle(label) {
 	return b;
 }
 
+/**
+ * How big one image in the sheet may be — a cell, in pixels, for the CSS.
+ *
+ * The row count is chosen rather than fixed, because the best shape depends on
+ * the images: nine tall ones go far bigger in two rows of five than in three
+ * rows of three, while nine wide ones do not. Every row count is tried and the
+ * one that shows an image biggest wins.
+ *
+ * Until an image has loaded there is nothing to measure and the stylesheet's own
+ * fallback stands; each load calls back in with a better answer.
+ */
+function fitSheet(sheet, n) {
+	const shapes = [...sheet.querySelectorAll('img')]
+		.filter((img) => img.naturalWidth)
+		.map((img) => img.naturalWidth / img.naturalHeight);
+	if (!shapes.length) return;
+
+	// The widest one decides: sized for the average, a panorama among portraits is
+	// the image that overflows the row it was given.
+	const aspect = Math.max(...shapes);
+	const gap = 10;
+	const room = sheetRoom(sheet);
+
+	let best = { rows: n, cols: 1, size: 0 };
+	for (let rows = 1; rows <= n; rows++) {
+		const cols = Math.ceil(n / rows);
+		const size = Math.min((room.height - (rows - 1) * gap) / rows, (room.width - (cols - 1) * gap) / cols / aspect);
+		if (size > best.size) best = { rows, cols, size };
+	}
+
+	// The height is the winning size itself, not the row's share of the box: a row
+	// too narrow for it is what decides on a wide post, and taking the share
+	// instead leaves the image letterboxed in a cell it can't fill.
+	//
+	// Floored, both of them: a cell a fraction of a pixel too wide is a row that
+	// wraps one image early, and the sheet then scrolls for a post that had
+	// fitted.
+	sheet.style.setProperty('--cell-h', `${Math.floor(best.size)}px`);
+	sheet.style.setProperty('--cell-w', `${Math.floor((room.width - (best.cols - 1) * gap) / best.cols)}px`);
+}
+
+/**
+ * What the sheet actually has, which is not 60vw × 88vh: the metadata panel and
+ * the arrows take their share off the width first, and on a narrow window that
+ * is most of it. Measured rather than assumed — the stylesheet's cap and a page
+ * scrollbar both land here.
+ */
+function sheetRoom(sheet) {
+	const frame = sheet.closest('.lightbox');
+	const style = getComputedStyle(frame);
+	const gap = parseFloat(style.columnGap) || 0;
+	let width = frame.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+	for (const part of frame.children) {
+		// The count, the hint and the close button are out of flow and take
+		// nothing; the stage is the sheet's own.
+		if (part.contains(sheet) || getComputedStyle(part).position === 'absolute') continue;
+		width -= part.getBoundingClientRect().width + gap;
+	}
+	const height = frame.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom);
+	return {
+		width: Math.min(width, window.innerWidth * 0.6) - 8,
+		// The toggle's row, the gap under it and the sheet's own padding.
+		height: Math.min(height, window.innerHeight * 0.88) - 44,
+	};
+}
+
 /** One image, arrows, dots — the shape TikTok's own slideshow player has. */
 function photoShot(names, url) {
 	const shot = document.createElement('div');
@@ -506,6 +572,7 @@ async function renderStage(item) {
 		if (lbSheet && names.length > 1) {
 			const sheet = document.createElement('div');
 			sheet.className = 'lb-sheet';
+
 			// The toggle gets a row to itself: as a flex item it would be stretched
 			// to the full width of one, and a pill that wide reads as a header bar.
 			const head = document.createElement('div');
@@ -528,6 +595,10 @@ async function renderStage(item) {
 					renderStage(filtered[lbIndex]);
 					renderCount();
 				});
+				// The shape of the post is only known once something has arrived, and
+				// each arrival can change it: one landscape image among portraits is a
+				// different sheet.
+				img.addEventListener('load', () => fitSheet(sheet, names.length), { once: true });
 				sheet.appendChild(img);
 			}
 			return;
@@ -635,6 +706,13 @@ export function wireLibrary(stateGetter) {
 	$('lbNext').addEventListener('click', () => step(1));
 	$('lightbox').addEventListener('click', (e) => {
 		if (e.target.id === 'lightbox') closeLightbox();
+	});
+
+	// The sheet is measured in pixels, so a window that changes size has to have
+	// the sum done again.
+	window.addEventListener('resize', () => {
+		const sheet = $('lbStage').querySelector('.lb-sheet');
+		if (sheet) fitSheet(sheet, sheet.querySelectorAll('img').length);
 	});
 
 	document.addEventListener('keydown', (e) => {
