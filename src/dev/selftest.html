@@ -250,18 +250,18 @@
 					? no("conflictAction:'overwrite' uniquified instead", tail(again.filename))
 					: ok("conflictAction:'overwrite' rewrites in place", tail(again.filename));
 
-				// Flagged as a real risk in downloads.js: Firefox sanitises download
-				// filenames and a leading-dot directory is the likeliest casualty.
-				const dotted = await put('data/.ttarchive/state.json', '{"version":1}');
-				if (dotted.state !== 'complete') {
-					no('a dot-directory path failed to download', `${dotted.state} ${dotted.error || ''}`);
-				} else if (tail(dotted.filename).includes('.ttarchive')) {
-					ok('a leading-dot directory survives Firefox sanitising', tail(dotted.filename));
+				// The metadata now sits at the archive root, so a bare filename with
+				// no directory component has to land where we asked and keep its name.
+				const meta = await put('archive.json', '{"version":2}');
+				if (meta.state !== 'complete') {
+					no('a root-level write failed', `${meta.state} ${meta.error || ''}`);
+				} else if (tail(meta.filename, 2) === `${FOLDER}/archive.json`) {
+					ok('archive.json lands at the archive root', tail(meta.filename, 2));
 				} else {
-					no('Firefox rewrote the dot-directory', `wanted data/.ttarchive/state.json, got ${tail(dotted.filename)}`);
+					no('Firefox rewrote the root-level path', `wanted ${FOLDER}/archive.json, got ${tail(meta.filename, 2)}`);
 				}
 
-				const nested = await put('data/Likes/photos/7660000000000000000/01.jpg', 'img');
+				const nested = await put('images/7660000000000000000/01.jpg', 'img');
 				nested.state === 'complete'
 					? ok('a deep nested path works', tail(nested.filename, 4))
 					: no('a deep nested path failed', `${nested.state} ${nested.error || ''}`);
@@ -274,12 +274,12 @@
 				const previous = await idbGet(FOLDER_KEY);
 				try {
 					await fs.pickFolder({ name: FOLDER });
-					const files = await fs.listFiles(['data', 'Likes', 'photos', '7660000000000000000']);
+					const files = await fs.listFiles([...fs.LAYOUT.images, '7660000000000000000']);
 					files.has('01.jpg')
 						? ok('the backend reads its own writes back out of download history')
 						: no('the backend did not see a file it just wrote', `saw {${[...files].join(', ')}}`);
 
-					const dirs = await fs.listDirs(['data', 'Likes', 'photos']);
+					const dirs = await fs.listDirs(fs.LAYOUT.images);
 					dirs.has('7660000000000000000')
 						? ok('listDirs finds the photo-post directory')
 						: no('listDirs missed the photo-post directory', `saw {${[...dirs].join(', ')}}`);

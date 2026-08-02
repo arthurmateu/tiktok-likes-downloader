@@ -34,9 +34,9 @@
 				</div>
 
 				<div id="noFolder" class="notice">
-					Pick the folder you want to archive into. If it's an existing myfaveTT folder, its
-					<code>data/Likes</code> contents are detected automatically and nothing gets
-					re-downloaded.
+					Pick the folder you want to archive into. If it's an existing myfaveTT folder, run
+					<code>script.py</code> in it first — that converts what's already there, so nothing
+					gets re-downloaded.
 				</div>
 
 				<!-- Only shown on the downloads backend (Firefox): no folder picker exists. -->
@@ -59,9 +59,9 @@
 				<div id="scanRow" class="row hidden">
 					<button id="scanFolder" class="btn">Scan an existing folder…</button>
 					<span class="muted grow">
-						Optional, and re-runnable. Lets Firefox see what's already on disk, import a
-						myfaveTT archive, and play files back in the Library — none of which it can do
-						from a download folder alone.
+						Optional, and re-runnable. Lets Firefox see what's already on disk, read
+						<code>archive.json</code> back, and play files in the Library — none of which it
+						can do from a download folder alone.
 					</span>
 					<input id="scanInput" type="file" webkitdirectory directory multiple class="hidden" />
 				</div>
@@ -70,7 +70,7 @@
 					<div class="cards">
 						<div class="card"><span class="num" id="statVideos">–</span><span class="lbl">videos on disk</span></div>
 						<div class="card"><span class="num" id="statPhotos">–</span><span class="lbl">photo posts</span></div>
-						<div class="card"><span class="num" id="statCovers">–</span><span class="lbl">covers</span></div>
+						<div class="card"><span class="num" id="statGone">–</span><span class="lbl">no longer available</span></div>
 						<div class="card"><span class="num" id="statKnown">–</span><span class="lbl">items with metadata</span></div>
 					</div>
 
@@ -134,7 +134,7 @@
 			<section id="panel-about" class="panel">
 				<h2>How it works</h2>
 				<ol>
-					<li>Pick any folder. Everything is written under <code>data/Likes/</code> in that folder.</li>
+					<li>Pick any folder. Everything is written straight into it — see below.</li>
 					<li>
 						Press <b>Sync likes</b>. A TikTok tab opens on your profile, switches to the Liked tab and
 						scrolls itself. The extension reads the list responses the page makes — it does not forge
@@ -148,14 +148,15 @@
 
 				<h2>Where files go</h2>
 				<pre class="tree">&lt;your folder&gt;/
-  data/
-    Likes/
-      videos/&lt;videoId&gt;.mp4        same naming as myfaveTT
-      covers/&lt;videoId&gt;.jpg        same naming as myfaveTT
-      photos/&lt;postId&gt;/01.jpg      new — photo posts, one folder per post
-    .ttarchive/
-      state.json                  our metadata (plain JSON)
-    .appdata/                     myfaveTT's files — read only, never modified</pre>
+  videos/&lt;videoId&gt;.mp4          one file per video
+  images/&lt;postId&gt;/01.jpg        one folder per photo post
+  archive.json                  every liked item, downloaded or not</pre>
+				<p>
+					Converting an existing myfaveTT folder — or an older version of this one, which used
+					<code>data/Likes/</code> — is a one-off: drop <code>script.py</code> into it and run it.
+					It moves the media into place and writes <code>archive.json</code> from myfaveTT's
+					databases, so nothing is downloaded twice.
+				</p>
 
 				<h2>On Firefox</h2>
 				<p>

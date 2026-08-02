@@ -3,8 +3,12 @@
  *
  * Reads media straight off the chosen folder through the same storage backend
  * the downloader writes with, so it works offline and never re-hits TikTok.
- * Covers are loaded lazily and their object URLs are revoked on scroll-out — at
- * 6k+ items holding them all alive is a few GB of blob memory.
+ * Thumbnails are loaded lazily and their object URLs are revoked on scroll-out
+ * — at 6k+ items holding them all alive is a few GB of blob memory.
+ *
+ * There are no cover files in the archive: a thumbnail is either a photo post's
+ * first image, or a frame decoded out of the video itself. The decoded frames
+ * are cached as small JPEGs so scrolling back over a tile is free.
  *
  * On a backend that can't read its own output (Gecko's downloads folder) every
  * read simply returns null until the user scans the folder, so tiles fall back
@@ -130,7 +134,7 @@ function setupObserver() {
 				if (e.isIntersecting) {
 					if (img.dataset.loaded) continue;
 					img.dataset.loaded = '1';
-					loadCover(el.dataset.id).then((url) => {
+					loadThumb(el.dataset.id).then((url) => {
 						if (url) img.src = url;
 						else img.dataset.loaded = '';
 					});
@@ -145,15 +149,122 @@ function setupObserver() {
 	);
 }
 
-async function loadCover(id) {
-	const name = disk.covers.get(id);
-	if (name) return blobURL(LAYOUT.covers, name);
-	// Photo posts written before a cover existed: fall back to the first image.
-	if (disk.photoDirs.has(id)) {
-		const files = [...(await listFiles([...LAYOUT.photos, id]))].sort();
-		if (files.length) return blobURL([...LAYOUT.photos, id], files[0]);
+// ------------------------------------------------------------------ thumbnails
+
+/**
+ * Decoded video frames, id -> JPEG blob. Bounded because a full scroll through
+ * a 6k archive would otherwise pin every frame it ever drew; at ~20 KB each the
+ * cap is a few MB and a re-decode costs one seek.
+ */
+const THUMB_CACHE_MAX = 400;
+const thumbs = new Map();
+
+function cacheThumb(id, blob) {
+	thumbs.set(id, blob);
+	while (thumbs.size > THUMB_CACHE_MAX) thumbs.delete(thumbs.keys().next().value);
+	return blob;
+}
+
+/**
+ * Draw one frame out of a video file.
+ *
+ * Seeks a little way in rather than taking frame 0, which on TikTok is very
+ * often black or a fade-in. The source blob is a File handle, so the decoder
+ * reads only the bytes it needs and not the whole clip.
+ */
+function frameFrom(blob) {
+	return new Promise((resolve) => {
+		const url = URL.createObjectURL(blob);
+		const v = document.createElement('video');
+		v.muted = true;
+		v.preload = 'metadata';
+
+		let settled = false;
+		const done = (out) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			URL.revokeObjectURL(url);
+			v.removeAttribute('src');
+			v.load();
+			resolve(out);
+		};
+		const timer = setTimeout(() => done(null), 10000);
+
+		v.addEventListener('error', () => done(null), { once: true });
+		v.addEventListener(
+			'loadeddata',
+			() => {
+				v.currentTime = Math.min(0.5, (v.duration || 1) / 4);
+			},
+			{ once: true }
+		);
+		v.addEventListener(
+			'seeked',
+			() => {
+				try {
+					const w = 360;
+					const h = Math.round(w * (v.videoHeight / v.videoWidth || 16 / 9));
+					const c = document.createElement('canvas');
+					c.width = w;
+					c.height = h;
+					c.getContext('2d').drawImage(v, 0, 0, w, h);
+					c.toBlob((out) => done(out), 'image/jpeg', 0.72);
+				} catch (_) {
+					done(null);
+				}
+			},
+			{ once: true }
+		);
+
+		v.src = url;
+	});
+}
+
+/**
+ * Decoding is serialized two at a time. A screenful of tiles all becoming
+ * visible at once would otherwise spin up twenty video decoders together, which
+ * stalls the page for longer than the thumbnails are worth.
+ */
+let decoding = 0;
+const decodeQueue = [];
+
+function pumpDecode() {
+	while (decoding < 2 && decodeQueue.length) {
+		const job = decodeQueue.shift();
+		decoding++;
+		job().finally(() => {
+			decoding--;
+			pumpDecode();
+		});
 	}
-	return null;
+}
+
+function queueDecode(fn) {
+	return new Promise((resolve) => {
+		decodeQueue.push(() => fn().then(resolve, () => resolve(null)));
+		pumpDecode();
+	});
+}
+
+/** Exported so src/dev/thumbs.html can drive it without an IntersectionObserver. */
+export async function loadThumb(id) {
+	if (disk.photoDirs.has(id)) {
+		const files = [...(await listFiles([...LAYOUT.images, id]))].sort();
+		if (files.length) return blobURL([...LAYOUT.images, id], files[0]);
+		return null;
+	}
+
+	const cached = thumbs.get(id);
+	if (cached) return URL.createObjectURL(cached);
+	if (!disk.videos.has(id)) return null;
+
+	return queueDecode(async () => {
+		const file = await readBlob(LAYOUT.videos, `${id}.mp4`);
+		if (!file) return null;
+		const frame = await frameFrom(file);
+		return frame ? URL.createObjectURL(cacheThumb(id, frame)) : null;
+	});
 }
 
 // ------------------------------------------------------------------ lightbox
@@ -175,9 +286,9 @@ async function openLightbox(item) {
 	$('lightbox').classList.remove('hidden');
 
 	if (item.type === 'photo') {
-		const files = [...(await listFiles([...LAYOUT.photos, item.id]))].sort();
+		const files = [...(await listFiles([...LAYOUT.images, item.id]))].sort();
 		for (const f of files) {
-			const url = await blobURL([...LAYOUT.photos, item.id], f);
+			const url = await blobURL([...LAYOUT.images, item.id], f);
 			if (!url) continue;
 			openURLs.push(url);
 			const img = document.createElement('img');
@@ -215,6 +326,15 @@ async function openLightbox(item) {
 	add('Likes', fmtCount(item.stats?.diggCount));
 	add('Plays', fmtCount(item.stats?.playCount));
 	add('Type', item.type === 'photo' ? `photo post (${item.photoCount || '?'} images)` : 'video');
+	add(
+		'Status',
+		{
+			saved: 'saved',
+			pending: 'in your likes, not downloaded',
+			unavailable: `download failed${typeof item.unavailable === 'string' ? ` — ${item.unavailable}` : ''}`,
+			gone: 'no longer in your likes — deleted, privated or unliked',
+		}[item.status] || ''
+	);
 	add('ID', item.id);
 
 	const link = document.createElement('a');

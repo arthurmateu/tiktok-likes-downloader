@@ -102,44 +102,30 @@ async function saveRecord(rec, state, { signal, onFile } = {}) {
 	const saved = [];
 	const files = {};
 
+	// Paths recorded in archive.json are archive-relative, so the JSON is useful
+	// to anything reading the folder without knowing this code's layout rules.
 	if (want.includes('video') && rec.video?.length) {
-		const { blob, url } = await fetchFirst(rec.video, { signal });
+		const { blob, url } = await fetchFirst(rec.video, { signal, expect: 'video' });
 		const name = `${rec.id}.mp4`;
 		await writeFile(LAYOUT.videos, name, blob);
 		disk.videos.add(rec.id);
-		files.video = name;
+		files.video = [...LAYOUT.videos, name].join('/');
 		saved.push('video');
 		onFile?.({ id: rec.id, kind: 'video', bytes: blob.size, url });
 	}
 
 	if (want.includes('photos') && rec.photos?.length) {
-		const names = [];
+		const paths = [];
 		for (let i = 0; i < rec.photos.length; i++) {
-			const { blob, url } = await fetchFirst(rec.photos[i], { signal });
+			const { blob, url } = await fetchFirst(rec.photos[i], { signal, expect: 'image' });
 			const name = `${String(i + 1).padStart(2, '0')}.${extFor(blob, url, 'jpg')}`;
-			await writeFile([...LAYOUT.photos, rec.id], name, blob);
-			names.push(name);
+			await writeFile([...LAYOUT.images, rec.id], name, blob);
+			paths.push([...LAYOUT.images, rec.id, name].join('/'));
 			onFile?.({ id: rec.id, kind: 'photo', index: i + 1, bytes: blob.size, url });
 		}
-		disk.photoDirs.set(rec.id, names.length);
-		files.photos = names;
+		disk.photoDirs.set(rec.id, paths.length);
+		files.photos = paths;
 		saved.push('photos');
-	}
-
-	if (want.includes('cover') && rec.cover?.length) {
-		try {
-			const { blob, url } = await fetchFirst(rec.cover, { signal });
-			// Keeps myfaveTT's <id>.jpg convention whenever the CDN hands us a JPEG,
-			// which it does for essentially every cover.
-			const name = `${rec.id}.${extFor(blob, url, 'jpg')}`;
-			await writeFile(LAYOUT.covers, name, blob);
-			disk.covers.set(rec.id, name);
-			files.cover = name;
-			saved.push('cover');
-			onFile?.({ id: rec.id, kind: 'cover', bytes: blob.size, url });
-		} catch (_) {
-			// A missing thumbnail is not worth failing the item over.
-		}
 	}
 
 	if (saved.length) markSaved(state, rec.id, files);

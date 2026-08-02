@@ -4,16 +4,31 @@
  * Two sources of truth, deliberately:
  *   - the directory listing decides whether a file needs downloading (a DB can
  *     drift, a file either exists or it doesn't)
- *   - state.json carries metadata for the viewer
+ *   - archive.json carries metadata for the viewer
  *
- * State is plain JSON so it stays greppable and repairable by hand.
+ * archive.json holds *every* item ever seen in the likes list, downloadable or
+ * not. An item TikTok has since deleted can never be re-fetched, but the record
+ * of what it was — id, author, caption, date — costs a few hundred bytes and is
+ * the only thing left if a way to retrieve it ever appears.
+ *
+ * State is plain JSON at the archive root so it stays greppable and repairable
+ * by hand. `tools/script.py` writes the same shape.
  */
 
 import { LAYOUT, listFiles, listDirs, readTextFile, writeFile, refresh } from './fs.js';
-import { importLegacy } from './legacy.js';
 
-const STATE_FILE = 'state.json';
-const STATE_VERSION = 1;
+const STATE_FILE = 'archive.json';
+const STATE_VERSION = 2;
+
+/**
+ * Per-item lifecycle:
+ *   saved       — the media is on disk
+ *   pending     — in your likes list, not downloaded yet
+ *   unavailable — download attempted and failed (expired URL, 403, challenge)
+ *   gone        — was in your likes list once, isn't any more: deleted,
+ *                 privated, or unliked. Unrecoverable; kept for the record.
+ */
+export const STATUS = { saved: 'saved', pending: 'pending', unavailable: 'unavailable', gone: 'gone' };
 
 export function emptyState() {
 	return {
@@ -24,13 +39,11 @@ export function emptyState() {
 		authors: {},
 		likeOrder: [],
 		unavailable: [],
-		legacy: null,
 	};
 }
 
 export const disk = {
 	videos: new Set(), // id
-	covers: new Map(), // id -> actual filename (extension varies)
 	photoDirs: new Map(), // id -> file count
 };
 
@@ -41,27 +54,18 @@ export async function scanDisk() {
 	disk.videos = new Set(
 		[...(await listFiles(LAYOUT.videos))].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4))
 	);
-	disk.covers = new Map(
-		[...(await listFiles(LAYOUT.covers))]
-			.filter((n) => /\.(jpe?g|webp|png|heic|avif)$/i.test(n))
-			.map((n) => [n.replace(/\.[^.]+$/, ''), n])
-	);
 	disk.photoDirs = new Map();
-	for (const id of await listDirs(LAYOUT.photos)) {
-		disk.photoDirs.set(id, (await listFiles([...LAYOUT.photos, id])).size);
+	for (const id of await listDirs(LAYOUT.images)) {
+		disk.photoDirs.set(id, (await listFiles([...LAYOUT.images, id])).size);
 	}
 	return {
 		videos: disk.videos.size,
-		covers: disk.covers.size,
 		photoSets: disk.photoDirs.size,
 	};
 }
 
 export function hasVideo(id) {
 	return disk.videos.has(id);
-}
-export function hasCover(id) {
-	return disk.covers.has(id);
 }
 export function hasPhotos(id, expected) {
 	const n = disk.photoDirs.get(id);
@@ -71,59 +75,26 @@ export function hasPhotos(id, expected) {
 
 /** What still needs fetching for this record, given what's on disk. */
 export function missingParts(rec) {
-	const out = [];
 	if (rec.type === 'photo') {
-		if (!hasPhotos(rec.id, (rec.photos || []).length)) out.push('photos');
-	} else if (!hasVideo(rec.id)) {
-		out.push('video');
+		return hasPhotos(rec.id, (rec.photos || []).length) ? [] : ['photos'];
 	}
-	if (!hasCover(rec.id)) out.push('cover');
-	return out;
+	return hasVideo(rec.id) ? [] : ['video'];
 }
 
 // ---------------------------------------------------------------- load / save
 
 export async function loadState() {
-	const raw = await readTextFile(LAYOUT.appdata, STATE_FILE);
+	const raw = await readTextFile(LAYOUT.root, STATE_FILE);
 	let state = emptyState();
 	if (raw) {
 		try {
 			const parsed = JSON.parse(raw);
 			if (parsed && parsed.version === STATE_VERSION) state = { ...emptyState(), ...parsed };
 		} catch (_) {
-			/* corrupt state.json — fall back to empty; disk scan still finds the media */
+			/* corrupt archive.json — fall back to empty; disk scan still finds the media */
 		}
 	}
 	return state;
-}
-
-/** Pull metadata out of a sibling myfaveTT archive, once, without touching it. */
-export async function mergeLegacy(state) {
-	// Retried whenever a previous attempt found nothing: on Gecko the myfaveTT
-	// DBs only become readable once the user has scanned the folder, which may
-	// well happen after the first load. Six misses cost nothing.
-	if (state.legacy && state.legacy.imported && state.legacy.found) {
-		return { merged: 0, skipped: true, found: true, counts: state.legacy.counts };
-	}
-	const legacy = await importLegacy();
-	if (!legacy) {
-		state.legacy = { imported: true, found: false };
-		return { merged: 0, found: false };
-	}
-
-	let merged = 0;
-	for (const [id, item] of Object.entries(legacy.items)) {
-		if (state.items[id]) continue;
-		state.items[id] = item;
-		merged++;
-	}
-	for (const [id, a] of Object.entries(legacy.authors)) {
-		if (!state.authors[id]) state.authors[id] = a;
-	}
-	if (!state.user && legacy.user) state.user = legacy.user;
-
-	state.legacy = { imported: true, found: true, counts: legacy.counts, at: Date.now() };
-	return { merged, found: true, counts: legacy.counts };
 }
 
 let saveTimer = null;
@@ -151,10 +122,13 @@ export function saveState(state, { immediate = false } = {}) {
 }
 
 async function flush(state) {
-	const blob = new Blob([JSON.stringify(state)], { type: 'application/json' });
+	// Indented: this file is meant to be opened and read by a person, and by
+	// anything that might one day be written to consume it. The extra bytes
+	// compress away and are trivial next to the media.
+	const blob = new Blob([JSON.stringify(state, null, '\t')], { type: 'application/json' });
 	// `text: true` marks this as metadata that has to survive into the next
 	// session even on a backend that can't read its own output folder.
-	await writeFile(LAYOUT.appdata, STATE_FILE, blob, { text: true });
+	await writeFile(LAYOUT.root, STATE_FILE, blob, { text: true });
 }
 
 // ---------------------------------------------------------------- mutations
@@ -175,6 +149,9 @@ export function upsertItem(state, rec) {
 		width: rec.width || prev.width || 0,
 		height: rec.height || prev.height || 0,
 		photoCount: rec.type === 'photo' ? (rec.photos || []).length : 0,
+		// Seeing it in the list again undoes a previous 'gone': the item is back,
+		// whatever happened in between.
+		status: prev.status === STATUS.saved ? STATUS.saved : STATUS.pending,
 		source: prev.source === 'myfavett' ? 'myfavett' : 'ttarchive',
 	};
 	if (rec.author?.id) {
@@ -194,10 +171,38 @@ export function markSaved(state, id, files) {
 	const item = state.items[id];
 	if (!item) return;
 	item.savedAt = Date.now();
+	item.status = STATUS.saved;
+	delete item.unavailable;
 	item.files = { ...(item.files || {}), ...files };
+	const at = state.unavailable.indexOf(id);
+	if (at !== -1) state.unavailable.splice(at, 1);
 }
 
 export function markUnavailable(state, id, reason) {
 	if (!state.unavailable.includes(id)) state.unavailable.push(id);
-	if (state.items[id]) state.items[id].unavailable = reason || true;
+	const item = state.items[id];
+	if (!item) return;
+	item.unavailable = reason || true;
+	if (item.status !== STATUS.saved) item.status = STATUS.unavailable;
+}
+
+/**
+ * Called after a *complete* harvest: anything we knew about that TikTok no
+ * longer returns has been deleted, privated or unliked. The media is
+ * unrecoverable either way — this only records that it happened, so a future
+ * reader of archive.json can tell "never downloaded" from "no longer exists".
+ *
+ * Never called on a stopped or errored run, where a short list means nothing.
+ */
+export function markGone(state, seenIds) {
+	let gone = 0;
+	for (const item of Object.values(state.items)) {
+		if (seenIds.has(item.id)) continue;
+		if (item.status === STATUS.saved || disk.videos.has(item.id) || disk.photoDirs.has(item.id)) continue;
+		if (item.status === STATUS.gone) continue;
+		item.status = STATUS.gone;
+		item.goneAt = Date.now();
+		gone++;
+	}
+	return gone;
 }

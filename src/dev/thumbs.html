@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>thumbnail tests</title>
+		<!--
+			Exercises the Library's thumbnail path against a folder that exists only
+			in memory: src/dev/fake-fs.js is swapped in for src/lib/fs.js by the
+			import map below, so state.js and viewer.js run exactly as shipped.
+
+			The point of interest is video thumbnails. There are no cover files in
+			the archive any more, so a video tile's image is a frame decoded out of
+			the .mp4 itself — and it must not be frame 0, which on TikTok is very
+			often black. The sample clip is black for its first 0.2s and colour bars
+			after, so a black thumbnail is a real failure and not a flaky one.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/thumbs.html. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+			.tile { width: 120px; height: 200px; display: inline-block; }
+			.tile img { max-width: 100%; }
+		</style>
+		<script type="importmap">
+			{ "imports": { "/src/lib/fs.js": "/src/dev/fake-fs.js" } }
+		</script>
+	</head>
+	<body>
+		<h1>thumbnails</h1>
+		<pre id="out">running…</pre>
+		<div id="dom"></div>
+
+		<script>
+			// The archive page's DOM, reduced to what viewer.js binds to. It has to
+			// be laid out rather than hidden, or IntersectionObserver never fires.
+			const IDS = ['search', 'sort', 'kind', 'libCount', 'grid', 'libMore', 'loadMore',
+				'lightbox', 'lbClose', 'lbStage', 'lbMeta'];
+			const host = document.getElementById('dom');
+			for (const id of IDS) {
+				const tag = id === 'search' ? 'input' : ['sort', 'kind'].includes(id) ? 'select' : 'div';
+				const el = document.createElement(tag);
+				el.id = id;
+				host.appendChild(el);
+			}
+			// applyFilters reads .value off these; a bare <select> gives ''.
+			for (const [id, value] of [['sort', 'date-desc'], ['kind', 'all']]) {
+				const sel = document.getElementById(id);
+				const opt = document.createElement('option');
+				opt.value = value;
+				sel.appendChild(opt);
+				sel.value = value;
+			}
+		</script>
+
+		<script type="module">
+			import * as fake from './fake-fs.js';
+			import { scanDisk, disk } from '../lib/state.js';
+			import { wireLibrary, renderLibrary, loadThumb } from '../archive/viewer.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+					(ok || !detail ? '' : `\n        ${detail}`));
+				out.innerHTML = lines.join('\n');
+			}
+
+			const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+			// ---- the fixture ---------------------------------------------------
+			// A 1s clip: black until 0.2s, colour bars after. Decoding frame 0 is
+			// therefore visibly distinguishable from decoding the frame we want.
+			const SAMPLE_MP4 =
+				'AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAObbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAA+gAAQAA' +
+				'AQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' +
+				'AAAAAgAAAsV0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAA+gAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAA' +
+				'AAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAJAAAAEAAAAAAAAkZWR0cwAAABxlbHN0AAAAAAAAAAEAAAPoAAAIAAABAAAAAAI9' +
+				'bWRpYQAAACBtZGhkAAAAAAAAAAAAAAAAAAAoAAAAKABVxAAAAAAALWhkbHIAAAAAAAAAAHZpZGUAAAAAAAAAAAAAAABWaWRl' +
+				'b0hhbmRsZXIAAAAB6G1pbmYAAAAUdm1oZAAAAAEAAAAAAAAAAAAAACRkaW5mAAAAHGRyZWYAAAAAAAAAAQAAAAx1cmwgAAAA' +
+				'AQAAAahzdGJsAAAAwHN0c2QAAAAAAAAAAQAAALBhdmMxAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAJABAABIAAAASAAAAAAA' +
+				'AAABFUxhdmM2Mi4yOC4xMDAgbGlieDI2NAAAAAAAAAAAAAAAGP//AAAANmF2Y0MBZAAL/+EAGWdkAAus2UJCGwEQAAADABAA' +
+				'AAMBQPFCmWABAAZo6+PLIsD9+PgAAAAAEHBhc3AAAAABAAAAAQAAABRidHJ0AAAAAAAAb6gAAAAAAAAAGHN0dHMAAAAAAAAA' +
+				'AQAAAAoAAAQAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAABIY3R0cwAAAAAAAAAHAAAAAwAACAAAAAABAAAQAAAAAAIAAAQAAAAA' +
+				'AQAADAAAAAABAAAEAAAAAAEAAAwAAAAAAQAABAAAAAAcc3RzYwAAAAAAAAABAAAAAQAAAAoAAAABAAAAPHN0c3oAAAAAAAAA' +
+				'AAAAAAoAAALrAAAAEAAAB+AAAADyAAAANgAAAC4AAADSAAAALQAAAI4AAAA3AAAAFHN0Y28AAAAAAAAAAQAAA8sAAABidWR0' +
+				'YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAA' +
+				'AAEAAAAATGF2ZjYyLjEyLjEwMAAAAAhmcmVlAAAN/W1kYXQAAAKuBgX//6rcRem95tlIt5Ys2CDZI+7veDI2NCAtIGNvcmUg' +
+				'MTY1IHIzMjIzIDA0ODBjYjAgLSBILjI2NC9NUEVHLTQgQVZDIGNvZGVjIC0gQ29weWxlZnQgMjAwMy0yMDI1IC0gaHR0cDov' +
+				'L3d3dy52aWRlb2xhbi5vcmcveDI2NC5odG1sIC0gb3B0aW9uczogY2FiYWM9MSByZWY9MyBkZWJsb2NrPTE6MDowIGFuYWx5' +
+				'c2U9MHgzOjB4MTEzIG1lPWhleCBzdWJtZT03IHBzeT0xIHBzeV9yZD0xLjAwOjAuMDAgbWl4ZWRfcmVmPTEgbWVfcmFuZ2U9' +
+				'MTYgY2hyb21hX21lPTEgdHJlbGxpcz0xIDh4OGRjdD0xIGNxbT0wIGRlYWR6b25lPTIxLDExIGZhc3RfcHNraXA9MSBjaHJv' +
+				'bWFfcXBfb2Zmc2V0PS0yIHRocmVhZHM9OCBsb29rYWhlYWRfdGhyZWFkcz0xIHNsaWNlZF90aHJlYWRzPTAgbnI9MCBkZWNp' +
+				'bWF0ZT0xIGludGVybGFjZWQ9MCBibHVyYXlfY29tcGF0PTAgY29uc3RyYWluZWRfaW50cmE9MCBiZnJhbWVzPTMgYl9weXJh' +
+				'bWlkPTIgYl9hZGFwdD0xIGJfYmlhcz0wIGRpcmVjdD0xIHdlaWdodGI9MSBvcGVuX2dvcD0wIHdlaWdodHA9MiBrZXlpbnQ9' +
+				'MjUwIGtleWludF9taW49MTAgc2NlbmVjdXQ9NDAgaW50cmFfcmVmcmVzaD0wIHJjX2xvb2thaGVhZD00MCByYz1jcmYgbWJ0' +
+				'cmVlPTEgY3JmPTIzLjAgcWNvbXA9MC42MCBxcG1pbj0wIHFwbWF4PTY5IHFwc3RlcD00IGlwX3JhdGlvPTEuNDAgYXE9MTox' +
+				'LjAwAIAAAAA1ZYiEAD///vdonwKbXmGqgOSVxSXbT4H/q3gs7ZHeD6ygsW86Ax0wuUfAAKGBU0kosBkOB90AAAAMQZohbEEP' +
+				'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' +
+				'POclgr9CyoA=';
+
+			function bytesFrom(b64) {
+				const bin = atob(b64);
+				const bytes = new Uint8Array(bin.length);
+				for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+				return bytes;
+			}
+
+			function solidJPEG(colour) {
+				const c = document.createElement('canvas');
+				c.width = 40;
+				c.height = 60;
+				const ctx = c.getContext('2d');
+				ctx.fillStyle = colour;
+				ctx.fillRect(0, 0, c.width, c.height);
+				return new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
+			}
+
+			fake.seed('videos/111.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
+			fake.seed('images/333_01.jpg', await solidJPEG('#ff0000'));
+			fake.seed('images/333_02.jpg', await solidJPEG('#0000ff'));
+
+			const counts = await scanDisk();
+			check('scanDisk sees the flat layout', counts.videos === 1 && counts.photoSets === 1,
+				JSON.stringify(counts));
+			check(
+				'photo post file count',
+				disk.photos.get('333')?.length === 2,
+				`got ${JSON.stringify(disk.photos.get('333'))}`
+			);
+
+			const state = {
+				version: 2,
+				items: {
+					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved' },
+					333: { id: '333', type: 'photo', desc: 'a photo post', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved' },
+					444: { id: '444', type: 'video', desc: 'never downloaded', createTime: 1, author: {}, stats: {}, status: 'pending' },
+				},
+				authors: {},
+			};
+
+			wireLibrary(() => state);
+			renderLibrary(state);
+
+			const tileFor = (id) => document.querySelector(`.tile[data-id="${id}"]`);
+			check('every known item gets a tile', document.querySelectorAll('.tile').length === 3);
+			check('an item with no files is marked missing', tileFor('444')?.classList.contains('missing') === true);
+			check('an item with files is not marked missing', tileFor('111')?.classList.contains('missing') === false);
+
+			// ---- thumbnails ------------------------------------------------------
+			// Driven directly rather than through the tiles' IntersectionObserver,
+			// which needs a rendered page and so can't run in a headless check.
+			function decode(url) {
+				return new Promise((resolve) => {
+					if (!url) return resolve(null);
+					const img = new Image();
+					img.onload = () => resolve(img);
+					img.onerror = () => resolve(null);
+					img.src = url;
+				});
+			}
+
+			const photoThumb = await decode(await loadThumb('333'));
+			check('a photo post is thumbnailed from its first image', !!photoThumb, 'no image was produced');
+			check('an item with no file gets no thumbnail', (await loadThumb('444')) === null);
+
+			const videoThumb = await decode(await loadThumb('111'));
+			check('a video is thumbnailed from a decoded frame', !!videoThumb,
+				'no frame was decoded — the archive has no cover files to fall back on');
+
+			if (videoThumb) {
+				check('the decoded frame keeps the clip aspect ratio',
+					Math.abs(videoThumb.naturalWidth / videoThumb.naturalHeight - 144 / 256) < 0.05,
+					`${videoThumb.naturalWidth}x${videoThumb.naturalHeight}`);
+
+				const c = document.createElement('canvas');
+				c.width = videoThumb.naturalWidth;
+				c.height = videoThumb.naturalHeight;
+				const ctx = c.getContext('2d');
+				ctx.drawImage(videoThumb, 0, 0);
+				const px = ctx.getImageData(0, 0, c.width, c.height).data;
+				let sum = 0;
+				for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+				const mean = sum / (px.length / 4) / 3;
+				check('the frame is not the black one at t=0', mean > 12,
+					`mean luminance ${mean.toFixed(1)} — looks like frame 0 was taken`);
+
+				const t0 = performance.now();
+				await loadThumb('111');
+				check('a second look at the same video is served from cache',
+					performance.now() - t0 < 30, `took ${(performance.now() - t0).toFixed(0)}ms`);
+			}
+
+			// ---- playback --------------------------------------------------------
+			tileFor('111').click();
+			await sleep(400);
+			check('clicking a video opens it in the lightbox', !!document.querySelector('#lbStage video')?.src);
+			check('the lightbox reports the item status',
+				document.getElementById('lbMeta').textContent.includes('saved'));
+			document.getElementById('lbClose').click();
+
+			tileFor('333').click();
+			await sleep(600);
+			const opened = document.querySelectorAll('#lbStage img').length;
+			check('a photo post opens every image in order', opened === 2, `got ${opened}`);
+			document.getElementById('lbClose').click();
+
+			lines.push('', failures
+				? `<span class="fail">${failures} of ${checks} failing</span>`
+				: `<span class="pass">all ${checks} passing</span>`);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>

@@ -27,13 +27,13 @@
 			// must be ignored — a deleted file, an interrupted one, and an unrelated
 			// download that happens to live elsewhere.
 			const HISTORY = [
-				{ id: 1, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\111.mp4', fileSize: 900 },
-				{ id: 2, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\222.mp4', fileSize: 800 },
-				{ id: 3, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\covers\\111.jpg', fileSize: 70 },
-				{ id: 4, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\photos\\333\\01.jpg', fileSize: 60 },
-				{ id: 5, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\photos\\333\\02.jpg', fileSize: 60 },
-				{ id: 6, state: 'complete', exists: false, filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\999.mp4' },
-				{ id: 7, state: 'interrupted', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\data\\Likes\\videos\\888.mp4' },
+				{ id: 1, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\111.mp4', fileSize: 900 },
+				{ id: 2, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\222.mp4', fileSize: 800 },
+				{ id: 3, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333\\01.jpg', fileSize: 60 },
+				{ id: 4, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\images\\333\\02.jpg', fileSize: 60 },
+				{ id: 5, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\archive.json', fileSize: 40 },
+				{ id: 6, state: 'complete', exists: false, filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\999.mp4' },
+				{ id: 7, state: 'interrupted', filename: 'C:\\Users\\me\\Downloads\\TikTok likes\\videos\\888.mp4' },
 				{ id: 8, state: 'complete', filename: 'C:\\Users\\me\\Downloads\\holiday.zip', fileSize: 10 },
 			];
 
@@ -84,24 +84,25 @@
 
 			// ---- listing, from download history alone -------------------------
 			check('videos on disk', await fs.listFiles(fs.LAYOUT.videos), new Set(['111.mp4', '222.mp4']));
-			check('covers on disk', await fs.listFiles(fs.LAYOUT.covers), new Set(['111.jpg']));
-			check('photo post dirs', await fs.listDirs(fs.LAYOUT.photos), new Set(['333']));
-			check('images in a photo post', await fs.listFiles([...fs.LAYOUT.photos, '333']), new Set(['01.jpg', '02.jpg']));
-			check('listFiles does not descend', await fs.listFiles(['data', 'Likes']), new Set([]));
+			check('photo post dirs', await fs.listDirs(fs.LAYOUT.images), new Set(['333']));
+			check('images in a photo post', await fs.listFiles([...fs.LAYOUT.images, '333']), new Set(['01.jpg', '02.jpg']));
+			check('listFiles does not descend', await fs.listFiles(fs.LAYOUT.images), new Set([]));
 			check('a deleted file is not listed', (await fs.listFiles(fs.LAYOUT.videos)).has('999.mp4'), false);
-			check('an unrelated download is ignored', await fs.listFiles([]), new Set([]));
+			check('an unrelated download is ignored', (await fs.listFiles(fs.LAYOUT.root)).has('holiday.zip'), false);
+			check('archive.json sits at the root', await fs.listFiles(fs.LAYOUT.root), new Set(['archive.json']));
 
 			// ---- writing ------------------------------------------------------
 			await fs.writeFile(fs.LAYOUT.videos, '444.mp4', new Blob(['x'], { type: 'video/mp4' }));
 			const last = started[started.length - 1];
-			check('write target path', last.filename, 'TikTok likes/data/Likes/videos/444.mp4');
+			check('write target path', last.filename, 'TikTok likes/videos/444.mp4');
 			check('write overwrites rather than uniquifying', last.conflictAction, 'overwrite');
 			check('write does not prompt', last.saveAs, false);
 			check('a written file joins the listing', (await fs.listFiles(fs.LAYOUT.videos)).has('444.mp4'), true);
 
 			// ---- metadata mirror ----------------------------------------------
-			await fs.writeFile(fs.LAYOUT.appdata, 'state.json', new Blob(['{"version":1}']), { text: true });
-			check('state.json reads back without a folder scan', await fs.readTextFile(fs.LAYOUT.appdata, 'state.json'), '{"version":1}');
+			await fs.writeFile(fs.LAYOUT.root, 'archive.json', new Blob(['{"version":2}']), { text: true });
+			check('root-relative write path', started[started.length - 1].filename, 'TikTok likes/archive.json');
+			check('archive.json reads back without a folder scan', await fs.readTextFile(fs.LAYOUT.root, 'archive.json'), '{"version":2}');
 
 			// ---- the folder scan ------------------------------------------------
 			check('nothing is readable before a scan', await fs.readBlob(fs.LAYOUT.videos, '111.mp4'), null);
@@ -115,14 +116,18 @@
 			// The first segment is the folder the user picked and is stripped; note
 			// it deliberately differs from the download folder name.
 			const info = fs.scanFolder([
-				fake('My TikToks/data/Likes/videos/555.mp4', 'v'),
-				fake('My TikToks/data/.appdata/db_likes.js', 'legacy'),
+				fake('My TikToks/videos/555.mp4', 'v'),
+				fake('My TikToks/archive.json', '{"version":2,"items":{}}'),
 			]);
 			check('scan reports the folder it read', info, { name: 'My TikToks', files: 2 });
 			check('scanned files join the listing', (await fs.listFiles(fs.LAYOUT.videos)).has('555.mp4'), true);
 			check('history and scan are unioned', (await fs.listFiles(fs.LAYOUT.videos)).has('111.mp4'), true);
 			check('scanned files are readable', (await fs.readBlob(fs.LAYOUT.videos, '555.mp4'))?.size, 1);
-			check('a myfaveTT db is readable', await fs.readTextFile(fs.LAYOUT.legacy, 'db_likes.js'), 'legacy');
+			check(
+				'a scanned archive.json wins over the mirror',
+				await fs.readTextFile(fs.LAYOUT.root, 'archive.json'),
+				'{"version":2,"items":{}}'
+			);
 			check('hasReadableFiles is true after a scan', fs.hasReadableFiles(), true);
 			check('the label names both folders', fs.rootName(), 'TikTok likes (reading My TikToks)');
 

@@ -7,15 +7,7 @@
 
 import { ext } from '../lib/ext.js';
 import * as fs from '../lib/fs.js';
-import {
-	loadState,
-	saveState,
-	scanDisk,
-	mergeLegacy,
-	upsertItem,
-	missingParts,
-	disk,
-} from '../lib/state.js';
+import { loadState, saveState, scanDisk, markGone, upsertItem, missingParts } from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
 import { renderLibrary, wireLibrary } from './viewer.js';
 
@@ -29,6 +21,8 @@ const app = {
 	seen: 0,
 	newItems: 0,
 	expectedTotal: 0,
+	/** Ids TikTok returned during this run. Only meaningful if it completes. */
+	seenIds: new Set(),
 };
 
 // ---------------------------------------------------------------- background
@@ -94,35 +88,31 @@ async function afterFolderReady() {
 	log('Scanning folder…');
 	const counts = await scanDisk();
 	app.state = await loadState();
-	const legacy = await mergeLegacy(app.state);
 
-	if (legacy.found) {
+	// A folder still in the old data/Likes shape has media the flat layout can't
+	// see. Saying so beats silently offering to re-download all of it.
+	if (!counts.videos && !counts.photoSets && (await fs.listDirs([])).has('data')) {
 		$('legacyNote').classList.remove('hidden');
 		$('legacyNote').textContent =
-			`Detected a myfaveTT archive here. Imported metadata for ${Object.keys(app.state.items).length} items` +
-			(legacy.counts
-				? ` (it recorded ${legacy.counts.downloaded} downloaded of ${legacy.counts.total} likes, ${legacy.counts.disappeared} no longer available).`
-				: '.') +
-			' Its files are left untouched.';
+			'This folder has a data/ directory but no videos/ — it looks like a myfaveTT ' +
+			'archive, or an older version of this one. Run tools/script.py inside it to ' +
+			'convert it in place, then rescan. Syncing now would re-download everything.';
 	}
-	if (legacy.merged) await saveState(app.state, { immediate: true });
 
 	const uid = app.state.user?.uniqueId || '';
 	if (uid && !$('username').value) $('username').value = uid;
 
 	renderStats(counts);
-	log(
-		`Found ${counts.videos} videos, ${counts.photoSets} photo posts, ${counts.covers} covers.`,
-		'ok'
-	);
+	log(`Found ${counts.videos} videos, ${counts.photoSets} photo posts.`, 'ok');
 	renderLibrary(app.state);
 }
 
 function renderStats(counts) {
+	const items = Object.values(app.state.items);
 	$('statVideos').textContent = counts.videos.toLocaleString();
 	$('statPhotos').textContent = counts.photoSets.toLocaleString();
-	$('statCovers').textContent = counts.covers.toLocaleString();
-	$('statKnown').textContent = Object.keys(app.state.items).length.toLocaleString();
+	$('statGone').textContent = items.filter((i) => i.status === 'gone').length.toLocaleString();
+	$('statKnown').textContent = items.length.toLocaleString();
 }
 
 $('pickFolder').addEventListener('click', async () => {
@@ -181,7 +171,7 @@ $('rescan').addEventListener('click', async () => {
 	const counts = await scanDisk();
 	renderStats(counts);
 	renderLibrary(app.state);
-	log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts, ${counts.covers} covers.`);
+	log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts.`);
 });
 
 // ---------------------------------------------------------------- sync
@@ -220,6 +210,7 @@ function onContentMessage(type, payload) {
 		const toDownload = [];
 		for (const rec of payload.items || []) {
 			upsertItem(app.state, rec);
+			app.seenIds.add(rec.id);
 			if (missingParts(rec).length) {
 				toDownload.push(rec);
 				app.newItems++;
@@ -241,9 +232,10 @@ async function startSync() {
 	app.syncing = true;
 	app.seen = 0;
 	app.newItems = 0;
+	app.seenIds = new Set();
 	// favorite/item_list doesn't report a total, so the bar is seeded from
 	// whatever we last knew and corrected if a total ever does arrive.
-	app.expectedTotal = app.state.legacy?.counts?.total || Object.keys(app.state.items).length || 0;
+	app.expectedTotal = Object.keys(app.state.items).length || 0;
 	$('startSync').disabled = true;
 	$('stopSync').disabled = false;
 
@@ -283,10 +275,22 @@ async function finishSync(reason) {
 	}
 
 	const counts = await scanDisk();
+
+	// Only a run that reached the end of the list can distinguish "TikTok didn't
+	// return it" from "we stopped scrolling early".
+	if (reason === 'complete' && app.seenIds.size) {
+		const gone = markGone(app.state, app.seenIds);
+		if (gone) {
+			log(
+				`${gone} previously-known item(s) are no longer in your likes — deleted, privated or unliked. Kept in archive.json.`
+			);
+		}
+	}
+
 	renderStats(counts);
 	await saveState(app.state, { immediate: true });
 	renderLibrary(app.state);
-	log('Done. state.json written.', 'ok');
+	log('Done. archive.json written.', 'ok');
 	$('startSync').disabled = false;
 }
 

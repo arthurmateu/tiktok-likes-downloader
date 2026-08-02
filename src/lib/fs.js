@@ -5,8 +5,8 @@
  * blob, read a file back, and remember where "here" is between sessions.
  * Chromium gives all four through File System Access; Gecko gives none of them
  * and has to be assembled out of the downloads API and a folder the user hands
- * over. Both are behind this one interface, so state.js, downloader.js,
- * legacy.js and viewer.js never learn which browser they're on.
+ * over. Both are behind this one interface, so state.js, downloader.js and
+ * viewer.js never learn which browser they're on.
  *
  * The backend is chosen by feature detection, not by user agent.
  */
@@ -14,13 +14,19 @@
 import * as fsa from './backends/fsa.js';
 import * as downloads from './backends/downloads.js';
 
-/** Folder layout inside the archive root. Mirrors myfaveTT so files collide by design. */
+/**
+ * Folder layout inside the archive root. Flat on purpose: two media directories
+ * and one metadata file, nothing hidden and nothing nested.
+ *
+ * This is deliberately *not* myfaveTT's layout any more. Converting an existing
+ * myfaveTT (or older ttarchive) folder is `tools/script.py`'s job, run once,
+ * rather than a compatibility shape carried forever by the extension.
+ */
 export const LAYOUT = {
-	videos: ['data', 'Likes', 'videos'],
-	covers: ['data', 'Likes', 'covers'],
-	photos: ['data', 'Likes', 'photos'],
-	appdata: ['data', '.ttarchive'],
-	legacy: ['data', '.appdata'],
+	videos: ['videos'],
+	images: ['images'],
+	/** The archive root itself — where archive.json lives. */
+	root: [],
 };
 
 const backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
