@@ -12,7 +12,15 @@
 			const noop = () => {};
 			window.chrome = {
 				runtime: {
-					connect: () => ({ onMessage: { addListener: noop }, postMessage: noop, name: 'archive' }),
+					connect: () => ({
+						onMessage: { addListener: noop },
+						// A real port has this, and the archive page reopens itself
+						// when it fires — Chromium disconnects one every time it stops
+						// the idle service worker.
+						onDisconnect: { addListener: noop },
+						postMessage: noop,
+						name: 'archive',
+					}),
 					sendMessage: () => Promise.resolve(),
 					onMessage: { addListener: noop },
 					onConnect: { addListener: noop },
@@ -55,7 +63,7 @@
 		<script>
 			const IDS = [
 				'folderName','pickFolder','grantFolder','noFolder','syncBody','legacyNote','username',
-				'concurrency','startSync','stopSync','rescan','writeViewer','bar','cSeen','cNew','cDone','cSkip',
+				'concurrency','startSync','syncMode','syncMenu','stopSync','rescan','writeViewer','bar','cSeen','cNew','cDone','cSkip',
 				'cFail','cBytes','log','statVideos','statPhotos','statGone','statKnown','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',

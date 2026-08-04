@@ -28,7 +28,7 @@ Either way: pin the extension, click it, **Open archive**.
 
 If TikTok rejects the paged requests, the log says so and the run falls back to scrolling the tab — that older path does need the tab visible, and it says so too.
 
-Run it again any time. Anything already on disk is skipped.
+Run it again any time. **Sync likes** reads down the list only as far as the point the archive already reaches, so a second sync costs a handful of requests rather than the whole list; the ▾ beside it switches to **Full sync**, which reads to the end. See [Where a sync stops](#where-a-sync-stops). Anything already on disk is skipped either way.
 
 Each completed sync also rewrites `viewer.html` in the folder — the same Library as a file you can double-click, no extension needed. See [viewer.html](#viewerhtml).
 
@@ -58,15 +58,27 @@ Every item that has ever appeared in your likes, whether or not the media could 
 | `unavailable` | download attempted and failed — expired URL, 403, captcha |
 | `gone` | was in your likes once and isn't now: deleted, privated, or unliked |
 
-`gone` is the point of the file. That media is unrecoverable and always was — but the id, author, caption, date and stats are a few hundred bytes each, and they are the only thing that survives the post. A completed sync is what promotes an item to `gone`; a run you stop early never does, because a short list proves nothing.
+`gone` is the point of the file. That media is unrecoverable and always was — but the id, author, caption, date and stats are a few hundred bytes each, and they are the only thing that survives the post. A completed sync is what promotes an item to `gone`; a run you stop early never does, because a short list proves nothing, and neither does a run that stopped as soon as it caught up.
+
+The file also carries `fullSyncAt`, the last time a run did reach the end of the list. It is what lets the next sync stop early — see [Where a sync stops](#where-a-sync-stops) — and `0` on an archive where no run ever has.
 
 It's indented JSON at the top level of the folder, so `jq` and a text editor are both fine on it.
+
+### When you liked something
+
+Nothing in TikTok's response says when you liked a post. The only thing that carries that information is the order the likes list comes back in — most recently liked first — so that order is what gets kept, as `likeOrder`: an array of ids, newest like at index 0. Each item's `likeRank` is its index into it, derived from the array on every load so the two can't disagree.
+
+A sync you stop early has only seen the top of the list. Its ids are merged in by anchor rather than appended: an id this run didn't reach keeps its place immediately after whichever id it used to follow, so a partial run corrects the newest likes and leaves the rest of the order alone. An item that has been unliked keeps the position it held, between the two likes it sat between.
+
+An archive last synced before any of this existed has no `likeOrder` at all, and one rebuilt from myfaveTT by `tools/script.py` never gets one — there is nothing in those databases to derive it from. Those items sort last, by post date, which is what the Library did for everything before. One full sync fills it in.
 
 ### viewer.html
 
 The archive page lives at a `chrome-extension://` or `moz-extension://` URL, which is not an address anyone wants to keep to hand. So the same Library is written into the folder itself, rewritten after every sync and on demand with **Write viewer.html**. Double-click it and the archive browses itself — search, sort, playback, per-item metadata — with no extension involved. Copy the folder to another machine or a drive and it still opens.
 
 It is one self-contained file because it has to be. A `file://` document gets a unique opaque origin, so it can neither `fetch('archive.json')` nor load a module script from beside itself; the CSS, the JS and a slimmed copy of the metadata are inlined instead. Media is the exception and stays on relative paths — `<img>` and `<video>` load siblings off `file://` without complaint, which is what makes the whole thing work. A 6k-item archive comes out around 3 MB.
+
+It opens in the order you liked things, most recent first — **Recently liked**, with **First liked** for the other end. The two date options sort by when the post was made instead, which is a different question and often a very different order.
 
 Opening an item gives you a feed rather than a single clip. The wheel, ↑ ↓ (or `j`/`k`, PageUp/PageDown) and the two round buttons step through whatever the search and sort currently list, skipping anything not on disk; space plays and pauses, `m` mutes for the rest of the session, Esc closes and leaves the grid scrolled to where you got to. A photo post shows one image at a time the way TikTok's own slideshow does — ← → or the dots page through it, and `g` opens the whole post out at once. The same feed is in the extension's own Library tab; the two are kept in step by hand.
 
@@ -138,6 +150,14 @@ From there a sync pages the list one of two ways:
 
 Both feed the same normalizer, so nothing downstream knows which one ran. A run that falls back partway just re-walks the list from the top; already-downloaded items are skipped on disk.
 
+### Where a sync stops
+
+The list is newest-first, so everything liked since the last sync is above everything already archived. **Sync likes** reads down it until it has passed 120 items in a row that an earlier run had already finished with — four pages — and stops there. A daily sync is then five or six requests instead of two hundred, which is worth more than the time it saves: [every request is attributable to the account](#being-refused), and the cheapest way not to be rate-limited is not to ask.
+
+The content script still reports the whole list it walks; the archive page is what decides it has seen enough, because the decision needs the directory listing and only the archive page has it. "Already finished with" is deliberately stricter than "we have a record of it": an item counts only if its media is on disk, or was fetched and refused (`unavailable`), or had already dropped out of the list (`gone`). Anything still `pending` keeps the run going, so the retry that a second sync exists for cannot be stopped short of the thing it is retrying. The count has to be consecutive, and one unrecognised id resets it — a post you re-liked in among the new ones can't end a run early.
+
+Two things need the end of the list, and they are what **Full sync** is for: noticing what you have unliked, since `gone` is only ever set by a run that reached the end, and retrying failures deeper than an incremental run goes. It is also what the *first* run on any archive does whichever mode is picked — until one run has read the list to the end there is no "already synced up to" to look for, and a folder converted by `tools/script.py` is exactly that case.
+
 One detail worth knowing if you touch this: Chrome clamps a hidden tab's timers to 1/s, and to 1/min once it has been hidden a while, which would throttle the paging loop to a crawl. The delay between pages is therefore taken from the service worker's clock (`{type: 'sleep'}` in `src/background.js`), which isn't clamped, raced against the local timer in case the worker has been shut down.
 
 ## Being refused
@@ -179,7 +199,7 @@ The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its 
 | `src/lib/backends/fsa.js` | Chromium backend — File System Access, write retries. |
 | `src/lib/backends/downloads.js` | Gecko backend — downloads API, history-derived listing, folder snapshot. |
 | `src/lib/ext.js` | `browser ?? chrome`, so every call site can `await`. |
-| `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status. |
+| `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status, and how far down the list a sync still has to read. |
 | `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
 | `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
 | `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
@@ -212,7 +232,7 @@ Not yet verified end-to-end: the Liked-tab harvest in either mode, which needs a
 ## Known limits
 
 - **Deleted / privated items can't be recovered.** They never appear in the list responses. Your myfaveTT DB records 1,995 of these already; `tools/script.py` carries all of them into `archive.json` as `gone`, which is as much as can be done for them.
-- **Media URLs are signed and expire.** Downloads run concurrently with the list read to stay ahead of it, but on a very large first run some may still time out. They're logged as failures; run **Sync likes** again and only the missing files are retried.
+- **Media URLs are signed and expire.** Downloads run concurrently with the list read to stay ahead of it, but on a very large first run some may still time out. They're logged as failures; run **Sync likes** again and only the missing files are retried — for ones deeper in the list than an incremental run reaches, **Full sync**.
 - **No `total` from TikTok.** The progress bar is seeded from your previous item count, so it's an estimate until the run ends.
 - Bookmarks, Following, and audio extraction are not implemented. The plumbing is there (`collector.js` already recognises the bookmarks tab) if you want them later.
 
@@ -233,6 +253,12 @@ Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stu
 `src/dev/throttle.html` unit-tests `src/lib/throttle.js` and `fetchFirst` against a scripted `fetch`. The behaviour it covers is almost entirely about requests *not* made — that a 429 stops the round instead of walking the remaining mirrors, that four parallel downloads meeting one limit back off once rather than four times, that a challenge page throws before trying anything else and under any content type, that a halted or stopped item is never marked `unavailable`, and that an ordinary 404 still walks the mirror list exactly as it used to. Open `http://127.0.0.1:8777/src/dev/throttle.html`.
 
 `src/dev/thumbs.html` tests the Library against a folder that exists only in memory: an import map swaps `src/dev/fake-fs.js` in for `src/lib/fs.js`, so `state.js` and `viewer.js` run exactly as shipped. It matters most for video thumbnails, which are now decoded frames rather than files — the sample clip inlined in the page is black for its first 0.2 s and colour bars after, so "we took frame 0" fails as a real assertion rather than a flaky one. Open `http://127.0.0.1:8777/src/dev/thumbs.html`.
+
+`src/dev/likeorder.html` covers the like order — the merge in `state.js` and the sort in the Library, against a folder that exists only in memory. The merge is the part worth testing: a run that ends early sees only the top of the list, and folding that prefix into the order already on record has to correct the newest likes without quietly reshuffling everything below them. It also checks the fallback, since an archive that hasn't been synced since this existed has no order at all and has to keep sorting by post date. Open `http://127.0.0.1:8777/src/dev/likeorder.html`.
+
+`src/dev/incremental.html` covers where an incremental sync is allowed to stop — `isSettled` and `settledStreak` in `state.js`, against a seeded in-memory folder. Both mistakes here are silent: too loose and a sync stops above likes it never archived, too strict and every run walks the whole list again, which is the thing this exists to end. So it checks the cases that decide it — a `pending` item holding the run open where an `unavailable` or `gone` one doesn't, a part-downloaded gallery counting as unfinished, one unknown id resetting the count mid-page, and the count surviving being handed a page at a time. Open `http://127.0.0.1:8777/src/dev/incremental.html`.
+
+`src/dev/syncmode.html` drives the split **Sync likes ▾** button, which is the one control on the archive page whose state lives in three places at once — the button's label, the tick in the menu, and the flag the click reads — and nothing notices when those disagree. It fetches `archive.html` and mounts the real markup rather than a copy, so an id renamed there fails here instead of quietly testing something that no longer ships, then imports `archive.js` against the same stub `chrome` API `_syntaxcheck.html` uses. Open `http://127.0.0.1:8777/src/dev/syncmode.html`.
 
 `src/dev/viewer.html` builds a `viewer.html` from sample state and checks the inlining, which is the part that goes wrong once and silently in someone's folder. A caption is arbitrary text from TikTok, and the fixture's caption carries the three sequences that break a naive generator: `</script>`, which ends the element it sits in; `$&`, which `String.replace` reads out of a *replacement*; and U+2028, a line terminator to a JavaScript parser but not to JSON. The result is rendered into a `blob:` iframe, whose origin is opaque like a `file://` document's. Open `http://127.0.0.1:8777/src/dev/viewer.html`.
 

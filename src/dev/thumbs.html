@@ -38,7 +38,7 @@
 			// The archive page's DOM, reduced to what viewer.js binds to. It has to
 			// be laid out rather than hidden, or IntersectionObserver never fires.
 			const IDS = ['search', 'sort', 'kind', 'libCount', 'grid', 'libMore', 'loadMore',
-				'lightbox', 'lbClose', 'lbStage', 'lbMeta'];
+				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbCount', 'lbStage', 'lbMeta'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = id === 'search' ? 'input' : ['sort', 'kind'].includes(id) ? 'select' : 'div';
@@ -245,10 +245,16 @@
 				document.getElementById('lbMeta').textContent.includes('saved'));
 			document.getElementById('lbClose').click();
 
+			// A photo post opens one image at a time, the way TikTok's own slideshow
+			// does; `g` is what opens the whole post out at once.
 			tileFor('333').click();
 			await sleep(600);
-			const opened = document.querySelectorAll('#lbStage img').length;
-			check('a photo post opens every image in order', opened === 2, `got ${opened}`);
+			const first = document.querySelectorAll('#lbStage img').length;
+			check('a photo post opens one image at a time', first === 1, `got ${first}`);
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'g', bubbles: true }));
+			await sleep(600);
+			const sheet = document.querySelectorAll('#lbStage img').length;
+			check('g opens every image of the post at once', sheet === 2, `got ${sheet}`);
 			document.getElementById('lbClose').click();
 
 			lines.push('', failures

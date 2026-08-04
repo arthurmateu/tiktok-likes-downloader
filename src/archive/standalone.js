@@ -86,6 +86,9 @@ export function slimItems(state) {
 			type: item.type || 'video',
 			desc: item.desc || '',
 			createTime: item.createTime || 0,
+			// Undefined rather than a sentinel: JSON drops the key entirely, and
+			// "no position in the likes list" is what the viewer's sort tests for.
+			likeRank: item.likeRank == null ? undefined : item.likeRank,
 			author: { uniqueId: author.uniqueId || '', nickname: author.nickname || '' },
 			stats: { diggCount: stats.diggCount || 0, playCount: stats.playCount || 0 },
 			photoCount: item.photoCount || 0,

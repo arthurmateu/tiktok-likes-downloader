@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>incremental sync tests</title>
+		<!--
+			Covers where a sync is allowed to stop. The likes list is newest-first,
+			so a run that has walked past a long enough stretch of items an earlier
+			run finished with is out of the new likes — but "finished with" is the
+			whole question, and getting it wrong is silent either way: too loose and
+			a sync stops above likes it never archived, too strict and every run
+			walks the entire list again, which is what this is meant to end.
+
+			src/dev/fake-fs.js is swapped in for src/lib/fs.js by the import map, so
+			state.js runs exactly as shipped against a folder that exists only in a
+			Map.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/incremental.html. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+			h2 { font-size: 14px; margin: 20px 0 4px; color: #a9a9c0; }
+		</style>
+		<script type="importmap">
+			{ "imports": { "/src/lib/fs.js": "/src/dev/fake-fs.js" } }
+		</script>
+	</head>
+	<body>
+		<h1>incremental sync</h1>
+		<pre id="out">running…</pre>
+
+		<script type="module">
+			import { emptyState, scanDisk, isSettled, settledStreak, CAUGHT_UP_RUN, STATUS } from '../lib/state.js';
+			import { reset, seed } from './fake-fs.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+					(ok || !detail ? '' : `\n        ${detail}`));
+				out.innerHTML = lines.join('\n');
+			}
+
+			const same = (label, got, want) =>
+				check(label, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}`);
+
+			function section(title) {
+				lines.push(`<h2>${title}</h2>`);
+			}
+
+			const blob = () => new Blob(['x']);
+
+			/** A record as the collector sends it. */
+			const video = (id) => ({ id, type: 'video', desc: '', createTime: 1, author: {}, stats: {}, photos: [] });
+			const photo = (id, n) => ({ ...video(id), type: 'photo', photos: Array.from({ length: n }, () => ['u']) });
+
+			/** A state that already knows about `ids`, each with the given status. */
+			function known(ids, status = STATUS.saved) {
+				const state = emptyState();
+				state.fullSyncAt = 1;
+				for (const id of ids) state.items[id] = { id, type: 'video', status };
+				return state;
+			}
+
+			// ---- what counts as settled -----------------------------------------
+			section('isSettled');
+
+			reset();
+			seed('videos/10.mp4', blob());
+			seed('images/30.jpg', blob());
+			seed('images/40_01.jpg', blob());
+			await scanDisk();
+
+			{
+				const state = known(['10']);
+				check('a known video whose file is on disk is settled', isSettled(state, video('10')));
+				check('an id we have never seen is not, file or no file',
+					!isSettled(emptyState(), video('10')));
+			}
+
+			{
+				// The retry case: a first run that ran out of signed URLs left these
+				// pending, and the next sync has to reach them.
+				const state = known(['20'], STATUS.pending);
+				check('a known item with nothing on disk holds the run open', !isSettled(state, video('20')));
+			}
+
+			{
+				const state = known(['20'], STATUS.unavailable);
+				check('one already fetched and refused does not', isSettled(state, video('20')));
+				state.items['20'].status = STATUS.gone;
+				check('nor does one that had dropped out of the list', isSettled(state, video('20')));
+			}
+
+			{
+				const state = known(['30', '40']);
+				check('a single-image post is settled by its one file', isSettled(state, photo('30', 1)));
+				check('a gallery missing all but the first image is not', !isSettled(state, photo('40', 3)));
+			}
+
+			// ---- where a run stops ----------------------------------------------
+			// The count has to be consecutive and has to survive being handed one
+			// page at a time, which is how the archive page feeds it.
+			section('settledStreak');
+
+			reset();
+			const settledIds = Array.from({ length: 200 }, (_, i) => String(1000 + i));
+			for (const id of settledIds) seed(`videos/${id}.mp4`, blob());
+			await scanDisk();
+
+			{
+				const state = known(settledIds);
+				const page = (from, n) => settledIds.slice(from, from + n).map(video);
+
+				let streak = settledStreak(state, page(0, 30));
+				same('one page of settled items', streak, 30);
+				streak = settledStreak(state, page(30, 30), streak);
+				same('the count carries across pages', streak, 60);
+
+				// A new like anywhere in the page means the newest ones aren't done.
+				streak = settledStreak(state, [...page(60, 10), video('new'), ...page(70, 5)], streak);
+				same('an unknown id resets it, and the rest of the page counts again', streak, 5);
+			}
+
+			{
+				const state = known(settledIds);
+				let streak = 0;
+				let pages = 0;
+				for (let at = 0; streak < CAUGHT_UP_RUN && at < settledIds.length; at += 30) {
+					streak = settledStreak(state, settledIds.slice(at, at + 30).map(video), streak);
+					pages++;
+				}
+				check(`${CAUGHT_UP_RUN} in a row is ${pages} pages of 30, not the whole list`,
+					pages === Math.ceil(CAUGHT_UP_RUN / 30), `took ${pages}`);
+			}
+
+			{
+				// The archive page reads this from a state it has just loaded, so a
+				// folder that predates the field has to come back as "never".
+				same('a fresh state has no complete run on record', emptyState().fullSyncAt, 0);
+			}
+
+			lines.push('', failures
+				? `<span class="fail">${failures} of ${checks} failing</span>`
+				: `<span class="pass">all ${checks} passing</span>`);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>

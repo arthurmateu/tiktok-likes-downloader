@@ -7,7 +7,17 @@
 
 import { ext } from '../lib/ext.js';
 import * as fs from '../lib/fs.js';
-import { loadState, saveState, scanDisk, markGone, upsertItem, missingParts } from '../lib/state.js';
+import {
+	loadState,
+	saveState,
+	scanDisk,
+	markGone,
+	upsertItem,
+	missingParts,
+	recordLikeOrder,
+	settledStreak,
+	CAUGHT_UP_RUN,
+} from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
 import { renderLibrary, wireLibrary } from './viewer.js';
 import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
@@ -24,31 +34,83 @@ const app = {
 	expectedTotal: 0,
 	/** Ids TikTok returned during this run. Only meaningful if it completes. */
 	seenIds: new Set(),
+	/** The same ids in the order they arrived, which is like order, newest first. */
+	likeSeq: [],
+	/** This run reads the list to the end rather than stopping once caught up. */
+	full: false,
+	/** Consecutive items an earlier run had already settled — see state.js. */
+	settled: 0,
 };
 
 // ---------------------------------------------------------------- background
 
-const port = ext.runtime.connect({ name: 'archive' });
+let port = null;
 let msgId = 0;
 const waiting = new Map();
 
-port.onMessage.addListener((msg) => {
-	if (msg.type === 'reply') {
-		const r = waiting.get(msg.id);
-		if (r) {
-			waiting.delete(msg.id);
-			r(msg.payload);
+/**
+ * The connection to the background, opened on demand rather than held from page
+ * load.
+ *
+ * Chromium stops the service worker once it has been idle for half a minute,
+ * and that disconnects this port. A page left open while you do something else
+ * therefore has a dead one by the time you come back to it — and posting to a
+ * dead port throws, which used to take the whole click down with it: no
+ * request, no reply, not even the timeout, because the throw happened before
+ * the timer was set. The sync button went grey and nothing else ever happened.
+ *
+ * Reconnecting is also what wakes the worker back up, so there is nothing else
+ * to do about it.
+ */
+function channel() {
+	if (port) return port;
+	port = ext.runtime.connect({ name: 'archive' });
+	port.onMessage.addListener((msg) => {
+		if (msg.type === 'reply') {
+			const r = waiting.get(msg.id);
+			if (r) {
+				waiting.delete(msg.id);
+				r(msg.payload);
+			}
+			return;
 		}
-		return;
-	}
-	onContentMessage(msg.type, msg.payload || {});
-});
+		onContentMessage(msg.type, msg.payload || {});
+	});
+	port.onDisconnect.addListener(() => {
+		port = null;
+		// A new port can't answer a request made on the old one. Failing them now
+		// beats leaving each to time out a minute later.
+		for (const [id, resolve] of waiting) {
+			waiting.delete(id);
+			resolve({ ok: false, error: 'the extension worker restarted mid-request' });
+		}
+		// A sync in progress is fed through this port — it is how the collector's
+		// items reach the folder. Waiting for the next request to reopen it would
+		// silently drop everything harvested in between.
+		if (app.syncing) channel();
+	});
+	return port;
+}
 
 function ask(cmd, extra = {}) {
 	const id = ++msgId;
 	return new Promise((resolve) => {
 		waiting.set(id, resolve);
-		port.postMessage({ id, cmd, ...extra });
+
+		const message = { id, cmd, ...extra };
+		let err = post(message);
+		// One retry on a fresh port: the disconnect may not have been delivered
+		// yet, in which case the port looks alive right up until it is posted to.
+		if (err) {
+			port = null;
+			err = post(message);
+		}
+		if (err) {
+			waiting.delete(id);
+			resolve({ ok: false, error: `could not reach the extension worker (${err})` });
+			return;
+		}
+
 		setTimeout(() => {
 			if (waiting.has(id)) {
 				waiting.delete(id);
@@ -57,6 +119,22 @@ function ask(cmd, extra = {}) {
 		}, 60000);
 	});
 }
+
+/** Returns why it couldn't be sent, or null if it went. */
+function post(message) {
+	try {
+		channel().postMessage(message);
+		return null;
+	} catch (e) {
+		return String((e && e.message) || e);
+	}
+}
+
+// Opened at load all the same, and not only when something is asked: this is
+// also how the background knows there is an archive page for a generated
+// viewer.html to reach. After an idle shutdown that registration is gone until
+// the next request reopens it, which is what the error the viewer shows says.
+channel();
 
 // ---------------------------------------------------------------- logging
 
@@ -261,7 +339,7 @@ function onViewerRequest({ rid, cmd }) {
 		}
 		// Answer before starting: startSync outlives this message by minutes.
 		respond({ ok: true });
-		startSync();
+		beginSync();
 		return;
 	}
 
@@ -325,9 +403,15 @@ function onContentMessage(type, payload) {
 		app.seen = Math.max(app.seen, payload.seenTotal || 0);
 		if (payload.total) app.expectedTotal = payload.total;
 
+		// Before the merge below, which overwrites the status this reads.
+		if (!app.full) app.settled = settledStreak(app.state, payload.items || [], app.settled);
+
 		const toDownload = [];
 		for (const rec of payload.items || []) {
 			upsertItem(app.state, rec);
+			// Arrival order is like order. The collector never sends an id twice in
+			// a run, but a duplicate here would corrupt the sequence, so check.
+			if (!app.seenIds.has(rec.id)) app.likeSeq.push(rec.id);
 			app.seenIds.add(rec.id);
 			if (missingParts(rec).length) {
 				toDownload.push(rec);
@@ -337,10 +421,31 @@ function onContentMessage(type, payload) {
 		if (toDownload.length) app.queue.addMany(toDownload);
 		saveState(app.state);
 		updateCounters();
+
+		// Only against a list we have read to the end at least once. Until then
+		// there is no "already synced up to" — an archive converted by
+		// tools/script.py, or one whose first run stopped somewhere in the middle,
+		// can have a settled item anywhere in the list.
+		if (!app.full && app.state.fullSyncAt && app.settled >= CAUGHT_UP_RUN) {
+			log(
+				`${app.settled} likes in a row were already archived — that's the end of the new ones, ` +
+					'so the rest of the list is left alone. Use Full sync to read all of it.',
+				'ok'
+			);
+			if (app.tabId) ask('stop-harvest', { tabId: app.tabId });
+			finishSync('caught-up');
+		}
 	}
 }
 
-async function startSync() {
+function setSyncButtons(running) {
+	$('startSync').disabled = running;
+	$('syncMode').disabled = running;
+	$('stopSync').disabled = !running;
+	if (running) closeSyncMenu();
+}
+
+async function startSync({ full = false } = {}) {
 	if (!app.state) {
 		log('Pick a folder first.', 'err');
 		return;
@@ -355,11 +460,24 @@ async function startSync() {
 	app.seen = 0;
 	app.newItems = 0;
 	app.seenIds = new Set();
+	app.likeSeq = [];
+	app.full = full || !app.state.fullSyncAt;
+	app.settled = 0;
+
+	if (full) {
+		log('Full sync: reading the list to the end, retrying anything that failed before.');
+	} else if (!app.state.fullSyncAt) {
+		// Nothing on record says where the list ends, so this run has to find out.
+		// Every later one can stop as soon as it recognises what it is reading.
+		log('No complete sync on record yet — reading the whole list this once.');
+	} else {
+		log('Reading the newest likes, and stopping where the archive already catches up.');
+	}
+
 	// favorite/item_list doesn't report a total, so the bar is seeded from
 	// whatever we last knew and corrected if a total ever does arrive.
 	app.expectedTotal = Object.keys(app.state.items).length || 0;
-	$('startSync').disabled = true;
-	$('stopSync').disabled = false;
+	setSyncButtons(true);
 
 	app.queue = new DownloadQueue({
 		concurrency: Math.max(1, Math.min(8, Number($('concurrency').value) || 4)),
@@ -400,17 +518,26 @@ async function startSync() {
 	await ask('start-harvest', { tabId: app.tabId, opts: { which: 'likes', mode: 'auto' } });
 }
 
+/** How the log describes a run that has just ended. */
+const ENDED = {
+	complete: 'reached the end of the list',
+	'caught-up': 'caught up with the archive',
+	stopped: 'stopped',
+	error: 'error',
+};
+
 async function finishSync(reason) {
 	if (!app.syncing) return;
 	app.syncing = false;
 	$('stopSync').disabled = true;
 
 	if (app.queue) {
-		log(`Harvest ${reason}. Finishing ${app.queue.pending} queued downloads…`);
+		log(`Harvest ${ENDED[reason] || reason}. Finishing ${app.queue.pending} queued downloads…`);
 		await app.queue.idle();
 		if (app.queue.failed.length) {
 			log(
-				`${app.queue.failed.length} item(s) failed — usually expired media URLs. Run Sync again to retry just those.`,
+				`${app.queue.failed.length} item(s) failed — usually expired media URLs. Sync again to retry them; ` +
+					'ones further down the list than this run went need a Full sync.',
 				'err'
 			);
 		}
@@ -421,6 +548,10 @@ async function finishSync(reason) {
 	// Only a run that reached the end of the list can distinguish "TikTok didn't
 	// return it" from "we stopped scrolling early".
 	if (reason === 'complete' && app.seenIds.size) {
+		// The same thing makes it a baseline for the next run: from here on, a
+		// stretch of already-settled items means the rest of the list has been
+		// read before, so there is no need to read it again.
+		app.state.fullSyncAt = Date.now();
 		const gone = markGone(app.state, app.seenIds);
 		if (gone) {
 			log(
@@ -429,15 +560,84 @@ async function finishSync(reason) {
 		}
 	}
 
+	// Unlike `gone`, this is worth doing after a run that stopped early: what it
+	// did see is still the newest slice of the list, in order, and merging a
+	// prefix leaves the rest of the order alone.
+	if (app.likeSeq.length) {
+		const known = recordLikeOrder(app.state, app.likeSeq);
+		log(`Like order recorded for ${known.toLocaleString()} item(s).`);
+	}
+
 	renderStats(counts);
+	// The bar is a fraction of the whole list, and an incremental run never
+	// approaches that. Ending where it meant to is still finished.
+	if (reason === 'complete' || reason === 'caught-up') $('bar').style.width = '100%';
 	await saveState(app.state, { immediate: true });
 	renderLibrary(app.state);
 	log('Done. archive.json written.', 'ok');
 	await writeViewerFile();
-	$('startSync').disabled = false;
+	setSyncButtons(false);
 }
 
-$('startSync').addEventListener('click', () => startSync());
+/**
+ * Nothing awaits a sync — it is started by a click and reports itself through
+ * the log. So a throw on the way in has nowhere to surface, and the page just
+ * sits there with the button greyed out looking like it is working. Anything
+ * that gets this far is a bug, but it is going to say so on screen.
+ */
+function beginSync(opts = {}) {
+	startSync(opts).catch((err) => {
+		log(`Sync could not start: ${(err && err.message) || err}`, 'err');
+		finishSync('error');
+	});
+}
+
+// ---------------------------------------------------------------- sync mode
+//
+// One button with a dropdown rather than two: which sync you want is a choice
+// between two of the same thing, and the label then says which one the click
+// is about to run.
+
+/** What the next click on the sync button will do. */
+let syncFull = false;
+
+function closeSyncMenu() {
+	$('syncMenu').classList.add('hidden');
+	$('syncMode').setAttribute('aria-expanded', 'false');
+}
+
+function setSyncMode(full) {
+	syncFull = full;
+	$('startSync').textContent = full ? 'Full sync' : 'Sync likes';
+	for (const item of $('syncMenu').querySelectorAll('.item')) {
+		item.setAttribute('aria-checked', String(!!item.dataset.full === full));
+	}
+}
+
+$('syncMode').addEventListener('click', (ev) => {
+	ev.stopPropagation();
+	const open = $('syncMenu').classList.toggle('hidden');
+	$('syncMode').setAttribute('aria-expanded', String(!open));
+});
+
+$('syncMenu').addEventListener('click', (ev) => {
+	const item = ev.target.closest('.item');
+	if (!item) return;
+	setSyncMode(!!item.dataset.full);
+	closeSyncMenu();
+	$('startSync').focus();
+});
+
+// A menu that only closes by choosing from it is a trap on a page with this
+// much else on it.
+document.addEventListener('click', (ev) => {
+	if (!ev.target.closest('.split')) closeSyncMenu();
+});
+document.addEventListener('keydown', (ev) => {
+	if (ev.key === 'Escape') closeSyncMenu();
+});
+
+$('startSync').addEventListener('click', () => beginSync({ full: syncFull }));
 
 $('stopSync').addEventListener('click', async () => {
 	if (app.tabId) await ask('stop-harvest', { tabId: app.tabId });

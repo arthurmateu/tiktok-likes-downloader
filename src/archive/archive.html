@@ -88,7 +88,32 @@
 					</div>
 
 					<div class="actions">
-						<button id="startSync" class="btn primary">Sync likes</button>
+						<div class="split">
+							<button id="startSync" class="btn primary">Sync likes</button>
+							<button
+								id="syncMode"
+								class="btn primary caret"
+								aria-haspopup="true"
+								aria-expanded="false"
+								aria-label="Choose how much of the list to read"
+								title="Choose how much of the list to read"
+							>
+								▾
+							</button>
+							<div id="syncMenu" class="menu hidden" role="menu">
+								<button class="item" role="menuitemradio" data-full="" aria-checked="true">
+									<b>Sync likes</b>
+									<span>Stops where the archive already catches up — everything new.</span>
+								</button>
+								<button class="item" role="menuitemradio" data-full="1" aria-checked="false">
+									<b>Full sync</b>
+									<span>
+										Reads the list to the end. Slower, and the only run that retries old failed
+										downloads and notices what you've unliked.
+									</span>
+								</button>
+							</div>
+						</div>
 						<button id="stopSync" class="btn danger" disabled>Stop</button>
 						<button id="rescan" class="btn">Rescan folder</button>
 						<button id="writeViewer" class="btn">Write viewer.html</button>
@@ -115,8 +140,10 @@
 				<div class="row toolbar">
 					<input id="search" class="grow" type="search" placeholder="Search caption, hashtag, author…" />
 					<select id="sort">
-						<option value="date-desc">Newest first</option>
-						<option value="date-asc">Oldest first</option>
+						<option value="liked-recent">Recently liked</option>
+						<option value="liked-first">First liked</option>
+						<option value="date-desc">Newest post</option>
+						<option value="date-asc">Oldest post</option>
 						<option value="likes-desc">Most liked</option>
 						<option value="plays-desc">Most played</option>
 					</select>

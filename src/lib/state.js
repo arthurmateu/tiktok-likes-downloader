@@ -39,6 +39,8 @@ export function emptyState() {
 		authors: {},
 		likeOrder: [],
 		unavailable: [],
+		/** When a run last reached the end of the list. 0 means never. */
+		fullSyncAt: 0,
 	};
 }
 
@@ -85,6 +87,55 @@ export function missingParts(rec) {
 	return hasVideo(rec.id) ? [] : ['video'];
 }
 
+// ------------------------------------------------------------- catching up
+//
+// The likes list is newest-first, so everything a previous run dealt with sits
+// below everything it hasn't. Once a run has walked past a long enough stretch
+// of items an earlier one already settled, it is out of the new likes and into
+// the part of the list it read last time — and reading the remaining thousands
+// of items only asks TikTok the same questions again, which is both slow and
+// the thing most likely to get the account rate-limited.
+//
+// "Settled" is deliberately stricter than "we have a record of it": an item
+// whose media never arrived has to keep the run open, or the retry that a
+// second sync is for would never reach it.
+
+/**
+ * How many settled items in a row end an incremental run. Pages are ~30 items,
+ * so this is four of them: long enough that a couple of already-known posts
+ * near the top — a re-like, or a page boundary landing awkwardly — can't be
+ * mistaken for the end of the new ones.
+ */
+export const CAUGHT_UP_RUN = 120;
+
+/**
+ * Has an earlier run already finished with this item?
+ *
+ * Call it *before* `upsertItem`: it reads the status the last run left behind,
+ * which the merge is about to overwrite.
+ */
+export function isSettled(state, rec) {
+	const prev = state.items[rec.id];
+	if (!prev) return false; // never seen it: this is a new like
+	if (!missingParts(rec).length) return true; // media is on disk
+	// Nothing on disk, but we already know why: the media was fetched and
+	// refused, or the item had dropped out of the list. Trying again is what a
+	// full sync is for; it isn't a reason to hold an incremental run open.
+	return prev.status === STATUS.unavailable || prev.status === STATUS.gone;
+}
+
+/**
+ * Extend a run of settled items by one page's worth of records, in list order.
+ * Any item still wanting something resets it to zero — the count has to be
+ * consecutive, or a scattering of old items would end a run halfway up the
+ * newest likes.
+ */
+export function settledStreak(state, recs, streak = 0) {
+	let n = streak;
+	for (const rec of recs) n = isSettled(state, rec) ? n + 1 : 0;
+	return n;
+}
+
 // ---------------------------------------------------------------- load / save
 
 export async function loadState() {
@@ -98,6 +149,10 @@ export async function loadState() {
 			/* corrupt archive.json — fall back to empty; disk scan still finds the media */
 		}
 	}
+	// likeOrder is the record; the per-item rank is derived from it every time, so
+	// a file rebuilt by tools/script.py — or edited by hand — can't disagree with
+	// itself.
+	applyLikeRanks(state);
 	return state;
 }
 
@@ -169,6 +224,73 @@ export function upsertItem(state, rec) {
 		state.authors[rec.author.id] = a;
 	}
 	return state.items[rec.id];
+}
+
+// ------------------------------------------------------------- like order
+//
+// TikTok's favorites list carries no "liked at" timestamp — nothing in the
+// payload says when you liked something. What it does say is where an item sits
+// in the list, and that list is in like order, most recent first. So the order
+// itself is the only record of when, and `likeOrder` holds it: index 0 is the
+// most recently liked item. `likeRank` on each item is its index into that
+// array, cached so the viewers can sort without a lookup table.
+
+/** Re-derive every item's `likeRank` from `state.likeOrder`. */
+export function applyLikeRanks(state) {
+	for (const item of Object.values(state.items || {})) delete item.likeRank;
+	(state.likeOrder || []).forEach((id, at) => {
+		const item = state.items[id];
+		if (item) item.likeRank = at;
+	});
+}
+
+/**
+ * Fold the ids this run saw, in the order TikTok returned them, into the order
+ * we already had.
+ *
+ * A run that stopped early only saw the top of the list, and ids it never
+ * reached — or that have since been unliked — still deserve a position rather
+ * than being dropped to the end. So placement is by anchor: an id missing from
+ * this run stays immediately after whichever id it used to follow. A complete
+ * run therefore rewrites the whole order and leaves `gone` items sitting
+ * between the neighbours they were liked between; a partial run corrects the
+ * top and leaves the tail as it was.
+ */
+export function recordLikeOrder(state, seenOrder) {
+	const seen = new Set(seenOrder);
+	/** Ids that dropped out before the first surviving one: they were the newest. */
+	const head = [];
+	/** surviving id -> the ids that used to follow it */
+	const after = new Map();
+	let anchor = null;
+
+	for (const id of state.likeOrder || []) {
+		if (seen.has(id)) {
+			anchor = id;
+			continue;
+		}
+		if (anchor === null) head.push(id);
+		else if (after.has(anchor)) after.get(anchor).push(id);
+		else after.set(anchor, [id]);
+	}
+
+	const order = [];
+	const placed = new Set();
+	const push = (id) => {
+		// An id with no item behind it is a stale entry, not a position.
+		if (placed.has(id) || !state.items[id]) return;
+		placed.add(id);
+		order.push(id);
+	};
+	for (const id of head) push(id);
+	for (const id of seenOrder) {
+		push(id);
+		for (const trailing of after.get(id) || []) push(trailing);
+	}
+
+	state.likeOrder = order;
+	applyLikeRanks(state);
+	return order.length;
 }
 
 export function markSaved(state, id, files) {

@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>like order tests</title>
+		<!--
+			Covers the one thing about like order that can't be seen by looking: the
+			list carries no timestamp, so the order *is* the record, and a run that
+			ends early sees only the top of it. Merging that prefix has to correct
+			the newest likes without scrambling everything below them, and getting
+			it wrong reorders someone's whole archive silently.
+
+			src/dev/fake-fs.js is swapped in for src/lib/fs.js by the import map, so
+			state.js and viewer.js run exactly as shipped with nothing on disk.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/likeorder.html. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+			h2 { font-size: 14px; margin: 20px 0 4px; color: #a9a9c0; }
+			#dom { position: absolute; left: -9999px; }
+			.tile { width: 120px; height: 200px; display: inline-block; }
+		</style>
+		<script type="importmap">
+			{ "imports": { "/src/lib/fs.js": "/src/dev/fake-fs.js" } }
+		</script>
+	</head>
+	<body>
+		<h1>like order</h1>
+		<pre id="out">running…</pre>
+		<div id="dom"></div>
+
+		<script>
+			// The archive page's DOM, reduced to what viewer.js binds to.
+			const IDS = ['search', 'sort', 'kind', 'libCount', 'grid', 'libMore', 'loadMore',
+				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbStage', 'lbMeta'];
+			const host = document.getElementById('dom');
+			for (const id of IDS) {
+				const tag = id === 'search' ? 'input' : ['sort', 'kind'].includes(id) ? 'select' : 'div';
+				const el = document.createElement(tag);
+				el.id = id;
+				host.appendChild(el);
+			}
+			// applyFilters reads .value off these; a bare <select> gives ''. The sort
+			// values have to match archive.html's, since that is what is being tested.
+			for (const [id, values] of [
+				['sort', ['liked-recent', 'liked-first', 'date-desc', 'date-asc', 'likes-desc', 'plays-desc']],
+				['kind', ['all', 'video', 'photo']],
+			]) {
+				const sel = document.getElementById(id);
+				for (const value of values) {
+					const opt = document.createElement('option');
+					opt.value = value;
+					sel.appendChild(opt);
+				}
+				sel.value = values[0];
+			}
+		</script>
+
+		<script type="module">
+			import { emptyState, applyLikeRanks, recordLikeOrder } from '../lib/state.js';
+			import { wireLibrary, renderLibrary } from '../archive/viewer.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+					(ok || !detail ? '' : `\n        ${detail}`));
+				out.innerHTML = lines.join('\n');
+			}
+
+			const same = (label, got, want) =>
+				check(label, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}`);
+
+			function section(title) {
+				lines.push(`<h2>${title}</h2>`);
+			}
+
+			/** A state whose items are named by id; createTime is the id as a number. */
+			function fixture(ids, order = []) {
+				const state = emptyState();
+				for (const id of ids) {
+					state.items[id] = { id, type: 'video', desc: id, createTime: Number(id), author: {}, stats: {} };
+				}
+				state.likeOrder = order;
+				applyLikeRanks(state);
+				return state;
+			}
+
+			// ---- merging ---------------------------------------------------------
+			section('recordLikeOrder');
+
+			{
+				const s = fixture(['10', '20', '30']);
+				recordLikeOrder(s, ['30', '10', '20']);
+				same('a first sync takes the sequence verbatim', s.likeOrder, ['30', '10', '20']);
+				same('rank is the index into it',
+					[s.items['30'].likeRank, s.items['10'].likeRank, s.items['20'].likeRank], [0, 1, 2]);
+			}
+
+			{
+				// 40 liked since last time, 10 unliked in between.
+				const s = fixture(['10', '20', '30', '40'], ['30', '10', '20']);
+				recordLikeOrder(s, ['40', '30', '20']);
+				same('an unliked item holds the place it had', s.likeOrder, ['40', '30', '10', '20']);
+			}
+
+			{
+				// The run died after two pages: 30 and 20 were never reached.
+				const s = fixture(['10', '20', '30', '40'], ['10', '20', '30']);
+				recordLikeOrder(s, ['40', '10']);
+				same('a partial run corrects the top and leaves the tail', s.likeOrder, ['40', '10', '20', '30']);
+			}
+
+			{
+				// Everything above the first survivor dropped out — those were the
+				// newest likes, so they belong at the head and not the end.
+				const s = fixture(['10', '20', '30'], ['10', '20', '30']);
+				recordLikeOrder(s, ['20', '30']);
+				same('ids that dropped off the top stay at the top', s.likeOrder, ['10', '20', '30']);
+			}
+
+			{
+				const s = fixture(['10', '20'], ['ghost', '10', '20']);
+				recordLikeOrder(s, ['10', '20']);
+				same('an id with no item behind it is dropped', s.likeOrder, ['10', '20']);
+			}
+
+			{
+				const s = fixture(['10', '20']);
+				recordLikeOrder(s, ['10', '20', '10']);
+				same('a repeated id cannot take two positions', s.likeOrder, ['10', '20']);
+			}
+
+			{
+				const s = fixture(['10', '20'], ['10', '20']);
+				s.likeOrder = ['20'];
+				applyLikeRanks(s);
+				same('a rank the order no longer justifies is cleared',
+					[s.items['20'].likeRank, s.items['10'].likeRank], [0, undefined]);
+			}
+
+			// ---- sorting ---------------------------------------------------------
+			// Through the shipped Library rather than a copy of the comparator: the
+			// grid is what anyone would actually be looking at.
+			section('the Library sort');
+
+			const state = fixture(['10', '20', '30', '40'], ['30', '10']);
+			wireLibrary(() => state);
+
+			const sort = document.getElementById('sort');
+			function gridOrder(value) {
+				sort.value = value;
+				sort.dispatchEvent(new Event('change'));
+				return [...document.querySelectorAll('#grid .tile')].map((el) => el.dataset.id);
+			}
+
+			renderLibrary(state);
+
+			same('recently liked first, unranked last by post date',
+				gridOrder('liked-recent'), ['30', '10', '40', '20']);
+			same('first liked first, unranked still last',
+				gridOrder('liked-first'), ['10', '30', '20', '40']);
+			same('post date is untouched by any of this',
+				gridOrder('date-desc'), ['40', '30', '20', '10']);
+
+			// An archive last synced before any of this existed, or one scanned in
+			// off disk, has no ranks at all — the sort must not collapse into
+			// insertion order.
+			const unranked = fixture(['10', '30', '20']);
+			wireLibrary(() => unranked);
+			renderLibrary(unranked);
+			same('with no order recorded it falls back to post date',
+				gridOrder('liked-recent'), ['30', '20', '10']);
+
+			lines.push('', failures
+				? `<span class="fail">${failures} of ${checks} failing</span>`
+				: `<span class="pass">all ${checks} passing</span>`);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>

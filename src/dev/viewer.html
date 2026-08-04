@@ -70,6 +70,10 @@
 						stats: { diggCount: 1234, playCount: 99000 },
 						status: 'saved',
 						files: { video: 'videos/111.mp4' },
+						// Deliberately the opposite of post-date order: 111 is the
+						// oldest post and the most recent like, so a page that has
+						// quietly fallen back to sorting by date says so in the grid.
+						likeRank: 0,
 					},
 					222: {
 						id: '222',
@@ -81,6 +85,7 @@
 						photoCount: 2,
 						status: 'saved',
 						files: { photos: ['images/222_01.jpg', 'images/222_02.jpg'] },
+						likeRank: 1,
 					},
 					333: {
 						id: '333',
@@ -141,12 +146,32 @@
 				check('bridge URL was baked in', /archive\.html$/.test(payload.config.bridgeURL));
 				check('slimming dropped nothing needed', 'status' in item && 'stats' in item && 'author' in item);
 
+				// Like order is a position in the likes list, not a date — the list
+				// carries no timestamp. An item that has never been through a sync has
+				// no position, and the key has to be absent rather than 0.
+				const ghost = payload.items.find((i) => i.id === '333');
+				check('like rank carried over', item.likeRank === 0, JSON.stringify(item.likeRank));
+				check('an unranked item carries no rank', !('likeRank' in ghost), JSON.stringify(ghost.likeRank));
+
 				// U+2028 is a line terminator to the JS parser: unescaped in the blob it
 				// would be a syntax error rather than a bad caption.
 				check('U+2028 escaped in the blob', !html.includes('\u2028'));
 
 				const url = URL.createObjectURL(new Blob([html], { type: 'text/html' }));
-				document.getElementById('frame').src = url;
+				const frame = document.getElementById('frame');
+				await new Promise((resolve) => {
+					frame.addEventListener('load', resolve, { once: true });
+					frame.src = url;
+				});
+
+				// The grid the generated page actually paints. A blob: iframe keeps
+				// this document's origin, so it can be read — the opaque-origin part
+				// that matters is the module and fetch loading, which happened above.
+				const page = frame.contentDocument;
+				check('the grid opens in like order', page.getElementById('sort').value === 'liked-recent',
+					page.getElementById('sort').value);
+				const order = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
+				check('most recently liked first, unranked last', String(order) === '111,222,333', String(order));
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}

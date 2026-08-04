@@ -392,6 +392,26 @@
 
 	// --------------------------------------------------------------- filtering
 
+	/**
+	 * Sort by where an item sits in your likes list rather than when it was
+	 * posted. `likeRank` 0 is the most recent like — the likes list carries no
+	 * timestamp, so its order is the only thing that records when.
+	 *
+	 * An archive last synced before the order was recorded has no ranks at all,
+	 * and one scanned in off disk never will. Those sort last, by post date, so
+	 * the control still does something sensible instead of nothing.
+	 */
+	function byLikeOrder(dir) {
+		const rank = (i) => (i.likeRank == null ? Infinity : i.likeRank);
+		return (a, b) => {
+			const ra = rank(a);
+			const rb = rank(b);
+			if (ra === rb) return dir * ((b.createTime || 0) - (a.createTime || 0));
+			if (ra === Infinity || rb === Infinity) return ra === Infinity ? 1 : -1;
+			return dir * (ra - rb);
+		};
+	}
+
 	let byId = new Map();
 
 	function applyFilters() {
@@ -414,6 +434,8 @@
 		}
 
 		const cmp = {
+			'liked-recent': byLikeOrder(1),
+			'liked-first': byLikeOrder(-1),
 			'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
 			'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
 			'likes-desc': (a, b) => ((b.stats || {}).diggCount || 0) - ((a.stats || {}).diggCount || 0),

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>sync mode tests</title>
+		<link rel="stylesheet" href="../archive/archive.css" />
+		<!--
+			Drives the archive page's own markup, stylesheet and script — the split
+			sync button is the one control on the page whose state lives in three
+			places at once (the label, the tick in the menu, and the flag the click
+			reads), and nothing else notices when they disagree.
+
+			archive.html is fetched and mounted rather than copied, so an id renamed
+			there fails here instead of quietly testing markup that no longer ships.
+			The `chrome` stub is the same idea as _syntaxcheck.html's: enough API for
+			archive.js to evaluate, and nothing that touches disk or a real tab.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/syncmode.html. Dev-only.
+		-->
+		<style>
+			#report { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 16px 24px; }
+			#report pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+		</style>
+	</head>
+	<body>
+		<div id="report"><pre id="out">running…</pre></div>
+		<div id="mount"></div>
+
+		<script>
+			// Enough of the extension API surface for archive.js to evaluate.
+			const noop = () => {};
+			window.chrome = {
+				runtime: {
+					connect: () => ({
+						onMessage: { addListener: noop },
+						onDisconnect: { addListener: noop },
+						postMessage: noop,
+						name: 'archive',
+					}),
+					sendMessage: () => Promise.resolve(),
+					onMessage: { addListener: noop },
+					getManifest: () => ({ host_permissions: ['*://*.tiktok.com/*'] }),
+					getURL: (p) => p,
+				},
+				tabs: { query: () => Promise.resolve([]), sendMessage: () => Promise.resolve({}) },
+				storage: { local: { get: () => Promise.resolve({}), set: () => Promise.resolve() } },
+				permissions: { contains: () => Promise.resolve(true), request: () => Promise.resolve(true) },
+			};
+		</script>
+
+		<script type="module">
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+					(ok || !detail ? '' : `\n        ${detail}`));
+				out.innerHTML = lines.join('\n');
+			}
+
+			// The shipped page, mounted as-is. Its own <script> came through the
+			// parser already-started, so archive.js runs once, below, and only after
+			// the markup it binds to is in the document.
+			const html = await (await fetch('../archive/archive.html')).text();
+			const parsed = new DOMParser().parseFromString(html, 'text/html');
+			document.getElementById('mount').append(...parsed.body.children);
+			await import('../archive/archive.js');
+
+			// Everything the sync controls live in is hidden until a folder is open.
+			document.getElementById('syncBody').classList.remove('hidden');
+
+			const $ = (id) => document.getElementById(id);
+			const items = [...document.querySelectorAll('#syncMenu .item')];
+			const shown = (el) => !!el.offsetParent;
+			const ticked = () => items.map((i) => i.getAttribute('aria-checked'));
+			const label = () => $('startSync').textContent.trim();
+
+			check('the menu offers the two modes', items.length === 2, `found ${items.length}`);
+			check('it starts on the incremental one, and says so',
+				label() === 'Sync likes' && ticked().join() === 'true,false', `${label()} / ${ticked()}`);
+			check('the menu is closed until asked for', !shown($('syncMenu')));
+
+			$('syncMode').click();
+			check('the caret opens it', shown($('syncMenu')));
+			check('and says so for a screen reader', $('syncMode').getAttribute('aria-expanded') === 'true');
+			check('it sits over the page rather than shoving it about',
+				getComputedStyle($('syncMenu')).position === 'absolute');
+
+			items[1].click();
+			check('choosing full sync closes the menu', !shown($('syncMenu')));
+			check('the button then says what it will do', label() === 'Full sync', label());
+			check('and the tick moves with it', ticked().join() === 'false,true', ticked().join());
+
+			$('syncMode').click();
+			document.getElementById('report').click();
+			check('a click anywhere else closes it', !shown($('syncMenu')));
+
+			$('syncMode').click();
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+			check('so does escape', !shown($('syncMenu')));
+
+			items[0].click();
+			check('and it goes back', label() === 'Sync likes' && ticked().join() === 'true,false');
+
+			// The point of a split button is that it reads as one control; a gap or
+			// a height that doesn't match makes it two, one of which is a mystery.
+			const a = $('startSync').getBoundingClientRect();
+			const b = $('syncMode').getBoundingClientRect();
+			check('the caret is joined to the button rather than floating beside it',
+				Math.abs(b.left - a.right) < 1 && Math.abs(b.height - a.height) < 1,
+				`gap ${(b.left - a.right).toFixed(1)}px, heights ${a.height} / ${b.height}`);
+
+			lines.push('', failures
+				? `<span class="fail">${failures} of ${checks} failing</span>`
+				: `<span class="pass">all ${checks} passing</span>`);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>
