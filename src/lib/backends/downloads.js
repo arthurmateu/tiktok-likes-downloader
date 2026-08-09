@@ -180,7 +180,12 @@ function* knownPaths() {
 	yield* snapshot.keys();
 }
 
-export async function listFiles(parts) {
+/**
+ * `onProgress` is reported once, at the end. There is no incremental work to
+ * report: the listing is a walk over an in-memory index that `refresh()` has
+ * already built, and it returns in microseconds.
+ */
+export async function listFiles(parts, { onProgress } = {}) {
 	const prefix = prefixOf(parts);
 	const names = new Set();
 	for (const path of knownPaths()) {
@@ -188,6 +193,7 @@ export async function listFiles(parts) {
 		const rest = path.slice(prefix.length);
 		if (rest && !rest.includes('/')) names.add(rest);
 	}
+	onProgress?.(names.size);
 	return names;
 }
 

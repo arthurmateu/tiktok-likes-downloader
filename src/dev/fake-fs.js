@@ -10,7 +10,7 @@
  * quietly testing a folder shape that no longer exists.
  */
 
-export { LAYOUT, photoName, photoOwner } from '../lib/fs.js?real';
+export { LAYOUT, photoName, photoOwner, audioOwner } from '../lib/fs.js?real';
 
 /** rel path -> Blob */
 const files = new Map();
@@ -25,7 +25,7 @@ export function reset() {
 
 const prefixOf = (parts) => (parts.length ? `${parts.join('/')}/` : '');
 
-export async function listFiles(parts) {
+export async function listFiles(parts, { onProgress } = {}) {
 	const prefix = prefixOf(parts);
 	const names = new Set();
 	for (const path of files.keys()) {
@@ -33,6 +33,9 @@ export async function listFiles(parts) {
 		const rest = path.slice(prefix.length);
 		if (rest && !rest.includes('/')) names.add(rest);
 	}
+	// Reported once, like the downloads backend: a Map has no incremental work to
+	// describe. Kept only so the fake honours the same contract as the real one.
+	onProgress?.(names.size);
 	return names;
 }
 

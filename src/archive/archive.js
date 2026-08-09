@@ -17,6 +17,7 @@ import {
 	recordLikeOrder,
 	settledStreak,
 	CAUGHT_UP_RUN,
+	STATUS,
 } from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
 import { renderLibrary, wireLibrary } from './viewer.js';
@@ -140,6 +141,7 @@ channel();
 
 function log(msg, cls = '') {
 	const el = $('log');
+	el.classList.remove('hidden');
 	const line = document.createElement('span');
 	line.className = cls;
 	const t = new Date().toLocaleTimeString();
@@ -157,26 +159,77 @@ function fmtBytes(n) {
 
 // ---------------------------------------------------------------- folder
 
+/**
+ * The panel is on screen before there is anything to put in it, so it has a
+ * state for that: dimmed, with every control that assumes `app.state` disabled.
+ * The scan that produces one is thousands of directory entries and takes
+ * seconds on a large folder — long enough that hiding the panel until it lands
+ * left the page looking empty and broken.
+ */
+function setBusy(busy) {
+	$('syncBody').classList.toggle('busy', busy);
+	$('rescan').disabled = busy;
+	$('writeViewer').disabled = busy;
+	if (busy) {
+		$('startSync').disabled = true;
+		$('syncMode').disabled = true;
+	} else {
+		// Rescanning mid-sync comes back through here. A run in progress has its own
+		// claim on these buttons, so hand them back to it rather than enabling them.
+		setSyncButtons(app.syncing);
+	}
+}
+
+/**
+ * The progress notice over the dimmed panel. `null` takes it away — which is
+ * separate from `setBusy` on purpose: a scan that failed leaves the controls
+ * disabled, because there is still no state behind them, but must not leave a
+ * bar sweeping away at a folder nobody is reading any more.
+ */
+function showScanning(msg) {
+	$('loading').classList.toggle('hidden', msg === null);
+	if (msg !== null) $('loadingMsg').textContent = msg;
+}
+
+/** What the scan says about itself while it runs. */
+function scanningMsg(files) {
+	return files
+		? `Reading your archive folder — ${files.toLocaleString()} files so far…`
+		: 'Reading your archive folder…';
+}
+
 async function afterFolderReady() {
 	$('folderName').textContent = fs.rootName();
 	$('grantFolder').classList.add('hidden');
 	$('noFolder').classList.add('hidden');
 	$('pickFolder').textContent = 'Change folder…';
 
+	$('syncBody').classList.remove('hidden');
+	setBusy(true);
+	showScanning(scanningMsg(0));
+
 	log('Scanning folder…');
 	let counts;
 	try {
-		counts = await scanDisk();
-		app.state = await loadState();
+		// Independent of each other: the directory listing decides what still needs
+		// downloading, archive.json carries the metadata. Together they cost the
+		// slower of the two rather than the sum.
+		const [scanned, state] = await Promise.all([
+			scanDisk({ onProgress: (files) => showScanning(scanningMsg(files)) }),
+			loadState(),
+		]);
+		counts = scanned;
+		app.state = state;
 	} catch (err) {
-		// Leave syncBody hidden: every control in it assumes app.state exists.
+		// Left busy: every control in the panel assumes app.state exists, and there
+		// isn't one. The log sits outside it, so this is still readable.
+		showScanning(null);
 		log(`Could not read the folder: ${err.message || err}`, 'err');
 		return;
 	}
 
-	// Only now. The scan above takes seconds on a large folder, and revealing the
-	// buttons before there is a state means a click in that window crashes.
-	$('syncBody').classList.remove('hidden');
+	showScanning(null);
+	setBusy(false);
 
 	// A folder still in the old data/Likes shape has media the flat layout can't
 	// see. Saying so beats silently offering to re-download all of it.
@@ -196,12 +249,43 @@ async function afterFolderReady() {
 	renderLibrary(app.state);
 }
 
+/**
+ * The one line that spells out the relationship the cards can only imply: how
+ * many likes, and how many files those likes came to.
+ */
+function summarise(verb, counts) {
+	const posts = counts.videos + counts.photoSets;
+	return (
+		`${verb} ${posts.toLocaleString()} liked posts on disk — ` +
+		`${counts.videos.toLocaleString()} videos, ` +
+		`${counts.photoSets.toLocaleString()} photo posts made of ${counts.images.toLocaleString()} images` +
+		`${counts.songs ? `, ${counts.songs.toLocaleString()} songs` : ''}.`
+	);
+}
+
+/**
+ * Posts, then the files they are made of.
+ *
+ * A liked post is one video file *or* one photo post's worth of images, so a
+ * count of files is thousands higher than a count of likes on a real archive.
+ * Both are worth showing; which is which has to be unmistakable.
+ *
+ * Counted off the directory listing rather than off each item's status, for the
+ * reason state.js keeps the listing as the source of truth: a status can drift
+ * when files are moved or deleted from outside, a file either exists or it
+ * doesn't. `unavailable` is the exception — nothing on disk can say why a post
+ * is missing, only the record can.
+ */
 function renderStats(counts) {
 	const items = Object.values(app.state?.items || {});
+	const unavailable = items.filter(
+		(i) => i.status === STATUS.gone || i.status === STATUS.unavailable
+	).length;
+
+	$('statPosts').textContent = (counts.videos + counts.photoSets).toLocaleString();
 	$('statVideos').textContent = counts.videos.toLocaleString();
-	$('statPhotos').textContent = counts.photoSets.toLocaleString();
-	$('statGone').textContent = items.filter((i) => i.status === 'gone').length.toLocaleString();
-	$('statKnown').textContent = items.length.toLocaleString();
+	$('statImages').textContent = counts.images.toLocaleString();
+	$('statUnavailable').textContent = unavailable.toLocaleString();
 }
 
 $('pickFolder').addEventListener('click', async () => {
@@ -261,10 +345,22 @@ $('rescan').addEventListener('click', async () => {
 		log('Pick a folder first.', 'err');
 		return;
 	}
-	const counts = await scanDisk();
-	renderStats(counts);
-	renderLibrary(app.state);
-	log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts.`);
+	// Same seconds-long scan as at load, and without this the button just sits
+	// there looking like the click missed.
+	setBusy(true);
+	showScanning(scanningMsg(0));
+	log('Rescanning folder…');
+	try {
+		const counts = await scanDisk({ onProgress: (files) => showScanning(scanningMsg(files)) });
+		renderStats(counts);
+		renderLibrary(app.state);
+		log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts.`);
+	} catch (err) {
+		log(`Could not read the folder: ${err.message || err}`, 'err');
+	} finally {
+		showScanning(null);
+		setBusy(false);
+	}
 });
 
 // ---------------------------------------------------------------- viewer.html

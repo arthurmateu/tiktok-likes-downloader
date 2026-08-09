@@ -66,12 +66,38 @@
 					<input id="scanInput" type="file" webkitdirectory directory multiple class="hidden" />
 				</div>
 
+				<!--
+					Outside #syncBody so it stays at full brightness while the panel behind
+					it is dimmed. The count is the point: an indeterminate bar only claims
+					something is happening, a number climbing past four thousand files
+					shows it.
+				-->
+				<div id="loading" class="notice loading hidden" role="status" aria-live="polite">
+					<span id="loadingMsg">Reading your archive folder…</span>
+					<div class="scanbar"><div class="scanbar-fill"></div></div>
+				</div>
+
 				<div id="syncBody" class="hidden">
+					<!--
+						Posts first, then the files they are made of. The distinction is the
+						whole point of this row: one liked post is one video file, or a photo
+						post's worth of images — which for a gallery can be thirty-odd. A row
+						that only counted files made the archive look several thousand items
+						larger than it is.
+					-->
 					<div class="cards">
-						<div class="card"><span class="num" id="statVideos">–</span><span class="lbl">videos on disk</span></div>
-						<div class="card"><span class="num" id="statPhotos">–</span><span class="lbl">photo posts</span></div>
-						<div class="card"><span class="num" id="statGone">–</span><span class="lbl">no longer available</span></div>
-						<div class="card"><span class="num" id="statKnown">–</span><span class="lbl">items with metadata</span></div>
+						<div class="card" title="Liked posts with their media on disk. A photo post counts once, however many images it holds.">
+							<span class="num" id="statPosts">–</span><span class="lbl">liked posts saved</span>
+						</div>
+						<div class="card" title="One file per video, so this is both a file count and a post count.">
+							<span class="num" id="statVideos">–</span><span class="lbl">videos</span>
+						</div>
+						<div class="card" title="Image files across every photo post — a gallery contributes one per image, so this is larger than the number of posts.">
+							<span class="num" id="statImages">–</span><span class="lbl">images</span>
+						</div>
+						<div class="card" title="Liked posts whose media can't be fetched: deleted, made private, unliked, or refused when it was tried.">
+							<span class="num" id="statUnavailable">–</span><span class="lbl">currently unavailable</span>
+						</div>
 					</div>
 
 					<div id="legacyNote" class="notice small hidden"></div>
@@ -130,9 +156,16 @@
 							<span><b id="cBytes">0 B</b></span>
 						</div>
 					</div>
-
-					<pre id="log" class="log"></pre>
 				</div>
+
+				<!--
+					Outside #syncBody deliberately. Scanning the folder is the slowest thing
+					this page does and it gates everything above — so its progress, and any
+					error that stops it, has to be readable while the rest is still greyed
+					out. Hidden until there is a line in it, so a fresh install isn't
+					fronted by an empty black box.
+				-->
+				<pre id="log" class="log hidden"></pre>
 			</section>
 
 			<!-- ---------------------------------------------------- library -->

@@ -93,14 +93,35 @@ async function tryGetDir(parts) {
 	}
 }
 
-/** Names of every file directly inside a directory. Empty set if it doesn't exist. */
-export async function listFiles(parts) {
+/**
+ * How many entries to read between progress reports. Each entry is a handle
+ * built across an IPC to the browser process, so a folder with thousands of
+ * files takes seconds — long enough that the caller has to be able to say so.
+ */
+const REPORT_EVERY = 250;
+
+/**
+ * Names of every file directly inside a directory. Empty set if it doesn't exist.
+ *
+ * `onProgress` is handed the running file count. It comes with a yield to the
+ * event loop, because reporting into a DOM that never gets a chance to paint is
+ * the same as not reporting at all: entries within one of Chromium's fetched
+ * batches resolve as microtasks, which a repaint can't get between.
+ */
+export async function listFiles(parts, { onProgress } = {}) {
 	const names = new Set();
 	const dir = await tryGetDir(parts);
 	if (!dir) return names;
+	let since = 0;
 	for await (const [name, handle] of dir.entries()) {
 		if (handle.kind === 'file') names.add(name);
+		if (onProgress && ++since >= REPORT_EVERY) {
+			since = 0;
+			onProgress(names.size);
+			await new Promise((r) => setTimeout(r, 0));
+		}
 	}
+	onProgress?.(names.size);
 	return names;
 }
 

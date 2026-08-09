@@ -49,15 +49,28 @@ export const disk = {
 	photos: new Map(), // id -> sorted file names, images/ being flat
 };
 
-export async function scanDisk() {
+/**
+ * @param {{ onProgress?: (files: number) => void }} opts
+ *   `onProgress` receives the running total across both media directories, so a
+ *   caller can show a folder this size being read rather than appearing to hang.
+ */
+export async function scanDisk({ onProgress } = {}) {
 	// Backends whose listing isn't live (Gecko's, which reads download history)
 	// need telling that now is the time to look again.
 	await refresh();
-	disk.videos = new Set(
-		[...(await listFiles(LAYOUT.videos))].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4))
-	);
+
+	// The two listings report their own counts from zero; carrying the first one's
+	// total forward makes the number the caller sees climb once, not twice.
+	let base = 0;
+	const step = onProgress ? (n) => onProgress(base + n) : undefined;
+
+	const videos = await listFiles(LAYOUT.videos, { onProgress: step });
+	base += videos.size;
+	const images = await listFiles(LAYOUT.images, { onProgress: step });
+
+	disk.videos = new Set([...videos].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4)));
 	disk.photos = new Map();
-	for (const name of [...(await listFiles(LAYOUT.images))].sort()) {
+	for (const name of [...images].sort()) {
 		const id = photoOwner(name);
 		if (!id) continue;
 		const names = disk.photos.get(id);

@@ -124,9 +124,12 @@ export async function refresh() {
 
 // -------------------------------------------------------------------- files
 
-/** Names of every file directly inside a directory. Empty set if it doesn't exist. */
-export function listFiles(parts) {
-	return must().listFiles(parts);
+/**
+ * Names of every file directly inside a directory. Empty set if it doesn't exist.
+ * `opts.onProgress` is called with the running count as the listing is built.
+ */
+export function listFiles(parts, opts) {
+	return must().listFiles(parts, opts);
 }
 
 export function listDirs(parts) {
