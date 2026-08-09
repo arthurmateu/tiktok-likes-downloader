@@ -476,6 +476,9 @@ select:focus {
 /* ---------------------------------------------------------------- lightbox */
 
 .lightbox {
+	--lb-gap: 24px;
+	--lb-panel: 340px;
+	--lb-step: 44px;
 	position: fixed;
 	inset: 0;
 	background: rgba(0, 0, 0, 0.9);
@@ -483,11 +486,30 @@ select:focus {
 	display: flex;
 	align-items: center;
 	justify-content: center;
-	gap: 24px;
+	gap: var(--lb-gap);
 	padding: 24px;
+}
+/*
+ * The empty mirror of the arrows and the panel on the other side. Centring a row
+ * of post-then-panel centres the pair, which leaves the post itself sitting left
+ * of the middle of the window and moving about as the panel's width changes;
+ * balancing the row with an equal column of nothing puts the post in the middle
+ * of the screen and hangs the panel off its side, which is what the eye is
+ * actually being asked to centre on.
+ *
+ * It is also the one thing here that gives way: a window too narrow for the post
+ * plus both rails takes the width back out of this column first, so a small
+ * screen slides back to the old off-centre layout instead of squashing the panel
+ * or pushing it off the edge.
+ */
+.lb-rail {
+	flex: 0 1 auto;
+	min-width: 0;
+	width: calc(var(--lb-step) + var(--lb-gap) + var(--lb-panel));
 }
 .lb-stage {
 	max-height: 90vh;
+	flex: none;
 	display: flex;
 	gap: 10px;
 	align-items: center;
@@ -523,13 +545,14 @@ select:focus {
 /* ------------------------------------------------------------- feed chrome */
 
 .lb-nav {
+	flex: none;
 	display: flex;
 	flex-direction: column;
 	gap: 10px;
 }
 .lb-step {
-	width: 44px;
-	height: 44px;
+	width: var(--lb-step);
+	height: var(--lb-step);
 	border-radius: 50%;
 	border: 1px solid var(--line);
 	background: var(--bg-2);
@@ -814,7 +837,8 @@ select:focus {
 	background: rgba(0, 0, 0, 0.9);
 }
 .lb-meta {
-	width: 340px;
+	flex: none;
+	width: var(--lb-panel);
 	max-height: 88vh;
 	overflow: auto;
 	background: var(--bg-2);
