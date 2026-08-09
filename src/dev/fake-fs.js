@@ -19,13 +19,30 @@ export function seed(path, blob) {
 	files.set(path, blob);
 }
 
+export function remove(path) {
+	files.delete(path);
+}
+
 export function reset() {
 	files.clear();
 }
 
+/**
+ * How many names a listing hands over at a time, 0 meaning all of them at once.
+ *
+ * The File System Access backend reports its folder in pieces because a real one
+ * takes seconds to read, and the scan is built to use each piece as it lands.
+ * This is how a test gets to watch that happen to a Map that is instant.
+ */
+let chunk = 0;
+
+export function batchEvery(n) {
+	chunk = n;
+}
+
 const prefixOf = (parts) => (parts.length ? `${parts.join('/')}/` : '');
 
-export async function listFiles(parts, { onProgress } = {}) {
+export async function listFiles(parts, { onProgress, onBatch } = {}) {
 	const prefix = prefixOf(parts);
 	const names = new Set();
 	for (const path of files.keys()) {
@@ -33,9 +50,21 @@ export async function listFiles(parts, { onProgress } = {}) {
 		const rest = path.slice(prefix.length);
 		if (rest && !rest.includes('/')) names.add(rest);
 	}
-	// Reported once, like the downloads backend: a Map has no incremental work to
-	// describe. Kept only so the fake honours the same contract as the real one.
-	onProgress?.(names.size);
+	// Reported in one go by default, like the downloads backend: a Map has no
+	// incremental work to describe. Kept only so the fake honours the same
+	// contract as the real one — and `batchEvery` makes it honour the other half.
+	if (!onBatch || !names.size) {
+		onProgress?.(names.size);
+		return names;
+	}
+	const all = [...names];
+	const step = chunk || all.length;
+	for (let at = 0; at < all.length; at += step) {
+		onBatch(all.slice(at, at + step));
+		onProgress?.(Math.min(all.length, at + step));
+		// The real backend yields here so the page can paint between batches.
+		await new Promise((r) => setTimeout(r, 0));
+	}
 	return names;
 }
 

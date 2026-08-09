@@ -35,6 +35,10 @@ async function blobURL(parts, name) {
 
 /** Shown in place of the media when the backend can't read the folder back. */
 function unreadableNote() {
+	// A scan in progress hasn't reached this post's file yet as far as anyone here
+	// knows, and saying it was never downloaded would be a guess that is about to
+	// be wrong.
+	if (disk.scanning) return 'Still reading the folder…';
 	return hasReadableFiles()
 		? 'Not downloaded yet.'
 		: "Downloaded, but Firefox can't read it back until you use “Scan an existing folder…” on the Sync tab.";
@@ -168,7 +172,12 @@ function appendPage() {
 
 function tile(item, index) {
 	const el = document.createElement('div');
-	el.className = 'tile' + (present(item) ? '' : ' missing');
+	// Dimmed for a post whose media isn't there — but only once the scan can be
+	// believed about that. Drawn mid-scan, the whole grid would come up dim and
+	// then un-dim in waves, which reads as a fault rather than as progress.
+	const here = present(item);
+	el.className = 'tile' + (here || disk.scanning ? '' : ' missing');
+	if (here) el.dataset.here = '1';
 	el.dataset.id = item.id;
 	el.dataset.index = index;
 
@@ -220,6 +229,75 @@ function setupObserver() {
 		},
 		{ rootMargin: '400px 0px' }
 	);
+}
+
+/**
+ * Bring the tiles already on screen back into line with `disk`, which a folder
+ * scan fills in batches while the grid is being looked at.
+ *
+ * The grid's *membership* is not in question here — it comes from archive.json,
+ * which is read in one go — so this is never a re-render. All that changes is
+ * what each tile knows about its own files: whether it is dimmed, and whether
+ * there is now a thumbnail to be had. A tile whose media has just appeared is
+ * handed back to the observer, because the observer has already had its say
+ * about that one: it asked for a thumbnail while the file was still unlisted,
+ * got nothing, and would never ask again on its own.
+ */
+export function refreshPresence() {
+	for (const node of $('grid').children) {
+		const item = filtered[node.dataset.index];
+		if (!item) continue;
+		const here = present(item);
+		node.classList.toggle('missing', !here && !disk.scanning);
+		if (!here || node.dataset.here) continue;
+		node.dataset.here = '1';
+		if (node.querySelector('img').dataset.loaded) continue;
+		observer.unobserve(node);
+		observer.observe(node);
+	}
+	refreshLightbox();
+}
+
+/**
+ * The same catching-up for the item that is open, if one is.
+ *
+ * The lightbox is built once per step, so a post opened before the scan reached
+ * its files keeps the note that said so — the stage has nothing waiting to hear
+ * that the folder has since been read. It is the grid's problem exactly, one
+ * item at a time, and it is worse there: a tile that stays grey for a second is
+ * a blemish, an opened post that stays empty looks like the file is gone.
+ *
+ * Rebuilding is only ever done to a stage with nothing on it. One with media on
+ * it is one that is playing, and restarting a clip under whoever is watching to
+ * tell them about a file they can already see is not a fix.
+ */
+function refreshLightbox() {
+	if (!lbOpen()) return;
+	const item = filtered[lbIndex];
+	if (!item) return;
+
+	if (present(item)) {
+		// Only the note is on the stage, so the media has arrived since it was
+		// drawn and there is no playback to interrupt by drawing it again.
+		if (!$('lbStage').querySelector('video, img')) {
+			renderLightbox();
+			return;
+		}
+
+		// The pictures made it and the track did not: audio/ is listed last, so a
+		// photo post opened mid-scan routinely has one and not the other. Only the
+		// song's own slot is rebuilt — the panel around it is already right, and
+		// the stage is not to be touched.
+		const box = $('lbMeta').querySelector('.lb-song');
+		if (item.type === 'photo' && box && !box.querySelector('audio') && disk.audio.has(item.id)) {
+			clearSong({ keepBox: true });
+			mountSong(item, lbSeq);
+		}
+	}
+
+	// The arrows step over whatever isn't on disk, so what they can reach changes
+	// with every batch whether or not this item was in it.
+	renderCount();
 }
 
 // ------------------------------------------------------------------ thumbnails
@@ -479,15 +557,23 @@ function songLabel(item) {
  */
 let songURL = null;
 
-/** Take the player away and let go of the file behind it. */
-function clearSong() {
+/**
+ * Take the player away and let go of the file behind it.
+ *
+ * `keepBox` empties the slot instead of taking it out of the panel, which is
+ * what mounting a second song into a panel that is staying put needs — see
+ * `refreshLightbox`. Everywhere else the whole panel is about to be rebuilt.
+ */
+function clearSong({ keepBox = false } = {}) {
 	const audio = $('lbMeta').querySelector('audio');
 	if (audio) {
 		audio.pause();
 		audio.removeAttribute('src');
 		audio.load();
 	}
-	$('lbMeta').querySelector('.lb-song')?.remove();
+	const box = $('lbMeta').querySelector('.lb-song');
+	if (keepBox) box?.replaceChildren();
+	else box?.remove();
 	if (songURL) {
 		URL.revokeObjectURL(songURL);
 		songURL = null;

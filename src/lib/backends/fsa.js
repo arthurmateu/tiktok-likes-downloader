@@ -107,21 +107,38 @@ const REPORT_EVERY = 250;
  * event loop, because reporting into a DOM that never gets a chance to paint is
  * the same as not reporting at all: entries within one of Chromium's fetched
  * batches resolve as microtasks, which a repaint can't get between.
+ *
+ * `onBatch` is handed the names found since the last report, so a caller can
+ * start using the listing while the rest of it is still being read rather than
+ * waiting seconds for the whole set.
  */
-export async function listFiles(parts, { onProgress } = {}) {
+export async function listFiles(parts, { onProgress, onBatch } = {}) {
 	const names = new Set();
 	const dir = await tryGetDir(parts);
 	if (!dir) return names;
+
+	let batch = [];
+	const report = () => {
+		if (onBatch && batch.length) {
+			onBatch(batch);
+			batch = [];
+		}
+		onProgress?.(names.size);
+	};
+
 	let since = 0;
 	for await (const [name, handle] of dir.entries()) {
-		if (handle.kind === 'file') names.add(name);
-		if (onProgress && ++since >= REPORT_EVERY) {
+		if (handle.kind === 'file') {
+			names.add(name);
+			if (onBatch) batch.push(name);
+		}
+		if ((onProgress || onBatch) && ++since >= REPORT_EVERY) {
 			since = 0;
-			onProgress(names.size);
+			report();
 			await new Promise((r) => setTimeout(r, 0));
 		}
 	}
-	onProgress?.(names.size);
+	report();
 	return names;
 }
 

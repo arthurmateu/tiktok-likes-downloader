@@ -139,7 +139,9 @@ export async function refresh() {
 
 /**
  * Names of every file directly inside a directory. Empty set if it doesn't exist.
- * `opts.onProgress` is called with the running count as the listing is built.
+ * `opts.onProgress` is called with the running count as the listing is built,
+ * and `opts.onBatch` with the names found since the last call — a backend whose
+ * listing takes seconds is usable long before it is finished.
  */
 export function listFiles(parts, opts) {
 	return must().listFiles(parts, opts);

@@ -20,7 +20,7 @@ import {
 	STATUS,
 } from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
-import { renderLibrary, wireLibrary } from './viewer.js';
+import { renderLibrary, refreshPresence, wireLibrary } from './viewer.js';
 import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
 
 const $ = (id) => document.getElementById(id);
@@ -206,23 +206,40 @@ async function afterFolderReady() {
 
 	$('syncBody').classList.remove('hidden');
 	setBusy(true);
-	showScanning(scanningMsg(0));
+	// Named, because it is now a step of its own with the folder scan behind it,
+	// and on a large archive it is a second of its own too.
+	showScanning('Reading archive.json…');
 
-	log('Scanning folder…');
+	log('Reading archive.json…');
 	let counts;
+
 	try {
-		// Independent of each other: the directory listing decides what still needs
-		// downloading, archive.json carries the metadata. Together they cost the
-		// slower of the two rather than the sum.
-		const [scanned, state] = await Promise.all([
-			scanDisk({ onProgress: (files) => showScanning(scanningMsg(files)) }),
-			loadState(),
-		]);
-		counts = scanned;
-		app.state = state;
+		// archive.json first, and strictly before the scan rather than alongside it.
+		//
+		// The two look independent — the directory listing decides what still needs
+		// downloading, archive.json carries the metadata the Library is drawn from —
+		// and running them together to pay for the slower rather than the sum is the
+		// obvious thing. It doesn't work: File System Access requests are served in
+		// order, so opening one file behind an enumeration of several thousand
+		// directory entries means the metadata arrives *after* the scan however
+		// early it was asked for, and the grid stays empty for the whole of it.
+		//
+		// One file read is a fraction of that enumeration, so paying for it up front
+		// costs a moment and puts the Library on screen before the slow part starts.
+		app.state = await loadState();
+		renderLibrary(app.state);
+
+		log('Scanning folder…');
+		showScanning(scanningMsg(0));
+		counts = await scanDisk({
+			onProgress: (files) => showScanning(scanningMsg(files)),
+			onBatch: refreshPresence,
+		});
 	} catch (err) {
-		// Left busy: every control in the panel assumes app.state exists, and there
-		// isn't one. The log sits outside it, so this is still readable.
+		// Left busy either way. Half the panel assumes app.state exists, and the
+		// other half assumes the listing is complete — syncing without one would
+		// re-download the entire folder. The log sits outside it, so this is still
+		// readable.
 		showScanning(null);
 		log(`Could not read the folder: ${err.message || err}`, 'err');
 		return;
@@ -351,9 +368,16 @@ $('rescan').addEventListener('click', async () => {
 	showScanning(scanningMsg(0));
 	log('Rescanning folder…');
 	try {
-		const counts = await scanDisk({ onProgress: (files) => showScanning(scanningMsg(files)) });
+		// Not renderLibrary: nothing about the *items* has changed — they come from
+		// archive.json, which this doesn't touch — so rebuilding the grid would only
+		// throw away the scroll position and every Load more the reader had pressed.
+		// What the scan changes is which tiles have files behind them, and that
+		// lands through onBatch as it goes.
+		const counts = await scanDisk({
+			onProgress: (files) => showScanning(scanningMsg(files)),
+			onBatch: refreshPresence,
+		});
 		renderStats(counts);
-		renderLibrary(app.state);
 		log(summarise('Rescanned —', counts));
 	} catch (err) {
 		log(`Could not read the folder: ${err.message || err}`, 'err');

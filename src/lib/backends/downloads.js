@@ -181,11 +181,11 @@ function* knownPaths() {
 }
 
 /**
- * `onProgress` is reported once, at the end. There is no incremental work to
- * report: the listing is a walk over an in-memory index that `refresh()` has
- * already built, and it returns in microseconds.
+ * `onProgress` and `onBatch` both fire once, at the end. There is no incremental
+ * work to report: the listing is a walk over an in-memory index that `refresh()`
+ * has already built, and it returns in microseconds.
  */
-export async function listFiles(parts, { onProgress } = {}) {
+export async function listFiles(parts, { onProgress, onBatch } = {}) {
 	const prefix = prefixOf(parts);
 	const names = new Set();
 	for (const path of knownPaths()) {
@@ -193,6 +193,7 @@ export async function listFiles(parts, { onProgress } = {}) {
 		const rest = path.slice(prefix.length);
 		if (rest && !rest.includes('/')) names.add(rest);
 	}
+	if (names.size) onBatch?.([...names]);
 	onProgress?.(names.size);
 	return names;
 }

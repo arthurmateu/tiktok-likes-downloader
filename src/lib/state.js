@@ -48,14 +48,54 @@ export const disk = {
 	videos: new Set(), // id
 	photos: new Map(), // id -> sorted file names, images/ being flat
 	audio: new Map(), // id -> file name; photo posts only, and not all of those
+	/**
+	 * Whether a scan is part-way through filling the three above. While it is,
+	 * an id that isn't there yet means "not listed yet" and not "not on disk" —
+	 * which is a distinction anything drawing itself off `disk` has to make.
+	 */
+	scanning: false,
 };
 
 /**
- * @param {{ onProgress?: (files: number) => void }} opts
+ * The counts a caller shows, off `disk` as it currently stands.
+ *
+ * `images` is image *files*, not posts — a gallery contributes one per image.
+ * Reported separately because the two are worth several thousand apart on a real
+ * archive, and showing only the file count makes it look far larger than the
+ * number of likes it represents.
+ */
+export function diskCounts() {
+	let images = 0;
+	for (const names of disk.photos.values()) images += names.length;
+	return { videos: disk.videos.size, photoSets: disk.photos.size, images, songs: disk.audio.size };
+}
+
+/** Bumped per scan, so one that has been superseded can tell — see scanDisk. */
+let scanSeq = 0;
+
+/**
+ * Read the media directories into `disk`.
+ *
+ * Filled batch by batch as the listing arrives rather than all at once at the
+ * end. A folder with thousands of files takes seconds to list, and the Library
+ * is drawn off these three collections — waiting for the complete answer meant
+ * an empty grid for as long as the scan took, on every page load.
+ *
+ * Each batch is *added* to whatever was already there, and only what this scan
+ * never saw is dropped, once it is over. That order matters: a rescan can be
+ * started while a sync is downloading, and `missingParts` reads these — a
+ * half-filled `disk` that had been emptied first would report files we already
+ * hold as absent and queue the whole archive for downloading again. Growing
+ * only, the worst a mid-scan reader can see is a file deleted from outside since
+ * the last scan, which the prune below corrects a moment later.
+ *
+ * @param {{ onProgress?: (files: number) => void, onBatch?: () => void }} opts
  *   `onProgress` receives the running total across the media directories, so a
  *   caller can show a folder this size being read rather than appearing to hang.
+ *   `onBatch` fires after each batch has been folded in, and once more when the
+ *   scan is over, whether or not it got there by finishing.
  */
-export async function scanDisk({ onProgress } = {}) {
+export async function scanDisk({ onProgress, onBatch } = {}) {
 	// Backends whose listing isn't live (Gecko's, which reads download history)
 	// need telling that now is the time to look again.
 	await refresh();
@@ -65,40 +105,85 @@ export async function scanDisk({ onProgress } = {}) {
 	let base = 0;
 	const step = onProgress ? (n) => onProgress(base + n) : undefined;
 
-	const videos = await listFiles(LAYOUT.videos, { onProgress: step });
-	base += videos.size;
-	const images = await listFiles(LAYOUT.images, { onProgress: step });
-	base += images.size;
-	const songs = await listFiles(LAYOUT.audio, { onProgress: step });
+	// What this scan has actually seen, so that when it ends the leftovers of the
+	// previous one can be told apart from them.
+	const seen = { videos: new Set(), images: new Set(), audio: new Set() };
 
-	disk.videos = new Set([...videos].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4)));
-	disk.photos = new Map();
-	for (const name of [...images].sort()) {
-		const id = photoOwner(name);
-		if (!id) continue;
-		const names = disk.photos.get(id);
-		if (names) names.push(name);
-		else disk.photos.set(id, [name]);
-	}
-	// The name rather than the id alone: what the CDN served decides the
-	// extension, so the viewer can't reconstruct the file name from the post.
-	disk.audio = new Map();
-	for (const name of songs) {
-		const id = audioOwner(name);
-		if (id) disk.audio.set(id, name);
-	}
-	return {
-		videos: disk.videos.size,
-		photoSets: disk.photos.size,
-		/**
-		 * Image *files*, not posts — a gallery contributes one per image. Reported
-		 * separately because the two are worth several thousand apart on a real
-		 * archive, and showing only the file count makes it look far larger than the
-		 * number of likes it represents.
-		 */
-		images: [...disk.photos.values()].reduce((n, names) => n + names.length, 0),
-		songs: disk.audio.size,
+	const addVideos = (names) => {
+		for (const name of names) {
+			if (!name.endsWith('.mp4')) continue;
+			const id = name.slice(0, -4);
+			seen.videos.add(id);
+			disk.videos.add(id);
+		}
 	};
+
+	const addImages = (names) => {
+		const touched = new Set();
+		for (const name of names) {
+			const id = photoOwner(name);
+			if (!id) continue;
+			seen.images.add(name);
+			const have = disk.photos.get(id);
+			if (!have) disk.photos.set(id, [name]);
+			else if (!have.includes(name)) have.push(name);
+			touched.add(id);
+		}
+		// A gallery's images can straddle a batch boundary and the listing isn't
+		// promised in order anyway, so a post is re-sorted whenever one of its
+		// images lands rather than the whole directory being sorted once.
+		for (const id of touched) disk.photos.get(id).sort();
+	};
+
+	const addSongs = (names) => {
+		// The name rather than the id alone: what the CDN served decides the
+		// extension, so the viewer can't reconstruct the file name from the post.
+		for (const name of names) {
+			const id = audioOwner(name);
+			if (!id) continue;
+			seen.audio.add(id);
+			disk.audio.set(id, name);
+		}
+	};
+
+	const fold = (add) => (names) => {
+		add(names);
+		onBatch?.();
+	};
+
+	// Changing folder doesn't wait for the scan of the last one, so two of these
+	// can be reading at once. Adding is safe either way, but the prune is not: run
+	// against a listing that has been overtaken it would delete exactly what the
+	// newer scan has just found. The older one therefore stands aside.
+	const mine = ++scanSeq;
+	disk.scanning = true;
+	try {
+		const videos = await listFiles(LAYOUT.videos, { onProgress: step, onBatch: fold(addVideos) });
+		base += videos.size;
+		const images = await listFiles(LAYOUT.images, { onProgress: step, onBatch: fold(addImages) });
+		base += images.size;
+		await listFiles(LAYOUT.audio, { onProgress: step, onBatch: fold(addSongs) });
+
+		// Whatever the previous scan left behind that this one did not find: files
+		// deleted, renamed or moved away from outside since.
+		if (mine === scanSeq) {
+			for (const id of disk.videos) if (!seen.videos.has(id)) disk.videos.delete(id);
+			for (const [id, names] of disk.photos) {
+				const kept = names.filter((name) => seen.images.has(name));
+				if (kept.length) disk.photos.set(id, kept);
+				else disk.photos.delete(id);
+			}
+			for (const id of disk.audio.keys()) if (!seen.audio.has(id)) disk.audio.delete(id);
+		}
+	} finally {
+		// In a `finally` so a scan that threw part-way still gets here, and once
+		// more through `onBatch` because the prune above and the end of `scanning`
+		// both change what a view drawn off `disk` ought to be showing.
+		if (mine === scanSeq) disk.scanning = false;
+		onBatch?.();
+	}
+
+	return diskCounts();
 }
 
 export function hasVideo(id) {
