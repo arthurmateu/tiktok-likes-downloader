@@ -867,14 +867,29 @@
 		let made = -1; // Frames produced so far, when that's all there is to go on.
 		let tail = Infinity; // The first instant with no picture behind it,
 		let guess = 0; // once a second lap has agreed with the first one's answer.
+		let laps = 0; // Wraps this has done itself, for the re-check below.
 
 		/** A picture has appeared, and it sits at `at` in the clip. */
 		function mark(at) {
 			const step = at - frameAt;
-			// A negative step is the wrap itself; an implausible one is a seek.
-			if (seeded && step > 0 && step < 0.5) gap = step;
+			// Backwards means the clip wrapped between this picture and the last,
+			// so this one is the new lap's first and the old lap's spacing tells
+			// us nothing. Worth being strict about: news of a frame can arrive a
+			// paint late, which lands it on the far side of the wrap, and taken at
+			// face value it would claim a picture at the very start of a lap that
+			// hasn't produced one yet.
+			if (step < 0) {
+				seeded = false;
+				frameAt = at;
+				return;
+			}
+			if (seeded && step < 0.5) gap = step;
 			seeded = true;
 			frameAt = at;
+			// A picture from past where the pictures were supposed to have stopped
+			// says the memo was wrong, whatever it was taken off. Keeping it would
+			// cut this clip short on every lap left, with nothing able to notice.
+			if (at > tail + gap) tail = Infinity;
 		}
 
 		if (exact) {
@@ -898,16 +913,23 @@
 				}
 			}
 
-			// Only ever the last second of the clip: a frame dropped in the middle
-			// of one, or a callback starved by a hidden tab, isn't a tail.
-			if (!(v.duration - v.currentTime < 1)) return;
-			if (v.currentTime < tail && v.currentTime - frameAt < gap * 1.5 + 0.03) return;
+			// Only ever the last second of the clip, and never before a picture has
+			// turned up in this lap: a frame dropped in the middle of one, a
+			// callback starved by a hidden tab, and the silent run-in these files
+			// open with are none of them a tail.
+			if (!seeded || !(v.duration - v.currentTime < 1)) return;
+			// Every eighth lap the memo is set aside and the clip runs to its own
+			// end again. One taken off a decoder hiccup rather than off the file
+			// gets found out that way, instead of trimming every lap from here on.
+			const trusted = laps % 8 === 7 ? Infinity : tail;
+			if (v.currentTime < trusted && v.currentTime - frameAt < gap * 1.5 + 0.03) return;
 			// A single lap's answer can be a stutter rather than the tail, and a
 			// memo taken from one would trim every lap after it short. It's held
 			// until a second lap lands in the same place, and trusted only then.
 			const end = frameAt + gap;
 			if (Math.abs(end - guess) < gap * 1.5) tail = Math.min(tail, end);
 			guess = end;
+			laps++;
 			frameAt = 0;
 			seeded = false;
 			v.currentTime = 0;
