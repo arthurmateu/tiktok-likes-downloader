@@ -15,8 +15,8 @@ import * as fsa from './backends/fsa.js';
 import * as downloads from './backends/downloads.js';
 
 /**
- * Folder layout inside the archive root. Flat on purpose: two media directories
- * and one metadata file, nothing hidden and nothing nested.
+ * Folder layout inside the archive root. Flat on purpose: three media
+ * directories and one metadata file, nothing hidden and nothing nested.
  *
  * This is deliberately *not* myfaveTT's layout any more. Converting an existing
  * myfaveTT (or older ttarchive) folder is `tools/script.py`'s job, run once,
@@ -25,6 +25,8 @@ import * as downloads from './backends/downloads.js';
 export const LAYOUT = {
 	videos: ['videos'],
 	images: ['images'],
+	/** Songs, and only for photo posts — a video's audio is inside its own mp4. */
+	audio: ['audio'],
 	/** The archive root itself — where archive.json lives. */
 	root: [],
 };
@@ -46,6 +48,17 @@ const PHOTO_FILE = /^(\d+)(?:_\d+)?\.[a-z0-9]{2,5}$/i;
 /** The post a file in images/ belongs to, or null if the name isn't ours. */
 export function photoOwner(name) {
 	const m = PHOTO_FILE.exec(name);
+	return m ? m[1] : null;
+}
+
+/**
+ * The same for audio/, which is one song per post and so has no numbered form.
+ * The extension is whatever the CDN served — usually .mp3, sometimes .m4a.
+ */
+const AUDIO_FILE = /^(\d+)\.[a-z0-9]{2,5}$/i;
+
+export function audioOwner(name) {
+	const m = AUDIO_FILE.exec(name);
 	return m ? m[1] : null;
 }
 

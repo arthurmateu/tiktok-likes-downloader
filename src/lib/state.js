@@ -15,7 +15,7 @@
  * by hand. `tools/script.py` writes the same shape.
  */
 
-import { LAYOUT, listFiles, photoOwner, readTextFile, writeFile, refresh } from './fs.js';
+import { LAYOUT, audioOwner, listFiles, photoOwner, readTextFile, writeFile, refresh } from './fs.js';
 
 const STATE_FILE = 'archive.json';
 const STATE_VERSION = 2;
@@ -47,11 +47,12 @@ export function emptyState() {
 export const disk = {
 	videos: new Set(), // id
 	photos: new Map(), // id -> sorted file names, images/ being flat
+	audio: new Map(), // id -> file name; photo posts only, and not all of those
 };
 
 /**
  * @param {{ onProgress?: (files: number) => void }} opts
- *   `onProgress` receives the running total across both media directories, so a
+ *   `onProgress` receives the running total across the media directories, so a
  *   caller can show a folder this size being read rather than appearing to hang.
  */
 export async function scanDisk({ onProgress } = {}) {
@@ -59,14 +60,16 @@ export async function scanDisk({ onProgress } = {}) {
 	// need telling that now is the time to look again.
 	await refresh();
 
-	// The two listings report their own counts from zero; carrying the first one's
-	// total forward makes the number the caller sees climb once, not twice.
+	// Each listing reports its own count from zero; carrying the previous ones'
+	// total forward makes the number the caller sees climb once, not three times.
 	let base = 0;
 	const step = onProgress ? (n) => onProgress(base + n) : undefined;
 
 	const videos = await listFiles(LAYOUT.videos, { onProgress: step });
 	base += videos.size;
 	const images = await listFiles(LAYOUT.images, { onProgress: step });
+	base += images.size;
+	const songs = await listFiles(LAYOUT.audio, { onProgress: step });
 
 	disk.videos = new Set([...videos].filter((n) => n.endsWith('.mp4')).map((n) => n.slice(0, -4)));
 	disk.photos = new Map();
@@ -77,9 +80,24 @@ export async function scanDisk({ onProgress } = {}) {
 		if (names) names.push(name);
 		else disk.photos.set(id, [name]);
 	}
+	// The name rather than the id alone: what the CDN served decides the
+	// extension, so the viewer can't reconstruct the file name from the post.
+	disk.audio = new Map();
+	for (const name of songs) {
+		const id = audioOwner(name);
+		if (id) disk.audio.set(id, name);
+	}
 	return {
 		videos: disk.videos.size,
 		photoSets: disk.photos.size,
+		/**
+		 * Image *files*, not posts — a gallery contributes one per image. Reported
+		 * separately because the two are worth several thousand apart on a real
+		 * archive, and showing only the file count makes it look far larger than the
+		 * number of likes it represents.
+		 */
+		images: [...disk.photos.values()].reduce((n, names) => n + names.length, 0),
+		songs: disk.audio.size,
 	};
 }
 
@@ -91,13 +109,22 @@ export function hasPhotos(id, expected) {
 	if (n == null) return false;
 	return expected ? n >= expected : n > 0;
 }
+export function hasAudio(id) {
+	return disk.audio.has(id);
+}
 
 /** What still needs fetching for this record, given what's on disk. */
 export function missingParts(rec) {
-	if (rec.type === 'photo') {
-		return hasPhotos(rec.id, (rec.photos || []).length) ? [] : ['photos'];
-	}
-	return hasVideo(rec.id) ? [] : ['video'];
+	if (rec.type !== 'photo') return hasVideo(rec.id) ? [] : ['video'];
+
+	const parts = [];
+	if (!hasPhotos(rec.id, (rec.photos || []).length)) parts.push('photos');
+	// Only ever asked for when this run actually has a URL to fetch it from. An
+	// archive from before songs were collected — or one scanned in off disk — has
+	// no way to get one, and would otherwise report every photo post it holds as
+	// incomplete for good.
+	if ((rec.audio || []).length && !hasAudio(rec.id)) parts.push('audio');
+	return parts;
 }
 
 // ------------------------------------------------------------- catching up
@@ -130,7 +157,12 @@ export const CAUGHT_UP_RUN = 120;
 export function isSettled(state, rec) {
 	const prev = state.items[rec.id];
 	if (!prev) return false; // never seen it: this is a new like
-	if (!missingParts(rec).length) return true; // media is on disk
+	// The song a photo post came with is deliberately not part of this. It is a
+	// bonus on top of the pictures, and a post whose pictures are all on disk is
+	// one an earlier run finished with — counting the song would have sent the
+	// first run after songs existed back down the entire list to collect them.
+	// They are still fetched for every post a run does reach.
+	if (!missingParts(rec).some((part) => part !== 'audio')) return true;
 	// Nothing on disk, but we already know why: the media was fetched and
 	// refused, or the item had dropped out of the list. Trying again is what a
 	// full sync is for; it isn't a reason to hold an incremental run open.

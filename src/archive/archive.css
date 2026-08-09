@@ -750,6 +750,41 @@ select:focus {
 	margin: 2px 0 0;
 	word-break: break-word;
 }
+
+/*
+ * The song, at the top of the metadata panel — where the post itself puts it,
+ * above the caption. A video has the name and nothing else, since its sound is
+ * in the file on the stage; a photo post has the player under it.
+ *
+ * The player is left as the browser's own rather than rebuilt: it is a row of
+ * controls nobody needs taught, and at this width the native one already lays
+ * itself out. Only the width is imposed, since an <audio> defaults to 300px and
+ * would sit short of the panel's edge.
+ */
+.lb-song {
+	margin-bottom: 14px;
+	padding-bottom: 12px;
+	border-bottom: 1px solid var(--line);
+}
+.lb-song .name {
+	color: var(--fg-dim);
+	font-size: 12px;
+	margin-bottom: 8px;
+	/* One line: a long title is the player's caption, not a paragraph above it. */
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+/* Nothing under it to be spaced away from. */
+.lb-song .name:last-child {
+	margin-bottom: 0;
+}
+.lb-song audio {
+	width: 100%;
+	display: block;
+	/* Chromium's player is a light control on a light panel otherwise. */
+	color-scheme: dark;
+}
 .lb-close {
 	position: absolute;
 	top: 16px;

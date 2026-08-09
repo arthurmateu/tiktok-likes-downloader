@@ -69,9 +69,14 @@ function escapeAttr(value) {
 }
 
 /**
- * Only what the grid, the search box and the lightbox actually read. Music,
- * dimensions and internal bookkeeping stay in archive.json — at six thousand
- * items the difference is megabytes of page.
+ * Only what the grid, the search box and the lightbox actually read. Dimensions
+ * and internal bookkeeping stay in archive.json — at six thousand items the
+ * difference is megabytes of page.
+ *
+ * The song's title and artist come along; the rest of what archive.json records
+ * about the music — its id — does not. Every item that has a title shows one at
+ * the top of its panel, whether or not the track itself was downloaded, so this
+ * cannot be narrowed to the posts holding an audio file.
  *
  * Exported because a live viewer asks for this same shape over the bridge, and
  * the two must not drift.
@@ -81,6 +86,7 @@ export function slimItems(state) {
 	for (const item of Object.values(state.items || {})) {
 		const author = item.author || {};
 		const stats = item.stats || {};
+		const music = item.music || {};
 		out.push({
 			id: item.id,
 			type: item.type || 'video',
@@ -94,6 +100,10 @@ export function slimItems(state) {
 			photoCount: item.photoCount || 0,
 			status: item.status || '',
 			files: item.files || undefined,
+			music:
+				music.title || music.authorName
+					? { title: music.title || '', authorName: music.authorName || '' }
+					: undefined,
 		});
 	}
 	return out;

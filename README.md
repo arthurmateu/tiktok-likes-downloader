@@ -39,11 +39,14 @@ Each completed sync also rewrites `viewer.html` in the folder — the same Libra
   videos/<videoId>.mp4       one file per video
   images/<postId>.jpg        a single-image post
   images/<postId>_01.jpg     a gallery, one file per image, numbered in order
+  audio/<postId>.mp3         the song a photo post plays over its images
   archive.json               every liked item, downloaded or not
   viewer.html                the Library, as a file you can double-click
 ```
 
 Nothing hidden, nothing nested. Filenames are the TikTok item ID, so writing the same item twice is a no-op, and the **directory listing** — not any database — decides what still needs downloading. Delete a file and the next sync re-fetches it; corrupt `archive.json` and nothing re-downloads.
+
+Only photo posts get an `audio/` file, and only where TikTok gave one: a video's soundtrack is already inside its own mp4, so fetching the track again would be a second request per item for a copy of something the folder has. The Library plays it beside the images. A song that can't be fetched is not a failed item — the pictures are the post, and the next sync tries the song again.
 
 There are no cover files. A cover is a thumbnail of something you already have, so the Library decodes a frame out of the video instead (a little way in, since TikTok's first frame is usually black) and caches it in memory. Photo posts use their own first image.
 

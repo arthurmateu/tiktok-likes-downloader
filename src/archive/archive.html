@@ -218,6 +218,7 @@
   videos/&lt;videoId&gt;.mp4          one file per video
   images/&lt;postId&gt;.jpg           a single-image post
   images/&lt;postId&gt;_01.jpg        a gallery, numbered in order
+  audio/&lt;postId&gt;.mp3            the song a photo post plays over its images
   archive.json                  every liked item, downloaded or not
   viewer.html                   this Library, as a file you can double-click</pre>
 
@@ -225,7 +226,7 @@
 				<p>
 					Rewritten after every sync, and by <b>Write viewer.html</b> above. It is one
 					self-contained file — the metadata is baked in and the media loads from
-					<code>videos/</code> and <code>images/</code> beside it — so the folder browses
+					<code>videos/</code>, <code>images/</code> and <code>audio/</code> beside it — so the folder browses
 					itself with no extension involved, and keeps working if you copy it to another
 					machine or a drive.
 				</p>

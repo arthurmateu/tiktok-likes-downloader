@@ -34,7 +34,15 @@
 		<pre id="out">running…</pre>
 
 		<script type="module">
-			import { emptyState, scanDisk, isSettled, settledStreak, CAUGHT_UP_RUN, STATUS } from '../lib/state.js';
+			import {
+				emptyState,
+				scanDisk,
+				isSettled,
+				missingParts,
+				settledStreak,
+				CAUGHT_UP_RUN,
+				STATUS,
+			} from '../lib/state.js';
 			import { reset, seed } from './fake-fs.js';
 
 			const out = document.getElementById('out');
@@ -105,6 +113,18 @@
 				const state = known(['30', '40']);
 				check('a single-image post is settled by its one file', isSettled(state, photo('30', 1)));
 				check('a gallery missing all but the first image is not', !isSettled(state, photo('40', 3)));
+			}
+
+			{
+				// The song is fetched for every post a run reaches, but wanting one
+				// must not hold the run open: counting it would have sent the first
+				// sync after songs existed back down the whole list to collect them.
+				const state = known(['30']);
+				const withSong = { ...photo('30', 1), audio: ['u'] };
+				same('a post with no song on disk still wants one', missingParts(withSong), ['audio']);
+				check('but that alone does not hold the run open', isSettled(state, withSong));
+				same('and a post nothing knows a song for wants nothing',
+					missingParts(photo('30', 1)), []);
 			}
 
 			// ---- where a run stops ----------------------------------------------

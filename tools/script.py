@@ -5,6 +5,7 @@ Convert a myfaveTT archive (or an older ttarchive one) to the flat layout.
     <folder>/videos/<id>.mp4
     <folder>/images/<postId>.jpg          a single-image post
     <folder>/images/<postId>_01.jpg       a gallery, numbered in order
+    <folder>/audio/<postId>.mp3           a photo post's song, where there is one
     <folder>/archive.json
 
 Photo posts used to get a directory each; they don't any more. An archive
@@ -57,6 +58,7 @@ B64_IN_JS = re.compile(r'=\s*"([A-Za-z0-9+/=]+)"')
 
 VIDEO_EXTS = {".mp4", ".webm", ".mov"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".avif", ".gif"}
+AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav"}
 
 # `<postId>.jpg` or `<postId>_01.jpg`. Ids are numeric, so the position suffix
 # can be told from the id itself rather than guessed at.
@@ -223,16 +225,13 @@ def scan_disk(root: Path, also: list[Path] | None = None):
     `also` lets a dry run count files it has decided to move but hasn't, so the
     summary it prints is the one the real run would produce.
     """
-    videos, images = {}, {}
+    videos, images, songs = {}, {}, {}
     found: list[Path] = list(also or [])
 
-    vdir = root / "videos"
-    if vdir.is_dir():
-        found += [f for f in vdir.iterdir() if f.is_file()]
-
-    idir = root / "images"
-    if idir.is_dir():
-        found += [f for f in idir.iterdir() if f.is_file()]
+    for name in ("videos", "images", "audio"):
+        d = root / name
+        if d.is_dir():
+            found += [f for f in d.iterdir() if f.is_file()]
 
     for f in found:
         if f.parent.name == "videos" and f.suffix.lower() in VIDEO_EXTS:
@@ -241,8 +240,13 @@ def scan_disk(root: Path, also: list[Path] | None = None):
             post_id = photo_owner(f)
             if post_id:
                 images.setdefault(post_id, []).append(f"images/{f.name}")
+        # One song per photo post, so no numbered form and nothing to collect
+        # into a list — the stem is the post it belongs to.
+        elif f.parent.name == "audio" and f.suffix.lower() in AUDIO_EXTS:
+            if f.stem.isdigit():
+                songs[f.stem] = f"audio/{f.name}"
 
-    return videos, {k: sorted(v) for k, v in images.items()}
+    return videos, {k: sorted(v) for k, v in images.items()}, songs
 
 
 def build_authors(raw: dict | None, previous: dict) -> dict:
@@ -276,7 +280,7 @@ def build_archive(root: Path, dbs: dict, previous: dict | None, also: list[Path]
     prev_items = (previous or {}).get("items") or {}
     authors = build_authors(dbs.get("authors"), (previous or {}).get("authors") or {})
 
-    on_disk_videos, on_disk_images = scan_disk(root, also)
+    on_disk_videos, on_disk_images, on_disk_songs = scan_disk(root, also)
 
     items: dict[str, dict] = {}
 
@@ -325,6 +329,12 @@ def build_archive(root: Path, dbs: dict, previous: dict | None, also: list[Path]
         item["type"] = "photo"
         item["photoCount"] = len(paths)
         item["files"] = {"photos": paths}
+    # Merged rather than assigned: the images above are the post, and a song
+    # without them is a leftover that shouldn't make the item look downloaded.
+    for item_id, path in on_disk_songs.items():
+        item = items.get(item_id)
+        if item and item.get("files", {}).get("photos"):
+            item["files"]["audio"] = path
 
     for item_id, item in items.items():
         item.setdefault("type", "video")

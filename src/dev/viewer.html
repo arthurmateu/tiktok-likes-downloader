@@ -70,6 +70,10 @@
 						stats: { diggCount: 1234, playCount: 99000 },
 						status: 'saved',
 						files: { video: 'videos/111.mp4' },
+						// A video's song is metadata the archive keeps and the viewer
+						// has no use for — the sound is inside the mp4 already — so it
+						// must not be carried into the page six thousand times over.
+						music: { id: '8', title: 'video sound', authorName: 'Someone' },
 						// Deliberately the opposite of post-date order: 111 is the
 						// oldest post and the most recent like, so a page that has
 						// quietly fallen back to sorting by date says so in the grid.
@@ -84,7 +88,8 @@
 						stats: { diggCount: 5, playCount: 6 },
 						photoCount: 2,
 						status: 'saved',
-						files: { photos: ['images/222_01.jpg', 'images/222_02.jpg'] },
+						files: { photos: ['images/222_01.jpg', 'images/222_02.jpg'], audio: 'audio/222.mp3' },
+						music: { id: '9', title: 'a song', authorName: 'Artist' },
 						likeRank: 1,
 					},
 					333: {
@@ -142,7 +147,17 @@
 				check('data blob parses', !!payload.items && payload.items.length === 3);
 				check('caption survived intact', item.desc === NASTY, JSON.stringify(item.desc));
 				check('file paths carried over', item.files.video === 'videos/111.mp4');
-				check('photo paths carried over', payload.items.find((i) => i.id === '222').files.photos.length === 2);
+				const post = payload.items.find((i) => i.id === '222');
+				check('photo paths carried over', post.files.photos.length === 2);
+
+				// The song's path and its name both have to reach the page: one is
+				// what the player loads, the other is the label above it. Every item
+				// with a name shows one, video or not, so both of these carry.
+				check('a photo post’s song path carried over', post.files.audio === 'audio/222.mp3');
+				check('and its title came with it', post.music && post.music.title === 'a song',
+					JSON.stringify(post.music));
+				check('a video’s song title came too', item.music && item.music.title === 'video sound',
+					JSON.stringify(item.music));
 				check('bridge URL was baked in', /archive\.html$/.test(payload.config.bridgeURL));
 				check('slimming dropped nothing needed', 'status' in item && 'stats' in item && 'author' in item);
 
@@ -172,6 +187,30 @@
 					page.getElementById('sort').value);
 				const order = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
 				check('most recently liked first, unranked last', String(order) === '111,222,333', String(order));
+
+				// The song player, in the page that actually gets written to the
+				// folder. The file 404s in here — there is no folder — but everything
+				// that decides whether a player appears at all has already happened by
+				// then, and where it appears is the point: above the caption.
+				page.querySelector('.tile[data-id="222"]').click();
+				const song = page.querySelector('#lbMeta .lb-song');
+				check('a photo post opens with its song', !!song);
+				check('the song sits above the caption', song === page.getElementById('lbMeta').firstElementChild);
+				check('the player points at the file in the folder',
+					!!song && /audio\/222\.mp3$/.test(song.querySelector('audio').getAttribute('src')));
+				check('and is labelled with the song', !!song && song.querySelector('.name').textContent.includes('a song'),
+					song && song.querySelector('.name').textContent);
+
+				// The other half: a video's sound is the file on the stage, so a
+				// second player over it would be two things playing at once — but the
+				// name still belongs in the same place, or stepping between the two
+				// moves it out from over the caption and down among the play counts.
+				page.querySelector('#lbClose').click();
+				page.querySelector('.tile[data-id="111"]').click();
+				const videoSong = page.querySelector('#lbMeta .lb-song');
+				check('a video names its song in the same place', !!videoSong &&
+					videoSong === page.getElementById('lbMeta').firstElementChild);
+				check('and gets no second player over it', !!videoSong && !videoSong.querySelector('audio'));
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}

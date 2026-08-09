@@ -245,7 +245,7 @@ async function afterFolderReady() {
 	if (uid && !$('username').value) $('username').value = uid;
 
 	renderStats(counts);
-	log(`Found ${counts.videos} videos, ${counts.photoSets} photo posts.`, 'ok');
+	log(summarise('Found', counts), 'ok');
 	renderLibrary(app.state);
 }
 
@@ -354,7 +354,7 @@ $('rescan').addEventListener('click', async () => {
 		const counts = await scanDisk({ onProgress: (files) => showScanning(scanningMsg(files)) });
 		renderStats(counts);
 		renderLibrary(app.state);
-		log(`Rescan: ${counts.videos} videos, ${counts.photoSets} photo posts.`);
+		log(summarise('Rescanned —', counts));
 	} catch (err) {
 		log(`Could not read the folder: ${err.message || err}`, 'err');
 	} finally {

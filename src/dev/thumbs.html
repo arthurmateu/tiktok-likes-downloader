@@ -162,13 +162,47 @@
 				return new Promise((r) => c.toBlob(r, 'image/jpeg', 0.9));
 			}
 
+			/**
+			 * A short silence, written out as a WAV by hand.
+			 *
+			 * The player only has to have a real file behind it — nothing here
+			 * listens to it — and a WAV is the one format that can be built in a
+			 * dozen lines rather than pasted in as a base64 fixture. The extension
+			 * being .wav is also the point: what the CDN served decides it, which is
+			 * why the file name is what the folder scan remembers.
+			 */
+			function silentWAV(seconds = 0.4) {
+				const rate = 8000;
+				const samples = Math.floor(rate * seconds);
+				const view = new DataView(new ArrayBuffer(44 + samples * 2));
+				const ascii = (at, s) => {
+					for (let i = 0; i < s.length; i++) view.setUint8(at + i, s.charCodeAt(i));
+				};
+				ascii(0, 'RIFF');
+				view.setUint32(4, 36 + samples * 2, true);
+				ascii(8, 'WAVEfmt ');
+				view.setUint32(16, 16, true); // PCM header length
+				view.setUint16(20, 1, true); // uncompressed
+				view.setUint16(22, 1, true); // mono
+				view.setUint32(24, rate, true);
+				view.setUint32(28, rate * 2, true); // bytes per second
+				view.setUint16(32, 2, true); // bytes per frame
+				view.setUint16(34, 16, true); // bits per sample
+				ascii(36, 'data');
+				view.setUint32(40, samples * 2, true);
+				return new Blob([view.buffer], { type: 'audio/wav' });
+			}
+
 			fake.seed('videos/111.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
 			fake.seed('images/333_01.jpg', await solidJPEG('#ff0000'));
 			fake.seed('images/333_02.jpg', await solidJPEG('#0000ff'));
+			fake.seed('audio/333.wav', silentWAV());
 
 			const counts = await scanDisk();
 			check('scanDisk sees the flat layout', counts.videos === 1 && counts.photoSets === 1,
 				JSON.stringify(counts));
+			check('and the song beside the photo post', counts.songs === 1 && disk.audio.get('333') === '333.wav',
+				JSON.stringify([counts.songs, disk.audio.get('333')]));
 			check(
 				'photo post file count',
 				disk.photos.get('333')?.length === 2,
@@ -178,8 +212,8 @@
 			const state = {
 				version: 2,
 				items: {
-					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved' },
-					333: { id: '333', type: 'photo', desc: 'a photo post', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved' },
+					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved', music: { title: 'someone’s song' } },
+					333: { id: '333', type: 'photo', desc: 'a photo post', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved', music: { title: 'a song', authorName: 'Artist' } },
 					444: { id: '444', type: 'video', desc: 'never downloaded', createTime: 1, author: {}, stats: {}, status: 'pending' },
 				},
 				authors: {},
@@ -243,6 +277,15 @@
 			check('clicking a video opens it in the lightbox', !!document.querySelector('#lbStage video')?.src);
 			check('the lightbox reports the item status',
 				document.getElementById('lbMeta').textContent.includes('saved'));
+			// Its sound is inside the mp4 already, so there is no second player — but
+			// the name sits where a photo post's does, or stepping between the two
+			// moves it out from over the caption and down among the play counts.
+			const videoSong = document.querySelector('#lbMeta .lb-song');
+			check('a video names its song in the same place',
+				videoSong === document.getElementById('lbMeta').firstElementChild &&
+					videoSong?.querySelector('.name').textContent.includes('someone’s song'),
+				videoSong?.textContent);
+			check('and gets no second player over it', !videoSong?.querySelector('audio'));
 			document.getElementById('lbClose').click();
 
 			// A photo post opens one image at a time, the way TikTok's own slideshow
@@ -255,7 +298,48 @@
 			await sleep(600);
 			const sheet = document.querySelectorAll('#lbStage img').length;
 			check('g opens every image of the post at once', sheet === 2, `got ${sheet}`);
+
+			// ---- the song --------------------------------------------------------
+			// A photo post on TikTok is a slideshow over a track, so the images on
+			// their own are half of it.
+			const player = document.querySelector('#lbMeta .lb-song');
+			check('a photo post opens with its song', !!player);
+			check('the song sits above the caption',
+				player === document.getElementById('lbMeta').firstElementChild);
+			check('it is labelled with the song',
+				player?.querySelector('.name').textContent.includes('a song — Artist'),
+				player?.querySelector('.name').textContent);
+
+			const song = player?.querySelector('audio');
+			check('and reads the file out of the folder', !!song?.src.startsWith('blob:'), song?.src);
+
+			// The stage is rebuilt every time the images are paged, and the song has
+			// to play across that rather than start over on each picture — which is
+			// the whole reason it lives in the metadata panel.
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+			await sleep(400);
+			check('paging the images leaves the song alone',
+				document.querySelector('#lbMeta .lb-song audio') === song);
+
+			// Speed belongs to video: it is a way of getting through one. A song at
+			// 1.75× is just wrong, so the ladder deliberately doesn't reach it.
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: ']', bubbles: true }));
+			await sleep(50);
+			check('the speed keys do not touch it', song?.playbackRate === 1, String(song?.playbackRate));
+			// Mute does carry, though: silencing the archive once has to silence all
+			// of it, or stepping onto a photo post is a surprise. Read as a toggle
+			// rather than an absolute — nothing here is a user gesture, so the
+			// autoplay fallback has already muted this player on its own behalf.
+			const wasMuted = song?.muted;
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', bubbles: true }));
+			await sleep(50);
+			check('mute reaches it', song?.muted === !wasMuted, `${wasMuted} -> ${song?.muted}`);
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'm', bubbles: true }));
+
 			document.getElementById('lbClose').click();
+			await sleep(50);
+			check('closing the lightbox stops the song',
+				song?.paused === true && !document.querySelector('#lbMeta .lb-song'));
 
 			lines.push('', failures
 				? `<span class="fail">${failures} of ${checks} failing</span>`

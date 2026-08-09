@@ -78,6 +78,23 @@
 		return [...new Set(urls.filter(Boolean))];
 	}
 
+	/**
+	 * The song itself, as opposed to its title.
+	 *
+	 * Asked for on photo posts only. A video's audio is already inside the mp4 we
+	 * fetch, so pulling the track down again would be a second request per item
+	 * for a copy of something the archive has.
+	 *
+	 * `playUrl` is a bare string in the web payload, but the app-shaped one wraps
+	 * it in a url list the same way PlayAddr does; both are read, since which
+	 * arrives depends on the endpoint that answered.
+	 */
+	function musicUrls(m) {
+		const play = m.playUrl;
+		const urls = typeof play === 'string' ? [play] : play?.urlList || play?.url_list || [];
+		return [...new Set(urls.filter(Boolean))];
+	}
+
 	function coverUrls(item) {
 		const v = item.video || {};
 		const ip = item.imagePost || {};
@@ -123,6 +140,7 @@
 			height: num(item.video?.height),
 			cover: coverUrls(item),
 			video: isPhoto ? [] : videoUrls(item.video || {}),
+			audio: isPhoto ? musicUrls(m) : [],
 			photos: isPhoto
 				? item.imagePost.images.map((im) => (im.imageURL?.urlList || []).filter(Boolean))
 				: [],

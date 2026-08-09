@@ -346,12 +346,27 @@ function applyPlayback(v) {
 	// Both, because `load()` resets playbackRate to whatever the default is.
 	v.defaultPlaybackRate = lbRate;
 	v.playbackRate = lbRate;
-	v.volume = lbVolume;
-	v.muted = lbMuted;
+	applySound(v);
+}
+
+/**
+ * Level and mute, which belong to anything with a sound in it — a clip, or the
+ * song over a photo post. Speed deliberately doesn't: it is a way of getting
+ * through a video, and a song is not something anyone wants at 1.75×.
+ */
+function applySound(el) {
+	el.volume = lbVolume;
+	el.muted = lbMuted;
 }
 
 function eachVideo(fn) {
 	for (const v of $('lbStage').querySelectorAll('video')) fn(v);
+}
+
+/** Both at once: the clip on the stage, and the song beside it in the panel. */
+function eachSound(fn) {
+	for (const v of $('lbStage').querySelectorAll('video')) fn(v);
+	for (const a of $('lbMeta').querySelectorAll('audio')) fn(a);
 }
 
 /**
@@ -397,6 +412,106 @@ function photoNames(item) {
 	return disk.photos.get(item.id) || [];
 }
 
+// -------------------------------------------------------------------- songs
+
+/** “Title — artist”, as much of it as the metadata has. */
+function songLabel(item) {
+	const m = item.music || {};
+	return [m.title, m.authorName].filter(Boolean).join(' — ');
+}
+
+/**
+ * The song's own object URL, kept out of `openURLs` on purpose.
+ *
+ * Those are revoked whenever the stage is rebuilt, and paging the images of a
+ * post rebuilds the stage several times over a track that should carry on
+ * playing. Revoking a URL a player is still holding also costs it the ability
+ * to seek, which is a control the player is showing.
+ */
+let songURL = null;
+
+/** Take the player away and let go of the file behind it. */
+function clearSong() {
+	const audio = $('lbMeta').querySelector('audio');
+	if (audio) {
+		audio.pause();
+		audio.removeAttribute('src');
+		audio.load();
+	}
+	$('lbMeta').querySelector('.lb-song')?.remove();
+	if (songURL) {
+		URL.revokeObjectURL(songURL);
+		songURL = null;
+	}
+}
+
+/**
+ * The song, at the top of the metadata panel: its name for anything that has
+ * one, and a player under that where the track itself is in the folder.
+ *
+ * The name is in the same place for a video as for a photo post, and above the
+ * caption in both — stepping between the two shouldn't move it, and it isn't a
+ * detail of the same rank as the play count. Only photo posts get the player: a
+ * video's sound is inside the file already on the stage, and a second thing
+ * playing over it is not what a title in the panel offered.
+ *
+ * The player half is async like the stage, and guarded by the same `lbSeq` — a
+ * folder read can outlast the step that asked for it, and audio attached after
+ * that belongs to an item nobody is looking at any more.
+ */
+async function mountSong(item, seq) {
+	const label = songLabel(item);
+	const file = item.type === 'photo' ? disk.audio.get(item.id) : null;
+	if (!label && !file) return;
+
+	const box = document.createElement('div');
+	box.className = 'lb-song';
+	const title = document.createElement('div');
+	title.className = 'name';
+	title.textContent = `♪ ${label || 'Unnamed sound'}`;
+	// The panel is 340px wide and a title plus an artist is routinely longer, so
+	// the ellipsis has to have the whole thing behind it somewhere.
+	title.title = label;
+	box.appendChild(title);
+	// Above the caption, which is where the post itself puts it.
+	$('lbMeta').prepend(box);
+
+	if (!file) return;
+
+	const url = await blobURL(LAYOUT.audio, file);
+	if (seq !== lbSeq) {
+		if (url) URL.revokeObjectURL(url);
+		return;
+	}
+	if (!url) return;
+	songURL = url;
+
+	const audio = document.createElement('audio');
+	audio.src = url;
+	audio.controls = true;
+	audio.loop = true;
+	applySound(audio);
+	// The player's own slider is the other way to set these, and what it sets has
+	// to carry onward exactly as what the video's slider and the keys set do.
+	audio.addEventListener('volumechange', () => {
+		lbMuted = audio.muted;
+		lbVolume = audio.volume;
+		remember();
+	});
+	box.appendChild(audio);
+
+	// Sound needs a gesture behind it, and stepping with the wheel or the keys
+	// isn't always counted as one. A refused play is retried muted rather than
+	// left as a player that looks broken.
+	try {
+		await audio.play();
+	} catch (_) {
+		audio.muted = true;
+		lbMuted = true;
+		audio.play().catch(() => {});
+	}
+}
+
 function clearStage() {
 	const stage = $('lbStage');
 	for (const v of stage.querySelectorAll('video')) {
@@ -412,6 +527,7 @@ function closeLightbox() {
 	if (!lbOpen()) return;
 	lbSeq++;
 	clearStage();
+	clearSong();
 	$('lbMeta').replaceChildren();
 	$('lightbox').classList.add('hidden');
 	const at = lbIndex;
@@ -859,6 +975,12 @@ function renderLightbox() {
 
 	renderStage(item);
 	renderCount();
+	// Read after renderStage, whose first act is to take the next sequence number.
+	// Anything this render starts is stamped with it.
+	const seq = lbSeq;
+	// The song lives with the metadata rather than on the stage, so tearing the
+	// stage down did not take the previous item's with it.
+	clearSong();
 
 	const dl = document.createElement('dl');
 	const add = (k, v) => {
@@ -894,6 +1016,8 @@ function renderLightbox() {
 	link.style.color = 'var(--accent)';
 
 	$('lbMeta').replaceChildren(dl, document.createElement('br'), link);
+	// Last, since it prepends into the panel this line has just built.
+	mountSong(item, seq);
 }
 
 // ------------------------------------------------------------------ wiring
@@ -966,7 +1090,7 @@ export function wireLibrary(stateGetter) {
 				// so do these.
 				if (!lbMuted && !lbVolume) lbVolume = 1;
 				remember();
-				eachVideo(applyPlayback);
+				eachSound(applySound);
 				break;
 			// Speed, on the two keys next to each other and on YouTube's pair for the
 			// same job. Nothing else here wants them.
@@ -1043,10 +1167,12 @@ export function wireLibrary(stateGetter) {
 }
 
 function togglePlay() {
-	const v = $('lbStage').querySelector('video');
-	if (!v) return;
-	if (v.paused) v.play().catch(() => {});
-	else v.pause();
+	// The stage for a video; for a photo post, the song beside it is the only
+	// thing space could mean.
+	const el = $('lbStage').querySelector('video') || $('lbMeta').querySelector('audio');
+	if (!el) return;
+	if (el.paused) el.play().catch(() => {});
+	else el.pause();
 }
 
 export function renderLibrary(state) {

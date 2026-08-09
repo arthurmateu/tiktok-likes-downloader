@@ -301,6 +301,17 @@
 		return (item.files && item.files.photos) || [];
 	}
 
+	/** The song over a photo post. Videos have theirs inside their own mp4. */
+	function audioPath(item) {
+		return (item.files && item.files.audio) || null;
+	}
+
+	/** “Title — artist”, as much of it as came along with the snapshot. */
+	function songLabel(item) {
+		const m = item.music || {};
+		return [m.title, m.authorName].filter(Boolean).join(' — ');
+	}
+
 	function present(item) {
 		return item.type === 'photo' ? photoPaths(item).length > 0 : !!(item.files && item.files.video);
 	}
@@ -521,12 +532,91 @@
 		// Both, because `load()` resets playbackRate to whatever the default is.
 		v.defaultPlaybackRate = lbRate;
 		v.playbackRate = lbRate;
-		v.volume = lbVolume;
-		v.muted = lbMuted;
+		applySound(v);
+	}
+
+	/**
+	 * Level and mute, which belong to anything with a sound in it — a clip, or the
+	 * song over a photo post. Speed deliberately doesn't: it is a way of getting
+	 * through a video, and a song is not something anyone wants at 1.75×.
+	 */
+	function applySound(el) {
+		el.volume = lbVolume;
+		el.muted = lbMuted;
 	}
 
 	function eachVideo(fn) {
 		for (const v of $('lbStage').querySelectorAll('video')) fn(v);
+	}
+
+	/** Both at once: the clip on the stage, and the song beside it in the panel. */
+	function eachSound(fn) {
+		for (const v of $('lbStage').querySelectorAll('video')) fn(v);
+		for (const a of $('lbMeta').querySelectorAll('audio')) fn(a);
+	}
+
+	/**
+	 * The song, at the top of the metadata panel: its name for anything that has
+	 * one, and a player under that where the track itself is in the folder.
+	 *
+	 * The name is in the same place for a video as for a photo post, and above
+	 * the caption in both — stepping between the two shouldn't move it, and it
+	 * isn't a detail of the same rank as the play count. Only photo posts get the
+	 * player: a video's sound is inside the file already on the stage, and a
+	 * second thing playing over it is not what a title in the panel offered.
+	 *
+	 * The player lives here rather than on the stage because the stage is rebuilt
+	 * every time the images are paged, and the song has to play across that
+	 * rather than start over on each picture.
+	 */
+	function mountSong(item) {
+		const label = songLabel(item);
+		const path = item.type === 'photo' ? audioPath(item) : null;
+		if (!label && !path) return;
+
+		const box = el('div', 'lb-song');
+		const name = el('div', 'name', `♪ ${label || 'Unnamed sound'}`);
+		// The panel is 340px wide and a title plus an artist is routinely longer, so
+		// the ellipsis has to have the whole thing behind it somewhere.
+		name.title = label;
+		box.appendChild(name);
+		// Above the caption, which is where the post itself puts it.
+		$('lbMeta').prepend(box);
+
+		if (!path) return;
+
+		const audio = document.createElement('audio');
+		audio.src = src(path);
+		audio.controls = true;
+		audio.loop = true;
+		applySound(audio);
+		// The player's own slider is the other way to set these, and what it sets
+		// has to carry onward exactly as what the video's slider and the keys set do.
+		audio.addEventListener('volumechange', () => {
+			lbMuted = audio.muted;
+			lbVolume = audio.volume;
+			remember();
+		});
+		audio.addEventListener(
+			'error',
+			() => {
+				if (audio.isConnected) name.textContent = `♪ ${label || 'Sound'} — not in this folder`;
+			},
+			{ once: true }
+		);
+		box.appendChild(audio);
+
+		// Sound needs a gesture behind it, and stepping with the wheel or the keys
+		// isn't always counted as one. A refused play is retried muted rather than
+		// left as a player that looks broken.
+		const started = audio.play();
+		if (started && started.catch) {
+			started.catch(() => {
+				audio.muted = true;
+				lbMuted = true;
+				audio.play().catch(() => {});
+			});
+		}
 	}
 
 	/**
@@ -1037,6 +1127,10 @@
 		link.style.color = 'var(--accent)';
 
 		$('lbMeta').replaceChildren(dl, document.createElement('br'), link);
+		// After the panel is built, since it prepends into it. Replacing the panel
+		// is also what stopped the previous song: a media element taken out of the
+		// document pauses itself.
+		mountSong(item);
 	}
 
 	// -------------------------------------------------------------------- boot
@@ -1075,10 +1169,12 @@
 	});
 
 	function togglePlay() {
-		const v = $('lbStage').querySelector('video');
-		if (!v) return;
-		if (v.paused) v.play().catch(() => {});
-		else v.pause();
+		// The stage for a video; for a photo post, the song beside it is the only
+		// thing space could mean.
+		const media = $('lbStage').querySelector('video') || $('lbMeta').querySelector('audio');
+		if (!media) return;
+		if (media.paused) media.play().catch(() => {});
+		else media.pause();
 	}
 
 	document.addEventListener('keydown', (e) => {
@@ -1122,7 +1218,7 @@
 				// so do these.
 				if (!lbMuted && !lbVolume) lbVolume = 1;
 				remember();
-				eachVideo(applyPlayback);
+				eachSound(applySound);
 				break;
 			// Speed, on the two keys next to each other and on YouTube's pair for the
 			// same job. Nothing else here wants them.

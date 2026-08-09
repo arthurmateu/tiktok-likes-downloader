@@ -23,6 +23,11 @@ const EXT_BY_TYPE = {
 	'image/heic': 'heic',
 	'image/avif': 'avif',
 	'video/mp4': 'mp4',
+	'audio/mpeg': 'mp3',
+	'audio/mp3': 'mp3',
+	'audio/mp4': 'm4a',
+	'audio/x-m4a': 'm4a',
+	'audio/aac': 'aac',
 };
 
 function extFor(blob, url, fallback) {
@@ -50,12 +55,22 @@ const MAGIC = {
 		[4, [0x66, 0x74, 0x79, 0x70]], // HEIC/AVIF
 		[0, [0x47, 0x49, 0x46, 0x38]], // GIF
 	],
+	audio: [
+		[0, [0x49, 0x44, 0x33]], // 'ID3' — an mp3 carrying a tag
+		[4, [0x66, 0x74, 0x79, 0x70]], // 'ftyp' — AAC in an MP4 container (.m4a)
+		// A bare MPEG frame: the sync word is eleven set bits, so only the first
+		// byte and the top three of the second are fixed. A predicate rather than a
+		// row of the table, since the rest of the byte is layer and bitrate.
+		(head) => head[0] === 0xff && (head[1] & 0xe0) === 0xe0,
+	],
 };
 
 async function looksLike(blob, kind) {
 	if (!kind || !MAGIC[kind]) return true;
 	const head = new Uint8Array(await blob.slice(0, 16).arrayBuffer());
-	return MAGIC[kind].some(([off, sig]) => sig.every((b, i) => head[off + i] === b));
+	return MAGIC[kind].some((sig) =>
+		typeof sig === 'function' ? sig(head) : sig[1].every((b, i) => head[sig[0] + i] === b)
+	);
 }
 
 /**
@@ -268,6 +283,25 @@ async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 		disk.photos.set(rec.id, names.sort());
 		files.photos = paths;
 		saved.push('photos');
+	}
+
+	// The song over a photo post. Failing to get it is not failing the item: the
+	// pictures are the post, and marking one `unavailable` over a track the CDN
+	// wouldn't serve would hide it in the library and have every later sync retry
+	// the whole thing. A halt or an abort still carry — neither is about this
+	// file, and both have to stop the run.
+	if (want.includes('audio') && rec.audio?.length) {
+		try {
+			const { blob, url } = await fetchFirst(rec.audio, { signal, expect: 'audio', guard });
+			const name = `${rec.id}.${extFor(blob, url, 'mp3')}`;
+			await writeFile(LAYOUT.audio, name, blob);
+			disk.audio.set(rec.id, name);
+			files.audio = [...LAYOUT.audio, name].join('/');
+			saved.push('audio');
+			onFile?.({ id: rec.id, kind: 'audio', bytes: blob.size, url });
+		} catch (err) {
+			if (err instanceof Halt || err?.name === 'AbortError') throw err;
+		}
 	}
 
 	if (saved.length) markSaved(state, rec.id, files);
