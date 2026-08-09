@@ -58,6 +58,61 @@ async function looksLike(blob, kind) {
 	return MAGIC[kind].some(([off, sig]) => sig.every((b, i) => head[off + i] === b));
 }
 
+/**
+ * Walk the top-level ISO-BMFF boxes and hand back the payload of the first one
+ * named `wanted`, or null. Reads only box headers, so the file never has to be
+ * pulled into memory whole to find a box near the front.
+ */
+async function topLevelBox(blob, wanted) {
+	for (let at = 0; at + 8 <= blob.size; ) {
+		const head = new DataView(await blob.slice(at, at + 16).arrayBuffer());
+		if (head.byteLength < 8) return null;
+		let size = head.getUint32(0);
+		let headerLen = 8;
+		const type = String.fromCharCode(head.getUint8(4), head.getUint8(5), head.getUint8(6), head.getUint8(7));
+		if (size === 1) {
+			// 64-bit size, in a `largesize` field sitting where the payload would be.
+			if (head.byteLength < 16) return null;
+			size = Number(head.getBigUint64(8));
+			headerLen = 16;
+		} else if (size === 0) {
+			size = blob.size - at; // box runs to end of file
+		}
+		if (size < headerLen) return null; // malformed: a box can't be shorter than its header
+		if (type === wanted) return blob.slice(at + headerLen, at + size);
+		at += size;
+	}
+	return null;
+}
+
+/**
+ * Does this mp4 actually carry sound?
+ *
+ * TikTok's adaptive `Format: 'dash'` gears are video-only, and the file one
+ * returns is a perfectly well-formed mp4 — right magic bytes, right content
+ * type, plays fine, silent. The collector no longer picks those, but selection
+ * reads fields TikTok owns and can rename, so this is the check that does not
+ * depend on getting that right: it looks at what actually arrived.
+ *
+ * A `moov` holds one `hdlr` per track naming that track's type; an audio track
+ * declares `soun`. Unparseable input returns true rather than false — the
+ * question is "did we demonstrably get a picture-only file", and "cannot tell"
+ * is not a reason to throw away a download.
+ */
+async function hasAudioTrack(blob) {
+	const moov = await topLevelBox(blob, 'moov');
+	if (!moov) return true;
+	const b = new Uint8Array(await moov.arrayBuffer());
+	// 'hdlr' at i puts the box header at i-4, and handler_type 16 bytes into the
+	// box: size(4) type(4) version+flags(4) pre_defined(4).
+	for (let i = 0; i + 16 <= b.length; i++) {
+		if (b[i] === 0x68 && b[i + 1] === 0x64 && b[i + 2] === 0x6c && b[i + 3] === 0x72) {
+			if (b[i + 12] === 0x73 && b[i + 13] === 0x6f && b[i + 14] === 0x75 && b[i + 15] === 0x6e) return true;
+		}
+	}
+	return false;
+}
+
 const HTML_PREFIXES = ['<!doctype', '<html', '<?xml', '<head'];
 
 /**
@@ -78,6 +133,18 @@ async function looksChallenged(blob) {
 const MAX_ROUNDS = 4;
 
 /**
+ * How many candidates may be rejected by `prefer` before the best one already
+ * in hand is accepted instead.
+ *
+ * Bounded because a `prefer` rejection costs a whole media download, and the
+ * one case that can fail every candidate — a post whose audio really is absent
+ * everywhere — would otherwise pull the same video down once per mirror. Two is
+ * enough to step off a bad gear onto the next one without turning a silent
+ * upload into a multi-hundred-megabyte retry loop.
+ */
+const MAX_PREFER_MISSES = 2;
+
+/**
  * Try each candidate URL in turn; TikTok hands out several mirrors per asset.
  * `expect` is 'video' or 'image' — a response that isn't actually that is
  * treated as a failure so the next mirror gets a turn.
@@ -85,11 +152,21 @@ const MAX_ROUNDS = 4;
  * A 429 is the one case that does *not* move to the next mirror: they resolve to
  * the same edge fleet, so the next one is another request into a limit we have
  * already hit. It backs off and re-tries the whole list instead.
+ *
+ * `prefer` is a softer test than `expect`: a payload failing it is *worse*, not
+ * wrong. The first one to fail is held on to while the remaining candidates get
+ * a turn, and handed back if none of them does better. That distinction is the
+ * point — a video whose audio is genuinely missing from every gear must still
+ * end up in the archive, so this can move the download to a better candidate
+ * but must never be able to fail an item on its own.
  */
-export async function fetchFirst(urls, { signal, expect, guard } = {}) {
+export async function fetchFirst(urls, { signal, expect, guard, prefer } = {}) {
 	const list = urls.filter(Boolean);
 	if (!list.length) throw new Error('no candidate URLs');
 	let lastErr = null;
+	/** Best-ranked payload that passed `expect` but failed `prefer`. */
+	let second = null;
+	let misses = 0;
 
 	for (let round = 0; round < MAX_ROUNDS; round++) {
 		let throttled = false;
@@ -124,7 +201,16 @@ export async function fetchFirst(urls, { signal, expect, guard } = {}) {
 					lastErr = new Error(`payload is not ${expect} (${blob.size}B, ${blob.type || 'no type'})`);
 					continue;
 				}
+				// The fetch itself succeeded, whatever `prefer` goes on to say about
+				// what came back, so the throttle guard is told either way.
 				guard?.ok();
+				if (prefer && !(await prefer(blob))) {
+					// Candidates arrive best-first, so the first miss is the best miss.
+					if (!second) second = { blob, url };
+					lastErr = new Error(`payload rejected by preference (${blob.size}B)`);
+					if (++misses >= MAX_PREFER_MISSES) return second;
+					continue;
+				}
 				return { blob, url };
 			} catch (err) {
 				if (err instanceof Halt || err?.name === 'AbortError') throw err;
@@ -137,6 +223,8 @@ export async function fetchFirst(urls, { signal, expect, guard } = {}) {
 		if (!throttled) break;
 	}
 
+	// Every candidate was worse than wanted, but one of them was still the media.
+	if (second) return second;
 	throw lastErr || new Error('no candidate URLs');
 }
 
@@ -152,7 +240,12 @@ async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 	// Paths recorded in archive.json are archive-relative, so the JSON is useful
 	// to anything reading the folder without knowing this code's layout rules.
 	if (want.includes('video') && rec.video?.length) {
-		const { blob, url } = await fetchFirst(rec.video, { signal, expect: 'video', guard });
+		const { blob, url } = await fetchFirst(rec.video, {
+			signal,
+			expect: 'video',
+			guard,
+			prefer: hasAudioTrack,
+		});
 		const name = `${rec.id}.mp4`;
 		await writeFile(LAYOUT.videos, name, blob);
 		disk.videos.add(rec.id);

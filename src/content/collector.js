@@ -45,6 +45,19 @@
 	 * Payloads that predate `PlayAddr.Width` fall back to the old bitrate order,
 	 * since every gear then scores zero pixels.
 	 *
+	 * `Format: 'dash'` gears are skipped, and that check has to come before the
+	 * ranking rather than after it. Those gears are the adaptive ladder: a
+	 * video-only representation, served from a `media-video-hvc1/` path, whose
+	 * sound lives in a separate `bitrateAudioInfo` entry it names in
+	 * `VideoExtra.audio_file_id`. They are ordinary playable mp4 files, so
+	 * nothing downstream notices — the archive just gets a silent copy. Ranking
+	 * on resolution walked straight into them, since the dash ladder is where
+	 * the 1080 rungs are: for 7669983946771336462 the gears are `normal_720_0`
+	 * (mp4, 720×1280) and `adapt_lowest_1080_1` (dash, 1080×1920), and the
+	 * 15,450,455-byte silent file in the archive is that second one to the byte.
+	 * Only `Format === 'dash'` is excluded, never a missing `Format` — payloads
+	 * older than the dash ladder don't carry the field and are all progressive.
+	 *
 	 * `downloadAddr` is deliberately excluded. Verified against
 	 * tiktok.com/@soupy_cos/video/7669190146864074006: playAddr and downloadAddr
 	 * are different encodes of the same clip (1,219,617 vs 1,252,838 bytes), and
@@ -53,7 +66,8 @@
 	 */
 	function videoUrls(v) {
 		const urls = [];
-		const gears = Array.isArray(v.bitrateInfo) ? v.bitrateInfo.slice() : [];
+		const all = Array.isArray(v.bitrateInfo) ? v.bitrateInfo : [];
+		const gears = all.filter((g) => String(g.Format ?? g.format ?? '').toLowerCase() !== 'dash');
 		const pixels = (g) => (g.PlayAddr?.Width || 0) * (g.PlayAddr?.Height || 0);
 		gears.sort((a, b) => pixels(b) - pixels(a) || (b.Bitrate || 0) - (a.Bitrate || 0));
 		for (const g of gears) {
