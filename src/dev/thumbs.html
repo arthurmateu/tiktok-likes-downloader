@@ -38,7 +38,7 @@
 			// The archive page's DOM, reduced to what viewer.js binds to. It has to
 			// be laid out rather than hidden, or IntersectionObserver never fires.
 			const IDS = ['search', 'sort', 'kind', 'libCount', 'grid', 'libMore', 'loadMore',
-				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbCount', 'lbStage', 'lbMeta'];
+				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbCount', 'lbStage', 'lbMeta', 'lbHelp', 'lbKeys'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = id === 'search' ? 'input' : ['sort', 'kind'].includes(id) ? 'select' : 'div';
@@ -46,6 +46,9 @@
 				el.id = id;
 				host.appendChild(el);
 			}
+			// The shortcut sheet starts closed on the real page, and what counts as
+			// closed is this class.
+			document.getElementById('lbHelp').classList.add('hidden');
 			// applyFilters reads .value off these; a bare <select> gives ''.
 			for (const [id, value] of [['sort', 'date-desc'], ['kind', 'all']]) {
 				const sel = document.getElementById(id);
@@ -213,8 +216,10 @@
 				version: 2,
 				items: {
 					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved', music: { title: 'someone’s song' } },
-					333: { id: '333', type: 'photo', desc: 'a photo post', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved', music: { title: 'a song', authorName: 'Artist' } },
-					444: { id: '444', type: 'video', desc: 'never downloaded', createTime: 1, author: {}, stats: {}, status: 'pending' },
+					333: { id: '333', type: 'photo', desc: 'a photo post #fyp', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved', music: { title: 'a song', authorName: 'Artist' } },
+					// `#fypage`: near-miss of 333's tag, since clicking a tag searches
+					// for the text rather than for an exact tag.
+					444: { id: '444', type: 'video', desc: 'never downloaded #fypage', createTime: 1, author: {}, stats: {}, status: 'pending' },
 				},
 				authors: {},
 			};
@@ -283,6 +288,40 @@
 			// saved, like almost every item anyone opens, and a pill saying so on all
 			// of them says nothing.
 			check('a saved item wears no status pill', !document.querySelector('#lbMeta .pill'));
+			// Volume on mpv's two keys. Read as a step from wherever the level is
+			// rather than as an absolute: it is remembered between runs of this page.
+			const clip = document.querySelector('#lbStage video');
+			const level = clip.volume;
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: '9', bubbles: true }));
+			check('9 takes the volume down a step',
+				Math.abs(clip.volume - Math.max(0, level - 0.05)) < 1e-6, `${level} -> ${clip.volume}`);
+			const lowered = clip.volume;
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: '0', bubbles: true }));
+			check('0 puts it back up',
+				Math.abs(clip.volume - Math.min(1, lowered + 0.05)) < 1e-6, `${lowered} -> ${clip.volume}`);
+
+			// Speed, and the key that gives it up. Normalised first, since the rate is
+			// remembered between runs of this page the same way the level is.
+			const key = (k) => document.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+			key('Backspace');
+			check('backspace comes back to normal speed', clip.playbackRate === 1, String(clip.playbackRate));
+			key(']');
+			check('] is still a rung up the ladder', clip.playbackRate === 1.25, String(clip.playbackRate));
+			key('Backspace');
+			check('and backspace drops the whole ladder', clip.playbackRate === 1, String(clip.playbackRate));
+
+			// The shortcuts, which are a sheet behind the ? rather than a line of grey
+			// text under every post.
+			const keySheet = document.getElementById('lbHelp');
+			document.getElementById('lbKeys').click();
+			check('the ? button opens the shortcut sheet', !keySheet.classList.contains('hidden'));
+			const caps = [...keySheet.querySelectorAll('kbd')].map((k) => k.textContent);
+			check('the shortcuts are drawn as the keys themselves',
+				['Backspace', 'Space', 'Esc', '9', '0', '←'].every((k) => caps.includes(k)), String(caps));
+			check('and the sheet knows the speed reset by its new key', !caps.includes('\\'), String(caps));
+			key('Escape');
+			check('escape closes the sheet before it closes the post',
+				keySheet.classList.contains('hidden') && !!document.querySelector('#lbStage video'));
 			// Its sound is inside the mp4 already, so there is no second player — but
 			// the name sits where a photo post's does, or stepping between the two
 			// moves the row it sits on and everything under it.
@@ -348,6 +387,33 @@
 			await sleep(50);
 			check('closing the lightbox stops the song',
 				song?.paused === true && !document.querySelector('#lbMeta .lb-song'));
+
+			// ---- hashtags --------------------------------------------------------
+			// Set apart from the sentence they are piled under, and each one a way
+			// into everything else filed the same.
+			tileFor('333').click();
+			await sleep(400);
+			const desc = document.querySelector('#lbMeta .lb-desc');
+			check('the caption marks its hashtags',
+				[...desc.querySelectorAll('.tag')].map((el) => el.textContent).join() === '#fyp',
+				desc.textContent);
+			check('and still reads as what the author wrote', desc.textContent === 'a photo post #fyp',
+				desc.textContent);
+
+			desc.querySelector('.tag').click();
+			await sleep(50);
+			check('clicking a tag searches for it', document.getElementById('search').value === '#fyp',
+				document.getElementById('search').value);
+			check('and the lightbox gets out of the way of the results',
+				document.getElementById('lightbox').classList.contains('hidden'));
+			// 444 is `#fypage`: a substring search is what makes a tag find the
+			// near-misses beside it, which is half of why anyone clicks one.
+			const tagged = [...document.querySelectorAll('.tile')].map((el) => el.dataset.id);
+			check('and the grid holds everything tagged like it', String(tagged) === '333,444', String(tagged));
+
+			// Everything below counts tiles, so the grid goes back to the whole of it.
+			document.getElementById('search').value = '';
+			renderLibrary(state);
 
 			lines.push('', failures
 				? `<span class="fail">${failures} of ${checks} failing</span>`

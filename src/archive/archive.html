@@ -288,10 +288,10 @@
 				<button id="lbNext" class="lb-step" title="Next (↓)">↓</button>
 			</div>
 			<div id="lbMeta" class="lb-meta"></div>
-			<div class="lb-hint">
-				scroll or ↑ ↓ — next · ← → — images in a post · g — all of them · space — play · m — mute · [ ] — speed
-				(\ resets) · esc — close
-			</div>
+			<!-- Filled by viewer.js from the same table the key handler reads, so the
+			     two can't drift apart. -->
+			<div id="lbHelp" class="lb-help hidden" role="dialog" aria-label="Keyboard shortcuts"></div>
+			<button id="lbKeys" class="lb-keys" title="Keyboard shortcuts (?)" aria-expanded="false">?</button>
 		</div>
 
 		<script type="module" src="archive.js"></script>

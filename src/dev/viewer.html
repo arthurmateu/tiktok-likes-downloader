@@ -82,7 +82,9 @@
 					222: {
 						id: '222',
 						type: 'photo',
-						desc: 'a photo post',
+						// Tagged, and tagged with a near-miss of 333's tag: clicking one
+						// searches for it, and the search is a substring one on purpose.
+						desc: '2 photos #fyp #ArtOnTikTok',
 						createTime: 1700000100,
 						author: { uniqueId: 'other', nickname: 'Other' },
 						stats: { diggCount: 5, playCount: 6 },
@@ -95,7 +97,7 @@
 					333: {
 						id: '333',
 						type: 'video',
-						desc: 'never downloaded',
+						desc: 'never downloaded #fypage',
 						createTime: 1700000200,
 						author: { uniqueId: 'ghost', nickname: 'Ghost' },
 						stats: {},
@@ -223,6 +225,64 @@
 				check('the id opens the post', !!idLink &&
 					idLink.getAttribute('href') === 'https://www.tiktok.com/@someone/video/111', idLink && idLink.href);
 				check('and reads as the id', !!idLink && idLink.textContent.trim() === '111', idLink && idLink.textContent);
+
+				// Volume on mpv's two keys. Relative rather than absolute: this page is
+				// a real origin, so the viewer's stored level survives between runs and
+				// a press starts from wherever the last one left it.
+				const press = (key) =>
+					page.dispatchEvent(new frame.contentWindow.KeyboardEvent('keydown', { key, bubbles: true }));
+				const media = page.querySelector('#lbStage video');
+				const started = media.volume;
+				press('9');
+				check('9 takes the volume down a step',
+					Math.abs(media.volume - Math.max(0, started - 0.05)) < 1e-6, `${started} → ${media.volume}`);
+				const lowered = media.volume;
+				press('0');
+				check('0 puts it back up', Math.abs(media.volume - Math.min(1, lowered + 0.05)) < 1e-6,
+					`${lowered} → ${media.volume}`);
+
+				// Speed, and the key that gives it up. Normalised first, since the rate
+				// is remembered between runs the same way the level is.
+				press('Backspace');
+				check('backspace comes back to normal speed', media.playbackRate === 1, String(media.playbackRate));
+				press(']');
+				check('] is still a rung up the ladder', media.playbackRate === 1.25, String(media.playbackRate));
+				press('Backspace');
+				check('and backspace drops the whole ladder', media.playbackRate === 1, String(media.playbackRate));
+
+				// The shortcuts, which are a sheet behind the ? rather than a line of
+				// grey text under every post.
+				const sheet = page.getElementById('lbHelp');
+				page.getElementById('lbKeys').click();
+				check('the ? button opens the shortcut sheet', !sheet.classList.contains('hidden'));
+				const caps = [...sheet.querySelectorAll('kbd')].map((k) => k.textContent);
+				check('the shortcuts are drawn as the keys themselves',
+					['Backspace', 'Space', 'Esc', '9', '0', '←'].every((k) => caps.includes(k)), String(caps));
+				check('and the sheet knows the speed reset by its new key', !caps.includes('\\'), String(caps));
+				press('Escape');
+				check('escape closes the sheet before it closes the post',
+					sheet.classList.contains('hidden') &&
+						!page.getElementById('lightbox').classList.contains('hidden'));
+
+				// The hashtags: told apart from the sentence they are piled under, and
+				// each one a way into everything else filed the same.
+				page.querySelector('#lbClose').click();
+				page.querySelector('.tile[data-id="222"]').click();
+				const desc = page.querySelector('#lbMeta .lb-desc');
+				const tags = [...desc.querySelectorAll('.tag')].map((el) => el.textContent);
+				check('the caption marks its hashtags', String(tags) === '#fyp,#ArtOnTikTok', String(tags));
+				check('and still reads as what the author wrote', desc.textContent === '2 photos #fyp #ArtOnTikTok',
+					desc.textContent);
+
+				desc.querySelector('.tag').click();
+				check('clicking a tag searches for it', page.getElementById('search').value === '#fyp',
+					page.getElementById('search').value);
+				check('and the lightbox gets out of the way of the results',
+					page.getElementById('lightbox').classList.contains('hidden'));
+				// 333 is `#fypage`: a substring search is what makes a tag find the
+				// near-misses beside it, which is half of why anyone clicks one.
+				const tagged = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
+				check('and the grid holds everything tagged like it', String(tagged) === '222,333', String(tagged));
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}

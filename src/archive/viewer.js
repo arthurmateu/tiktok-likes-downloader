@@ -374,6 +374,8 @@ function lbOpen() {
  * 1×, and nothing past 2× is worth a quarter of.
  */
 const RATES = [0.25, 0.5, 0.75, 1, 1.25, 1.5, 1.75, 2, 2.5, 3, 4];
+/** What one press of 9 or 0 is worth. Twenty presses across the whole range. */
+const VOLUME_STEP = 0.05;
 const STORE = 'ttarchive-playback';
 
 /** Everything a new <video> defaults away from, applied in one place. */
@@ -441,6 +443,18 @@ function stepRate(delta) {
 	if (at < 0) at = RATES.length - 1;
 	else if (delta > 0 && RATES[at] > lbRate) at--;
 	setRate(RATES[Math.min(RATES.length - 1, Math.max(0, at + delta))]);
+}
+
+function stepVolume(delta) {
+	// Rounded, or twenty presses of a fifth of a twentieth land on 0.9999999.
+	const next = Math.round((lbVolume + delta * VOLUME_STEP) * 100) / 100;
+	lbVolume = Math.min(1, Math.max(0, next));
+	// Turning it up is a request to hear something, and a mute left on top of that
+	// is silence with the slider saying otherwise — the player's own slider unmutes
+	// itself the same way.
+	if (delta > 0 && lbVolume > 0) lbMuted = false;
+	remember();
+	eachSound(applySound);
 }
 
 function photoNames(item) {
@@ -557,6 +571,7 @@ function clearStage() {
 
 function closeLightbox() {
 	if (!lbOpen()) return;
+	toggleKeys(false);
 	lbSeq++;
 	clearStage();
 	clearSong();
@@ -1027,6 +1042,45 @@ function figure(name, count, label) {
 	return box;
 }
 
+/** Letters, digits and underscore: what TikTok itself keeps in a tag name. */
+const TAG = /#[\p{L}\p{N}_]+/gu;
+
+/**
+ * The caption, with its hashtags told apart from it. Half of a TikTok caption is
+ * routinely the pile of tags at the end, and at the same weight as the sentence
+ * above it that pile reads as something the author was saying.
+ *
+ * Each one is also the way into the rest of the archive filed under it, which is
+ * why they are buttons rather than dimmed text.
+ */
+function caption(desc) {
+	const box = el('div', 'lb-desc');
+	let at = 0;
+	for (const m of desc.matchAll(TAG)) {
+		if (m.index > at) box.appendChild(document.createTextNode(desc.slice(at, m.index)));
+		const tag = el('button', 'tag', m[0]);
+		tag.title = `Show everything tagged ${m[0]}`;
+		tag.addEventListener('click', () => searchFor(m[0]));
+		box.appendChild(tag);
+		at = m.index + m[0].length;
+	}
+	if (at < desc.length) box.appendChild(document.createTextNode(desc.slice(at)));
+	return box;
+}
+
+/**
+ * Put something in the search box and go to the results. The search is a
+ * substring one, so a tag also turns up the near-misses beside it — `#fyp` finds
+ * `#fypage` too, which is what someone clicking a tag wanted.
+ */
+function searchFor(text) {
+	$('search').value = text;
+	// The results are in the grid, and the grid is behind the lightbox.
+	closeLightbox();
+	applyFilters(getState());
+	window.scrollTo({ top: 0 });
+}
+
 /**
  * The panel beside the stage, in the order the post itself is read: who, what
  * they said, how it did, what it was set to, and last the id.
@@ -1055,7 +1109,7 @@ function metaPanel(item) {
 	}
 	if (who.childNodes.length) out.push(who);
 
-	if (item.desc) out.push(el('div', 'lb-desc', item.desc));
+	if (item.desc) out.push(caption(item.desc));
 
 	const figs = el('div', 'lb-figs');
 	figs.append(figure('heart', stats.diggCount, 'likes'), figure('play', stats.playCount, 'views'));
@@ -1103,6 +1157,57 @@ function metaPanel(item) {
 	return out;
 }
 
+// ---------------------------------------------------------------- shortcuts
+
+/**
+ * Every key the handler below takes, written as the key itself. It used to be a
+ * line of small grey text along the bottom of every post, which is a thing you
+ * read once and then go on not reading for the rest of the archive; behind a `?`
+ * it is out of the way until it is wanted.
+ *
+ * This table is the sheet, so a shortcut can't be added without appearing in it
+ * — that is the whole reason it sits here rather than in the HTML.
+ */
+const KEYS = [
+	[['↑', '↓'], 'Previous and next post'],
+	[['←', '→'], 'Images within a photo post'],
+	[['G'], 'Open every image at once'],
+	[['Space'], 'Play or pause'],
+	[['M'], 'Mute'],
+	[['9', '0'], 'Volume down and up'],
+	[['[', ']'], 'Slower and faster'],
+	[['Backspace'], 'Back to normal speed'],
+	[['?'], 'This list'],
+	[['Esc'], 'Close'],
+];
+
+function buildKeys() {
+	const box = $('lbHelp');
+	if (box.childNodes.length) return;
+	box.appendChild(el('h2', null, 'Keyboard'));
+	for (const [keys, what] of KEYS) {
+		const caps = el('div', 'caps');
+		for (const k of keys) caps.appendChild(el('kbd', null, k));
+		const row = el('div', 'row');
+		row.append(caps, el('span', null, what));
+		box.appendChild(row);
+	}
+	box.appendChild(el('p', 'note', 'The wheel steps through the feed too.'));
+}
+
+/** `on` omitted toggles; the sheet is built the first time it is asked for. */
+function toggleKeys(on) {
+	const box = $('lbHelp');
+	const open = on == null ? box.classList.contains('hidden') : on;
+	if (open) buildKeys();
+	box.classList.toggle('hidden', !open);
+	$('lbKeys').setAttribute('aria-expanded', String(open));
+}
+
+function keysOpen() {
+	return !$('lbHelp').classList.contains('hidden');
+}
+
 // ------------------------------------------------------------------ wiring
 
 export function wireLibrary(stateGetter) {
@@ -1121,8 +1226,13 @@ export function wireLibrary(stateGetter) {
 	$('lbClose').addEventListener('click', closeLightbox);
 	$('lbPrev').addEventListener('click', () => step(-1));
 	$('lbNext').addEventListener('click', () => step(1));
+	$('lbKeys').addEventListener('click', () => toggleKeys());
 	$('lightbox').addEventListener('click', (e) => {
-		if (e.target.id === 'lightbox') closeLightbox();
+		if (e.target.id !== 'lightbox') return;
+		// A click off the sheet dismisses the sheet. Only once it is gone does a
+		// click on the backdrop mean the thing it usually means.
+		if (keysOpen()) toggleKeys(false);
+		else closeLightbox();
 	});
 
 	// The sheet is measured in pixels, so a window that changes size has to have
@@ -1143,7 +1253,13 @@ export function wireLibrary(stateGetter) {
 
 		switch (e.key) {
 			case 'Escape':
-				closeLightbox();
+				// One thing at a time: the sheet is what was opened last, so it is
+				// what closes first.
+				if (keysOpen()) toggleKeys(false);
+				else closeLightbox();
+				break;
+			case '?':
+				toggleKeys();
 				break;
 			case 'ArrowDown':
 			case 'PageDown':
@@ -1175,6 +1291,14 @@ export function wireLibrary(stateGetter) {
 				remember();
 				eachSound(applySound);
 				break;
+			// Level, on mpv's pair. They are next to each other, they are next to
+			// the mute key, and nothing else here wants a digit.
+			case '9':
+				stepVolume(-1);
+				break;
+			case '0':
+				stepVolume(1);
+				break;
 			// Speed, on the two keys next to each other and on YouTube's pair for the
 			// same job. Nothing else here wants them.
 			case '[':
@@ -1185,7 +1309,7 @@ export function wireLibrary(stateGetter) {
 			case '>':
 				stepRate(1);
 				break;
-			case '\\':
+			case 'Backspace':
 				setRate(1);
 				break;
 			case 'g':

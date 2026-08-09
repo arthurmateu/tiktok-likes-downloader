@@ -323,16 +323,98 @@ select:focus {
 	font-variant-numeric: tabular-nums;
 }
 
-.lb-hint {
+/*
+ * The shortcuts, behind the `?` in the corner rather than printed along the
+ * bottom of every post. The sheet sits above the button it belongs to and is
+ * built by the viewer out of the same table the key handler reads.
+ */
+.lb-keys {
 	position: absolute;
-	bottom: 14px;
-	left: 20px;
 	right: 20px;
-	text-align: center;
+	bottom: 16px;
+	width: 26px;
+	height: 26px;
+	padding: 0;
+	border: 0;
+	border-radius: 50%;
+	background: rgba(255, 255, 255, 0.12);
+	color: var(--fg-dim);
+	font: inherit;
+	font-size: 14px;
+	line-height: 1;
+	cursor: pointer;
+}
+.lb-keys:hover,
+.lb-help:not(.hidden) + .lb-keys {
+	background: rgba(255, 255, 255, 0.22);
+	color: var(--fg);
+}
+.lb-help {
+	position: absolute;
+	right: 20px;
+	bottom: 54px;
+	z-index: 1;
+	display: grid;
+	/* The caps column takes the width of the widest key rather than a guess at
+	   it — `Backspace` is four times the width of `M`. */
+	grid-template-columns: max-content 1fr;
+	gap: 7px 14px;
+	max-width: calc(100vw - 40px);
+	/* A short window is the case where the sheet is taller than the space above
+	   the button it opened from. */
+	max-height: calc(100vh - 90px);
+	overflow: auto;
+	padding: 14px 16px;
+	background: var(--bg-2);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
+	font-size: 12px;
+}
+
+/* The heading and the footnote are the two rows that span the pair of columns. */
+.lb-help h2,
+.lb-help .note {
+	grid-column: 1 / -1;
+	margin: 0;
 	color: var(--fg-dim);
 	font-size: 11px;
-	opacity: 0.65;
-	pointer-events: none;
+	font-weight: 600;
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+.lb-help .note {
+	margin-top: 4px;
+	font-weight: 400;
+	letter-spacing: 0;
+	text-transform: none;
+	opacity: 0.8;
+}
+.lb-help .row {
+	display: contents;
+}
+.lb-help .caps {
+	display: flex;
+	gap: 4px;
+	justify-content: flex-end;
+}
+.lb-help .row span {
+	align-self: center;
+	color: var(--fg-dim);
+}
+/* A key drawn as the key: the bottom border is the edge of the cap. */
+.lb-help kbd {
+	min-width: 22px;
+	padding: 3px 6px 2px;
+	border: 1px solid var(--line);
+	border-bottom: 3px solid var(--line);
+	border-radius: 5px;
+	background: var(--bg-3);
+	color: var(--fg);
+	font-family: inherit;
+	font-size: 11px;
+	line-height: 1.35;
+	text-align: center;
 }
 
 /* --------------------------------------------------- photo posts (carousel) */
@@ -552,6 +634,23 @@ select:focus {
 	line-height: 1.45;
 	white-space: pre-wrap;
 	word-break: break-word;
+}
+/* The tags, set apart from the sentence they are piled under. They are buttons
+   — clicking one searches for it — but a control drawn as a control would put
+   thirty of them through the caption, so the whole chrome is stripped back to a
+   dimmer run of text that answers the pointer. */
+.lb-desc .tag {
+	font: inherit;
+	color: var(--fg-dim);
+	background: none;
+	border: 0;
+	padding: 0;
+	vertical-align: baseline;
+	cursor: pointer;
+}
+.lb-desc .tag:hover,
+.lb-desc .tag:focus-visible {
+	color: var(--accent);
 }
 .lb-figs {
 	display: flex;
