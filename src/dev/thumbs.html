@@ -275,14 +275,21 @@
 			tileFor('111').click();
 			await sleep(400);
 			check('clicking a video opens it in the lightbox', !!document.querySelector('#lbStage video')?.src);
-			check('the lightbox reports the item status',
-				document.getElementById('lbMeta').textContent.includes('saved'));
+			// The id is the link out to the post, and the row anyone copies from.
+			const idLink = document.querySelector('#lbMeta .lb-id a');
+			check('the lightbox links the post by its id',
+				idLink?.textContent.trim() === '111' && /\/video\/111$/.test(idLink?.href || ''), idLink?.href);
+			// Status is only remarked on when it is worth remarking on: this item is
+			// saved, like almost every item anyone opens, and a pill saying so on all
+			// of them says nothing.
+			check('a saved item wears no status pill', !document.querySelector('#lbMeta .pill'));
 			// Its sound is inside the mp4 already, so there is no second player — but
 			// the name sits where a photo post's does, or stepping between the two
-			// moves it out from over the caption and down among the play counts.
+			// moves the row it sits on and everything under it.
 			const videoSong = document.querySelector('#lbMeta .lb-song');
 			check('a video names its song in the same place',
-				videoSong === document.getElementById('lbMeta').firstElementChild &&
+				videoSong?.previousElementSibling.className === 'lb-figs' &&
+					videoSong?.nextElementSibling.className === 'lb-facts' &&
 					videoSong?.querySelector('.name').textContent.includes('someone’s song'),
 				videoSong?.textContent);
 			check('and gets no second player over it', !videoSong?.querySelector('audio'));
@@ -304,8 +311,9 @@
 			// their own are half of it.
 			const player = document.querySelector('#lbMeta .lb-song');
 			check('a photo post opens with its song', !!player);
-			check('the song sits above the caption',
-				player === document.getElementById('lbMeta').firstElementChild);
+			check('the song sits under the counts',
+				player?.previousElementSibling.className === 'lb-figs' &&
+					player?.nextElementSibling.className === 'lb-facts');
 			check('it is labelled with the song',
 				player?.querySelector('.name').textContent.includes('a song — Artist'),
 				player?.querySelector('.name').textContent);

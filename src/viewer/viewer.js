@@ -138,6 +138,34 @@
 		return node;
 	}
 
+	/**
+	 * The icons, as paths rather than as characters. An emoji is the other way to
+	 * put a heart next to a number, and it is a different picture on every
+	 * platform and a colour nobody chose; these are one stroke weight in the
+	 * current text colour, which is the whole point of drawing them.
+	 *
+	 * Written out here rather than fetched: the page is one file next to a folder
+	 * of media, so an icon that lives at a URL is an icon that isn't there.
+	 */
+	const ICONS = {
+		heart: '<path d="M12 20.3 4.6 12.9a4.7 4.7 0 0 1 6.6-6.6l.8.8.8-.8a4.7 4.7 0 0 1 6.6 6.6z"/>',
+		play: '<circle cx="12" cy="12" r="9"/><path d="M10.2 8.3 15.8 12l-5.6 3.7z"/>',
+		music: '<path d="M9 17.6V5.4l10-2v12.2"/><circle cx="6.5" cy="17.9" r="2.6"/><circle cx="16.5" cy="15.6" r="2.6"/>',
+		link: '<path d="M14 4.5h5.5V10"/><path d="M19.5 4.5 11 13"/><path d="M18 13.5v5.2a1.3 1.3 0 0 1-1.3 1.3H5.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H11"/>',
+	};
+
+	function icon(name) {
+		const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+		svg.setAttribute('class', 'ico');
+		svg.setAttribute('viewBox', '0 0 24 24');
+		// Decoration beside a number that already says it: nothing for a screen
+		// reader to announce.
+		svg.setAttribute('aria-hidden', 'true');
+		// Static markup from the table above — never anything out of the archive.
+		svg.innerHTML = ICONS[name];
+		return svg;
+	}
+
 	/** A read-only field plus a copy button, for the extension page's URL. */
 	function urlRow() {
 		if (!config.bridgeURL) return null;
@@ -556,14 +584,13 @@
 	}
 
 	/**
-	 * The song, at the top of the metadata panel: its name for anything that has
+	 * The song, in its slot in the metadata panel: its name for anything that has
 	 * one, and a player under that where the track itself is in the folder.
 	 *
-	 * The name is in the same place for a video as for a photo post, and above
-	 * the caption in both — stepping between the two shouldn't move it, and it
-	 * isn't a detail of the same rank as the play count. Only photo posts get the
-	 * player: a video's sound is inside the file already on the stage, and a
-	 * second thing playing over it is not what a title in the panel offered.
+	 * The name is in the same place for a video as for a photo post — stepping
+	 * between the two shouldn't move it. Only photo posts get the player: a
+	 * video's sound is inside the file already on the stage, and a second thing
+	 * playing over it is not what a title in the panel offered.
 	 *
 	 * The player lives here rather than on the stage because the stage is rebuilt
 	 * every time the images are paged, and the song has to play across that
@@ -572,16 +599,17 @@
 	function mountSong(item) {
 		const label = songLabel(item);
 		const path = item.type === 'photo' ? audioPath(item) : null;
-		if (!label && !path) return;
+		const box = $('lbMeta').querySelector('.lb-song');
+		// Left empty, and hidden by the stylesheet on that basis.
+		if (!box || (!label && !path)) return;
 
-		const box = el('div', 'lb-song');
-		const name = el('div', 'name', `♪ ${label || 'Unnamed sound'}`);
+		const name = el('div', 'name');
+		const text = el('span', null, label || 'Unnamed sound');
 		// The panel is 340px wide and a title plus an artist is routinely longer, so
 		// the ellipsis has to have the whole thing behind it somewhere.
-		name.title = label;
+		text.title = label;
+		name.append(icon('music'), text);
 		box.appendChild(name);
-		// Above the caption, which is where the post itself puts it.
-		$('lbMeta').prepend(box);
 
 		if (!path) return;
 
@@ -600,7 +628,8 @@
 		audio.addEventListener(
 			'error',
 			() => {
-				if (audio.isConnected) name.textContent = `♪ ${label || 'Sound'} — not in this folder`;
+				// The span, not the row: the row also holds the icon.
+				if (audio.isConnected) text.textContent = `${label || 'Sound'} — not in this folder`;
 			},
 			{ once: true }
 		);
@@ -1088,6 +1117,90 @@
 		}
 	}
 
+	/** A count under its icon's meaning: `♡ 1.2K`, with the exact number behind it. */
+	function figure(name, count, label) {
+		const box = el('span', null);
+		box.title = `${(count || 0).toLocaleString()} ${label}`;
+		box.append(icon(name), el('b', null, fmtCount(count)));
+		return box;
+	}
+
+	/**
+	 * The panel beside the stage, in the order the post itself is read: who, what
+	 * they said, how it did, what it was set to, and last the id.
+	 *
+	 * The labels are gone from all of that. `Likes` next to a heart is the caption
+	 * of a caption, and the four lines it took to say `video, saved, posted on` are
+	 * one dim line at the bottom — they are how you check a thing, not what you
+	 * came to read. The id stays visible because it is the one field anyone copies,
+	 * and it is now the link as well: the row that names the post opens it.
+	 */
+	function metaPanel(item) {
+		const author = item.author || {};
+		const stats = item.stats || {};
+		const out = [];
+
+		const who = el('div', 'lb-who');
+		if (author.nickname) who.appendChild(el('div', 'name', author.nickname));
+		if (author.uniqueId) {
+			const handle = el('a', 'handle', `@${author.uniqueId}`);
+			handle.href = `https://www.tiktok.com/@${author.uniqueId}`;
+			handle.target = '_blank';
+			handle.rel = 'noreferrer';
+			who.appendChild(handle);
+		}
+		if (who.childNodes.length) out.push(who);
+
+		if (item.desc) out.push(el('div', 'lb-desc', item.desc));
+
+		const figs = el('div', 'lb-figs');
+		figs.append(figure('heart', stats.diggCount, 'likes'), figure('play', stats.playCount, 'views'));
+		out.push(figs);
+
+		// Empty, and filled by mountSong below. It is built here so that the song
+		// sits in the same place whether or not this item has one and whether or
+		// not its file has finished loading — a row that appears late and pushes
+		// the caption down is worse than a row that is sometimes absent.
+		out.push(el('div', 'lb-song'));
+
+		const facts = el('div', 'lb-facts');
+		if (item.createTime) {
+			const when = new Date(item.createTime * 1000);
+			const line = el('span', null, when.toLocaleDateString(undefined, { dateStyle: 'medium' }));
+			line.title = when.toLocaleString();
+			facts.appendChild(line);
+		}
+		facts.appendChild(
+			el('span', null, item.type === 'photo' ? `${item.photoCount || photoPaths(item).length || '?'} images` : 'video')
+		);
+		// Only when it is worth saying. `saved` is the ordinary case and every item
+		// on the stage is one — a pill on all of them says nothing.
+		const status = {
+			pending: ['pending', 'in your likes, not downloaded'],
+			unavailable: ['failed', 'download failed'],
+			gone: ['gone', 'no longer in your likes — deleted, privated or unliked'],
+		}[item.status];
+		if (status) {
+			const pill = el('span', 'pill', status[0]);
+			pill.title = status[1];
+			facts.appendChild(pill);
+		}
+		out.push(facts);
+
+		const idRow = el('div', 'lb-id');
+		idRow.appendChild(el('span', null, 'ID'));
+		const link = el('a', null, item.id);
+		link.href = `https://www.tiktok.com/@${author.uniqueId || 'x'}/video/${item.id}`;
+		link.target = '_blank';
+		link.rel = 'noreferrer';
+		link.title = 'Open this post on TikTok';
+		link.appendChild(icon('link'));
+		idRow.appendChild(link);
+		out.push(idRow);
+
+		return out;
+	}
+
 	function renderLightbox() {
 		const item = filtered[lbIndex];
 		if (!item) return closeLightbox();
@@ -1095,39 +1208,8 @@
 		renderStage(item);
 		renderCount();
 
-		const dl = document.createElement('dl');
-		const add = (k, v) => {
-			if (v == null || v === '') return;
-			dl.append(el('dt', null, k), el('dd', null, v));
-		};
-		const author = item.author || {};
-		const stats = item.stats || {};
-		add('Caption', item.desc);
-		add('Author', author.uniqueId ? `@${author.uniqueId} — ${author.nickname || ''}` : '');
-		add('Posted', item.createTime ? new Date(item.createTime * 1000).toLocaleString() : '');
-		add('Likes', fmtCount(stats.diggCount));
-		add('Plays', fmtCount(stats.playCount));
-		add('Type', item.type === 'photo' ? `photo post (${item.photoCount || '?'} images)` : 'video');
-		add(
-			'Status',
-			{
-				saved: 'saved',
-				pending: 'in your likes, not downloaded',
-				unavailable: 'download failed',
-				gone: 'no longer in your likes — deleted, privated or unliked',
-			}[item.status] || ''
-		);
-		add('ID', item.id);
-
-		const link = document.createElement('a');
-		link.href = `https://www.tiktok.com/@${author.uniqueId || 'x'}/video/${item.id}`;
-		link.target = '_blank';
-		link.rel = 'noreferrer';
-		link.textContent = 'Open on TikTok ↗';
-		link.style.color = 'var(--accent)';
-
-		$('lbMeta').replaceChildren(dl, document.createElement('br'), link);
-		// After the panel is built, since it prepends into it. Replacing the panel
+		$('lbMeta').replaceChildren(...metaPanel(item));
+		// After the panel is built, since it fills a slot in it. Replacing the panel
 		// is also what stopped the previous song: a media element taken out of the
 		// document pauses itself.
 		mountSong(item);

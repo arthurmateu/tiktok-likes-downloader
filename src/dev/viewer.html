@@ -191,11 +191,16 @@
 				// The song player, in the page that actually gets written to the
 				// folder. The file 404s in here — there is no folder — but everything
 				// that decides whether a player appears at all has already happened by
-				// then, and where it appears is the point: above the caption.
+				// then, and where it appears is the point: under the counts, above
+				// the line of facts.
+				const slot = (id) => [...page.getElementById('lbMeta').children].map((el) => el.className).indexOf(id);
 				page.querySelector('.tile[data-id="222"]').click();
 				const song = page.querySelector('#lbMeta .lb-song');
 				check('a photo post opens with its song', !!song);
-				check('the song sits above the caption', song === page.getElementById('lbMeta').firstElementChild);
+				check('the song sits under the counts', !!song &&
+					song.previousElementSibling.className === 'lb-figs' &&
+					song.nextElementSibling.className === 'lb-facts');
+				const songSlot = slot('lb-song');
 				check('the player points at the file in the folder',
 					!!song && /audio\/222\.mp3$/.test(song.querySelector('audio').getAttribute('src')));
 				check('and is labelled with the song', !!song && song.querySelector('.name').textContent.includes('a song'),
@@ -204,13 +209,20 @@
 				// The other half: a video's sound is the file on the stage, so a
 				// second player over it would be two things playing at once — but the
 				// name still belongs in the same place, or stepping between the two
-				// moves it out from over the caption and down among the play counts.
+				// moves the row it sits on and everything under it.
 				page.querySelector('#lbClose').click();
 				page.querySelector('.tile[data-id="111"]').click();
 				const videoSong = page.querySelector('#lbMeta .lb-song');
-				check('a video names its song in the same place', !!videoSong &&
-					videoSong === page.getElementById('lbMeta').firstElementChild);
+				check('a video names its song in the same place', !!videoSong && slot('lb-song') === songSlot,
+					`${slot('lb-song')} vs ${songSlot}`);
 				check('and gets no second player over it', !!videoSong && !videoSong.querySelector('audio'));
+
+				// The id is the link: it is the row anyone reaches for, and a panel
+				// that shows it as plain text sends them back to the search box.
+				const idLink = page.querySelector('#lbMeta .lb-id a');
+				check('the id opens the post', !!idLink &&
+					idLink.getAttribute('href') === 'https://www.tiktok.com/@someone/video/111', idLink && idLink.href);
+				check('and reads as the id', !!idLink && idLink.textContent.trim() === '111', idLink && idLink.textContent);
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}
