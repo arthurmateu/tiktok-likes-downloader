@@ -246,13 +246,13 @@ Not yet verified end-to-end: the Liked-tab harvest in either mode, which needs a
 
 ## Development
 
-`_syntaxcheck.html` loads every module against a stub `chrome` API to catch parse and top-level errors without installing the extension:
+`syntaxcheck.html` loads every module against a stub `chrome` API to catch parse and top-level errors without installing the extension:
 
 ```bash
 python -m http.server 8777
 ```
 
-Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stub `browser.*` and hide `showDirectoryPicker`, so the Firefox backend is the one that gets selected and evaluated. It is dev-only and not referenced by the extension.
+Then open `http://127.0.0.1:8777/syntaxcheck.html`. Add `?gecko` to make it stub `browser.*` and hide `showDirectoryPicker`, so the Firefox backend is the one that gets selected and evaluated. It is dev-only and not referenced by the extension.
 
 `src/dev/backends.html` unit-tests the Gecko backend against a faked download history and a faked directory pick — path arithmetic, the history/snapshot union, filename sanitising, the `archive.json` mirror. Serve the repo as above and open `http://127.0.0.1:8777/src/dev/backends.html`; it prints pass/fail and needs no browser extension loaded.
 
@@ -266,7 +266,7 @@ Then open `http://127.0.0.1:8777/_syntaxcheck.html`. Add `?gecko` to make it stu
 
 `src/dev/incremental.html` covers where an incremental sync is allowed to stop — `isSettled` and `settledStreak` in `state.js`, against a seeded in-memory folder. Both mistakes here are silent: too loose and a sync stops above likes it never archived, too strict and every run walks the whole list again, which is the thing this exists to end. So it checks the cases that decide it — a `pending` item holding the run open where an `unavailable` or `gone` one doesn't, a part-downloaded gallery counting as unfinished, one unknown id resetting the count mid-page, and the count surviving being handed a page at a time. Open `http://127.0.0.1:8777/src/dev/incremental.html`.
 
-`src/dev/syncmode.html` drives the split **Sync likes ▾** button, which is the one control on the archive page whose state lives in three places at once — the button's label, the tick in the menu, and the flag the click reads — and nothing notices when those disagree. It fetches `archive.html` and mounts the real markup rather than a copy, so an id renamed there fails here instead of quietly testing something that no longer ships, then imports `archive.js` against the same stub `chrome` API `_syntaxcheck.html` uses. Open `http://127.0.0.1:8777/src/dev/syncmode.html`.
+`src/dev/syncmode.html` drives the split **Sync likes ▾** button, which is the one control on the archive page whose state lives in three places at once — the button's label, the tick in the menu, and the flag the click reads — and nothing notices when those disagree. It fetches `archive.html` and mounts the real markup rather than a copy, so an id renamed there fails here instead of quietly testing something that no longer ships, then imports `archive.js` against the same stub `chrome` API `syntaxcheck.html` uses. Open `http://127.0.0.1:8777/src/dev/syncmode.html`.
 
 `src/dev/viewer.html` builds a `viewer.html` from sample state and checks the inlining, which is the part that goes wrong once and silently in someone's folder. A caption is arbitrary text from TikTok, and the fixture's caption carries the three sequences that break a naive generator: `</script>`, which ends the element it sits in; `$&`, which `String.replace` reads out of a *replacement*; and U+2028, a line terminator to a JavaScript parser but not to JSON. The result is rendered into a `blob:` iframe, whose origin is opaque like a `file://` document's. Open `http://127.0.0.1:8777/src/dev/viewer.html`.
 
