@@ -232,12 +232,20 @@ export function missingParts(rec) {
 // second sync is for would never reach it.
 
 /**
- * How many settled items in a row end an incremental run. Pages are ~30 items,
- * so this is four of them: long enough that a couple of already-known posts
- * near the top — a re-like, or a page boundary landing awkwardly — can't be
- * mistaken for the end of the new ones.
+ * How many settled items in a row end an incremental run.
+ *
+ * Not one — "the newest like we already hold" is the wrong place to stop,
+ * because the order is by *when you liked it*, not by what the post is. Re-like
+ * something from two years ago and it lands at the top of the list already
+ * settled, with this week's genuinely new likes sitting underneath it. So there
+ * has to be some slack.
+ *
+ * But only some. Pages run ~15–30 items, and the check can only fire on a page
+ * boundary anyway, so this is a couple of pages: enough to step over a re-like
+ * or two at the top, and no more. Everything past that is asking TikTok
+ * questions an earlier run already asked.
  */
-export const CAUGHT_UP_RUN = 120;
+export const CAUGHT_UP_RUN = 32;
 
 /**
  * Has an earlier run already finished with this item?
@@ -526,7 +534,8 @@ export function markUnavailable(state, id, reason) {
  * How many likes may vanish off the deep end of the list before it reads as a
  * list that was cut short rather than one that shrank.
  *
- * Two pages, and consecutive, for the same reason `CAUGHT_UP_RUN` is four: what
+ * Two pages, and consecutive, for the same reason `CAUGHT_UP_RUN` has slack in
+ * it at all: what
  * distinguishes a truncation from unliking is not how many went missing but
  * *where*. Unlikes are scattered through the order — you unlike a post because
  * of what it is, not because of when you liked it. A truncation takes the tail
