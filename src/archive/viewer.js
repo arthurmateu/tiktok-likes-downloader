@@ -16,7 +16,7 @@
  */
 
 import { LAYOUT, readBlob, hasReadableFiles } from '../lib/fs.js';
-import { disk } from '../lib/state.js';
+import { disk, listingComplete } from '../lib/state.js';
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 200;
@@ -35,10 +35,10 @@ async function blobURL(parts, name) {
 
 /** Shown in place of the media when the backend can't read the folder back. */
 function unreadableNote() {
-	// A scan in progress hasn't reached this post's file yet as far as anyone here
-	// knows, and saying it was never downloaded would be a guess that is about to
-	// be wrong.
-	if (disk.scanning) return 'Still reading the folder…';
+	// A listing that hasn't finished hasn't reached this post's file yet as far as
+	// anyone here knows, and saying it was never downloaded would be a guess that
+	// is about to be wrong.
+	if (!listingComplete()) return 'Still reading the folder…';
 	return hasReadableFiles()
 		? 'Not downloaded yet.'
 		: "Downloaded, but Firefox can't read it back until you use “Scan an existing folder…” on the Sync tab.";
@@ -172,12 +172,10 @@ function appendPage() {
 
 function tile(item, index) {
 	const el = document.createElement('div');
-	// Dimmed for a post whose media isn't there — but only once the scan can be
-	// believed about that. Drawn mid-scan, the whole grid would come up dim and
-	// then un-dim in waves, which reads as a fault rather than as progress.
-	const here = present(item);
-	el.className = 'tile' + (here || disk.scanning ? '' : ' missing');
-	if (here) el.dataset.here = '1';
+	// Dimmed for a post whose media isn't there — but only once the listing can be
+	// believed about that. Drawn before or during a scan, the whole grid would come
+	// up dim and then un-dim in waves, which reads as a fault rather than progress.
+	el.className = 'tile' + (present(item) || !listingComplete() ? '' : ' missing');
 	el.dataset.id = item.id;
 	el.dataset.index = index;
 
@@ -206,6 +204,41 @@ function tile(item, index) {
 	return el;
 }
 
+/**
+ * Ask a tile for its thumbnail, now or again.
+ *
+ * `data-loaded` is the whole of a tile's state: set while a read is in flight and
+ * left set once an image is on it, cleared by a read that came back with nothing
+ * so the tile can be asked once more when something changes for it.
+ *
+ * `data-again` is that something arriving *during* a read — a scan batch, or a
+ * download landing — which the read cannot have seen. Its answer is already out
+ * of date when it lands, so the tile asks a second time rather than being left
+ * blank by an answer nobody can correct: `refreshPresence` has no way back in
+ * once a load is in flight, and the tile has already had its turn.
+ */
+function loadTile(el) {
+	const img = el.querySelector('img');
+	if (img.src) return;
+	if (img.dataset.loaded) {
+		img.dataset.again = '1';
+		return;
+	}
+	img.dataset.loaded = '1';
+	delete img.dataset.again;
+	loadThumb(el.dataset.id).then((url) => {
+		if (url) {
+			img.src = url;
+			delete img.dataset.again;
+			return;
+		}
+		img.dataset.loaded = '';
+		// Only while it is still worth having: a tile scrolled away in the meantime
+		// has let go of whatever it had, and will ask again when it comes back.
+		if (img.dataset.again && el.dataset.onscreen) loadTile(el);
+	});
+}
+
 function setupObserver() {
 	observer?.disconnect();
 	observer = new IntersectionObserver(
@@ -214,16 +247,17 @@ function setupObserver() {
 				const el = e.target;
 				const img = el.querySelector('img');
 				if (e.isIntersecting) {
-					if (img.dataset.loaded) continue;
-					img.dataset.loaded = '1';
-					loadThumb(el.dataset.id).then((url) => {
-						if (url) img.src = url;
-						else img.dataset.loaded = '';
-					});
-				} else if (img.src.startsWith('blob:')) {
-					URL.revokeObjectURL(img.src);
-					img.removeAttribute('src');
-					img.dataset.loaded = '';
+					// Recorded, because a scan batch has to know which tiles are worth
+					// catching up and a load in flight has to know whether to bother.
+					el.dataset.onscreen = '1';
+					loadTile(el);
+				} else {
+					delete el.dataset.onscreen;
+					if (img.src.startsWith('blob:')) {
+						URL.revokeObjectURL(img.src);
+						img.removeAttribute('src');
+						img.dataset.loaded = '';
+					}
 				}
 			}
 		},
@@ -233,27 +267,24 @@ function setupObserver() {
 
 /**
  * Bring the tiles already on screen back into line with `disk`, which a folder
- * scan fills in batches while the grid is being looked at.
+ * scan fills in batches and a sync adds to a file at a time while the grid is
+ * being looked at.
  *
  * The grid's *membership* is not in question here — it comes from archive.json,
  * which is read in one go — so this is never a re-render. All that changes is
  * what each tile knows about its own files: whether it is dimmed, and whether
- * there is now a thumbnail to be had. A tile whose media has just appeared is
- * handed back to the observer, because the observer has already had its say
- * about that one: it asked for a thumbnail while the file was still unlisted,
- * got nothing, and would never ask again on its own.
+ * there is now a thumbnail to be had.
+ *
+ * Only the tiles on screen are asked again. One that isn't will ask for itself
+ * when it is scrolled to, by which time the listing is that much further along.
  */
 export function refreshPresence() {
 	for (const node of $('grid').children) {
 		const item = filtered[node.dataset.index];
 		if (!item) continue;
 		const here = present(item);
-		node.classList.toggle('missing', !here && !disk.scanning);
-		if (!here || node.dataset.here) continue;
-		node.dataset.here = '1';
-		if (node.querySelector('img').dataset.loaded) continue;
-		observer.unobserve(node);
-		observer.observe(node);
+		node.classList.toggle('missing', !here && listingComplete());
+		if (here && node.dataset.onscreen) loadTile(node);
 	}
 	refreshLightbox();
 }
@@ -398,19 +429,63 @@ function queueDecode(fn) {
 	});
 }
 
+/**
+ * Where a post's files are while the listing still can't say.
+ *
+ * Waiting for the listing to reach a file means waiting on where that file falls
+ * in the sweep, which has nothing to do with where the post is on screen: the
+ * directories are read one after another and each in whatever order the
+ * filesystem hands them over, so the first screenful of tiles was being served
+ * across the whole of a scan — and every photo post behind the whole of videos/.
+ *
+ * archive.json is read in one go before the scan starts, and it records the path
+ * of everything this extension wrote; a video's name is derivable besides, being
+ * always `<id>.mp4`. So the file can simply be asked for. A read of one that
+ * isn't there answers null exactly as an unlisted id does — the guess costs a
+ * lookup and can't be wrong about anything.
+ *
+ * Once a scan has run to the end the listing is the better answer and this stops
+ * being consulted: by then an id it doesn't hold is a file that isn't there, and
+ * asking for it every time a tile scrolled past would be a lookup for nothing.
+ */
+function unlistedRecord(id) {
+	if (listingComplete()) return null;
+	return getState()?.items?.[id] || null;
+}
+
+/** archive.json records archive-relative paths; the folder reads take names. */
+const fileName = (path) => String(path).split('/').pop();
+
+function recordedPhotos(id) {
+	const item = unlistedRecord(id);
+	const photos = item?.type === 'photo' ? item.files?.photos : null;
+	// An archive scanned in from somewhere else has no `files` on its records and
+	// no way to guess an image's name — the extension chose the extension from
+	// what the CDN served. Those tiles wait for the listing, as all of them used to.
+	return photos?.length ? photos.map(fileName) : null;
+}
+
+function recordedVideo(id) {
+	const item = unlistedRecord(id);
+	if (!item || item.type === 'photo') return null;
+	return item.files?.video ? fileName(item.files.video) : `${id}.mp4`;
+}
+
 /** Exported so src/dev/thumbs.html can drive it without an IntersectionObserver. */
 export async function loadThumb(id) {
-	const photos = disk.photos.get(id);
+	const photos = disk.photos.get(id) || recordedPhotos(id);
 	if (photos) {
 		return photos.length ? blobURL(LAYOUT.images, photos[0]) : null;
 	}
 
 	const cached = thumbs.get(id);
 	if (cached) return URL.createObjectURL(cached);
-	if (!disk.videos.has(id)) return null;
+
+	const name = disk.videos.has(id) ? `${id}.mp4` : recordedVideo(id);
+	if (!name) return null;
 
 	return queueDecode(async () => {
-		const file = await readBlob(LAYOUT.videos, `${id}.mp4`);
+		const file = await readBlob(LAYOUT.videos, name);
 		if (!file) return null;
 		const frame = await frameFrom(file);
 		return frame ? URL.createObjectURL(cacheThumb(id, frame)) : null;
@@ -535,8 +610,22 @@ function stepVolume(delta) {
 	eachSound(applySound);
 }
 
+/**
+ * The images of a photo post, by the listing where there is one and by the
+ * post's own record until then — the same shortcut the tiles take, for the same
+ * reason: images/ is read after the whole of videos/, so a post opened early in
+ * a scan sat looking like a lost file for as long as that took.
+ */
 function photoNames(item) {
-	return disk.photos.get(item.id) || [];
+	return disk.photos.get(item.id) || recordedPhotos(item.id) || [];
+}
+
+/** And the song over them, which is read after both of those. */
+function songFile(item) {
+	const listed = disk.audio.get(item.id);
+	if (listed) return listed;
+	const recorded = unlistedRecord(item.id)?.files?.audio;
+	return recorded ? fileName(recorded) : null;
 }
 
 // -------------------------------------------------------------------- songs
@@ -595,7 +684,7 @@ function clearSong({ keepBox = false } = {}) {
  */
 async function mountSong(item, seq) {
 	const label = songLabel(item);
-	const file = item.type === 'photo' ? disk.audio.get(item.id) : null;
+	const file = item.type === 'photo' ? songFile(item) : null;
 	const box = $('lbMeta').querySelector('.lb-song');
 	// Left empty, and hidden by the stylesheet on that basis.
 	if (!box || (!label && !file)) return;
@@ -611,9 +700,9 @@ async function mountSong(item, seq) {
 	if (!file) {
 		// A photo post with a song we know we could not get says so, rather than
 		// showing a title with nothing under it — which is indistinguishable from a
-		// download this archive simply hasn't run yet. Only once the scan has
-		// finished: until then `disk.audio` not having it means "not listed yet".
-		if (item.type === 'photo' && item.noAudio && !disk.scanning) {
+		// download this archive simply hasn't run yet. Only once a scan has run to
+		// the end: until then nothing here can say the track isn't in the folder.
+		if (item.type === 'photo' && item.noAudio && listingComplete()) {
 			box.appendChild(el('div', 'nosong', 'TikTok would not part with this track.'));
 		}
 		return;

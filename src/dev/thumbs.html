@@ -215,8 +215,10 @@
 			const state = {
 				version: 2,
 				items: {
-					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved', music: { title: 'someone’s song' } },
-					333: { id: '333', type: 'photo', desc: 'a photo post #fyp', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved', music: { title: 'a song', authorName: 'Artist' } },
+					// `files` is what the downloader records for anything it wrote, and
+					// the Library reads it while the folder listing is still catching up.
+					111: { id: '111', type: 'video', desc: 'a video', createTime: 3, author: {}, stats: {}, status: 'saved', music: { title: 'someone’s song' }, files: { video: 'videos/111.mp4' } },
+					333: { id: '333', type: 'photo', desc: 'a photo post #fyp', createTime: 2, author: {}, stats: {}, photoCount: 2, status: 'saved', music: { title: 'a song', authorName: 'Artist' }, files: { photos: ['images/333_01.jpg', 'images/333_02.jpg'], audio: 'audio/333.wav' } },
 					// `#fypage`: near-miss of 333's tag, since clicking a tag searches
 					// for the text rather than for an exact tag.
 					444: { id: '444', type: 'video', desc: 'never downloaded #fypage', createTime: 1, author: {}, stats: {}, status: 'pending' },
@@ -485,6 +487,39 @@
 			await newer;
 			check('an overtaken scan keeps its hands off what the newer one found',
 				disk.videos.has('555') === true, [...disk.videos].join(', '));
+
+			// ---- a thumbnail the listing hasn't reached yet -----------------------
+			// The grid is drawn as soon as archive.json is read, a second or more
+			// ahead of the listing, and the listing then arrives in the order the
+			// directories happen to be read in — which has nothing to do with what
+			// is on screen. Waiting to be told a file exists therefore meant the
+			// first screenful filling in across the whole of a scan, and every photo
+			// post waiting behind the whole of videos/. The record already says where
+			// those files are, so the tile can simply ask for one.
+			fake.reset();
+			await scanDisk({});
+			// A second video: the frame cache holds 111 from the checks above, which
+			// would answer this without ever reading the folder.
+			state.items['222'] = { id: '222', type: 'video', desc: 'listed late', createTime: 0,
+				author: {}, stats: {}, status: 'saved', files: { video: 'videos/222.mp4' } };
+			fake.seed('videos/222.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
+			fake.seed('images/333_01.jpg', await solidJPEG('#ff0000'));
+			fake.seed('images/333_02.jpg', await solidJPEG('#0000ff'));
+			// Nothing has listed either of those, and no scan is running: the state
+			// every tile is in for as long as the first scan of a folder takes.
+			disk.scanned = false;
+			check('a video is thumbnailed before the listing reaches it',
+				!!(await decode(await loadThumb('222'))), 'no frame was decoded');
+			check('and a photo post out of the names its own record carries',
+				!!(await decode(await loadThumb('333'))), 'no image was produced');
+			check('while a record with no file behind it still gets nothing',
+				(await loadThumb('444')) === null);
+			disk.scanned = true;
+			// Once a scan has had its say, the listing is the answer and the record is
+			// not consulted — an id it doesn't hold is a file that isn't there.
+			check('a file the finished listing does not hold is not asked for',
+				(await loadThumb('333')) === null);
+			delete state.items['222'];
 
 			// ---- an item opened before its files are read -------------------------
 			// The lightbox is built once per step, so a post opened while the scan

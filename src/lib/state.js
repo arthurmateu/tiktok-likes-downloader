@@ -60,7 +60,26 @@ export const disk = {
 	 * which is a distinction anything drawing itself off `disk` has to make.
 	 */
 	scanning: false,
+	/**
+	 * Whether one has ever run to the end. The same distinction, for the moment
+	 * before the first scan has started: the archive page draws itself off
+	 * archive.json as soon as that file is read, which is a second or more ahead
+	 * of the listing, and an empty `disk` then says nothing about the folder.
+	 */
+	scanned: false,
 };
+
+/**
+ * Whether `disk` can be believed about a file it does *not* hold.
+ *
+ * Only a scan that ran to the end can call a file absent. Before the first one,
+ * during any of them, and after one that threw part-way, an id these collections
+ * don't have means "not read yet" — which is a different thing to say to the
+ * reader, and a different thing to do about.
+ */
+export function listingComplete() {
+	return disk.scanned && !disk.scanning;
+}
 
 /**
  * The counts a caller shows, off `disk` as it currently stands.
@@ -163,6 +182,7 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 	// newer scan has just found. The older one therefore stands aside.
 	const mine = ++scanSeq;
 	disk.scanning = true;
+	let complete = false;
 	try {
 		const videos = await listFiles(LAYOUT.videos, { onProgress: step, onBatch: fold(addVideos) });
 		base += videos.size;
@@ -180,12 +200,19 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 				else disk.photos.delete(id);
 			}
 			for (const id of disk.audio.keys()) if (!seen.audio.has(id)) disk.audio.delete(id);
+			// Here rather than in the `finally`: this is the point at which the three
+			// collections are the folder, and a scan that threw on the way to it has
+			// listed part of the folder and pruned none of it.
+			complete = true;
 		}
 	} finally {
 		// In a `finally` so a scan that threw part-way still gets here, and once
 		// more through `onBatch` because the prune above and the end of `scanning`
 		// both change what a view drawn off `disk` ought to be showing.
-		if (mine === scanSeq) disk.scanning = false;
+		if (mine === scanSeq) {
+			disk.scanning = false;
+			if (complete) disk.scanned = true;
+		}
 		onBatch?.();
 	}
 
@@ -488,9 +515,10 @@ export function markNoAudio(state, id, reason) {
  */
 export function noteAbsentSongLink(state, rec) {
 	if (rec.type !== 'photo') return false;
-	// Mid-scan an id `disk.audio` doesn't have means "not listed yet", not "not on
-	// disk" — writing the note off that would libel a song sitting in the folder.
-	if (disk.scanning) return false;
+	// An id `disk.audio` doesn't have only means "not on disk" once a scan has run
+	// to the end; before that it means "not listed yet", and writing the note off
+	// that would libel a song sitting in the folder.
+	if (!listingComplete()) return false;
 	const item = state.items[rec.id];
 	if (!item) return false;
 	if (hasAudio(rec.id)) {

@@ -611,7 +611,14 @@ async function startSync({ full = false } = {}) {
 	app.queue = new DownloadQueue({
 		concurrency: Math.max(1, Math.min(8, Number($('concurrency').value) || 4)),
 		state: app.state,
-		onProgress: updateCounters,
+		onProgress: () => {
+			updateCounters();
+			// An item that has just been written is in `disk` already — the downloader
+			// adds to it as it writes — and the grid is the only thing that hasn't
+			// heard. Same catching-up a scan's batches get, once per finished item, so
+			// a tile lights up as its files land rather than at the end of the run.
+			refreshPresence();
+		},
 		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
 		onThrottle: (ev) => {
 			if (!ev.halted) {
