@@ -12,7 +12,7 @@
  */
 
 import { LAYOUT, photoName, writeFile } from './fs.js';
-import { disk, missingParts, markSaved, markUnavailable } from './state.js';
+import { disk, missingParts, markNoAudio, markSaved, markUnavailable } from './state.js';
 import { Guard, Halt, classifyStatus, retryAfterMs } from './throttle.js';
 
 const EXT_BY_TYPE = {
@@ -290,6 +290,18 @@ async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 	// wouldn't serve would hide it in the library and have every later sync retry
 	// the whole thing. A halt or an abort still carry — neither is about this
 	// file, and both have to stop the run.
+	//
+	// What it must not do is fail *quietly*, which is what it used to do. A song
+	// that cannot be had is a permanent condition on a real archive — an old
+	// post's sound goes away with the upload it came from — so an empty `catch`
+	// left the same posts silently retried on every full sync, with nothing on
+	// the record to say which ones or why. The reason goes on the item instead.
+	//
+	// This is only the half where a URL existed and the fetch of it failed. The
+	// other half — TikTok naming a song but no link to it — never reaches here,
+	// because `missingParts` only asks for audio it has somewhere to fetch from;
+	// `noteAbsentSongLink` records that one off the harvested record.
+	let noAudio = null;
 	if (want.includes('audio') && rec.audio?.length) {
 		try {
 			const { blob, url } = await fetchFirst(rec.audio, { signal, expect: 'audio', guard });
@@ -301,11 +313,14 @@ async function saveRecord(rec, state, { signal, onFile, guard } = {}) {
 			onFile?.({ id: rec.id, kind: 'audio', bytes: blob.size, url });
 		} catch (err) {
 			if (err instanceof Halt || err?.name === 'AbortError') throw err;
+			noAudio = `the track was refused — ${String((err && err.message) || err)}`;
 		}
 	}
 
 	if (saved.length) markSaved(state, rec.id, files);
-	return { saved, wanted: want };
+	// After `markSaved`, which clears this on the run where the track does arrive.
+	if (noAudio) markNoAudio(state, rec.id, noAudio);
+	return { saved, wanted: want, noAudio };
 }
 
 /**
@@ -324,8 +339,10 @@ export class DownloadQueue {
 		this.queue = [];
 		this.active = 0;
 		this.controller = new AbortController();
-		this.stats = { queued: 0, done: 0, skipped: 0, failed: 0, bytes: 0 };
+		this.stats = { queued: 0, done: 0, skipped: 0, failed: 0, bytes: 0, noAudio: 0 };
 		this.failed = [];
+		/** Photo posts whose song could not be had: `{ id, reason }`. */
+		this.noAudio = [];
 		this._idleResolvers = [];
 		this.paused = false;
 		this._halted = false;
@@ -398,6 +415,10 @@ export class DownloadQueue {
 					this.stats.bytes += f.bytes || 0;
 				},
 			});
+			if (res.noAudio) {
+				this.stats.noAudio++;
+				this.noAudio.push({ id: rec.id, reason: res.noAudio });
+			}
 			if (res.saved.length) this.stats.done++;
 			else this.stats.skipped++;
 		} catch (err) {

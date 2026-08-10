@@ -608,7 +608,16 @@ async function mountSong(item, seq) {
 	title.append(icon('music'), text);
 	box.appendChild(title);
 
-	if (!file) return;
+	if (!file) {
+		// A photo post with a song we know we could not get says so, rather than
+		// showing a title with nothing under it — which is indistinguishable from a
+		// download this archive simply hasn't run yet. Only once the scan has
+		// finished: until then `disk.audio` not having it means "not listed yet".
+		if (item.type === 'photo' && item.noAudio && !disk.scanning) {
+			box.appendChild(el('div', 'nosong', 'TikTok would not part with this track.'));
+		}
+		return;
+	}
 
 	const url = await blobURL(LAYOUT.audio, file);
 	if (seq !== lbSeq) {

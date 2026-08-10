@@ -103,6 +103,23 @@
 						stats: {},
 						status: 'gone',
 					},
+					444: {
+						id: '444',
+						type: 'photo',
+						desc: 'pictures kept, song not',
+						createTime: 1700000300,
+						author: { uniqueId: 'quiet', nickname: 'Quiet' },
+						stats: {},
+						photoCount: 1,
+						// Saved, and rightly: the pictures are the post. Only the track
+						// is absent, and permanently — which the folder alone cannot say,
+						// since a missing file looks the same as one not read yet.
+						status: 'saved',
+						files: { photos: ['images/444.jpg'] },
+						music: { id: '10', title: 'Licensed Thing', authorName: 'A Label' },
+						noAudio: 'TikTok named the track but sent no link to it',
+						likeRank: 2,
+					},
 				},
 			};
 
@@ -146,7 +163,7 @@
 				const payload = JSON.parse(doc.getElementById('ttarchive-data').textContent);
 				const item = payload.items.find((i) => i.id === '111');
 
-				check('data blob parses', !!payload.items && payload.items.length === 3);
+				check('data blob parses', !!payload.items && payload.items.length === 4);
 				check('caption survived intact', item.desc === NASTY, JSON.stringify(item.desc));
 				check('file paths carried over', item.files.video === 'videos/111.mp4');
 				const post = payload.items.find((i) => i.id === '222');
@@ -160,6 +177,14 @@
 					JSON.stringify(post.music));
 				check('a video’s song title came too', item.music && item.music.title === 'video sound',
 					JSON.stringify(item.music));
+
+				// Whether the song is absent, not why: the panel only needs to know it
+				// has nothing to wait for, and the reason is six thousand strings of
+				// prose the page would carry for nothing.
+				const quiet = payload.items.find((i) => i.id === '444');
+				check('a post with no obtainable song says so', quiet.noAudio === true, JSON.stringify(quiet.noAudio));
+				check('and the reason stays in archive.json', typeof quiet.noAudio !== 'string');
+				check('a post whose song did arrive carries no such flag', !('noAudio' in post));
 				check('bridge URL was baked in', /archive\.html$/.test(payload.config.bridgeURL));
 				check('slimming dropped nothing needed', 'status' in item && 'stats' in item && 'author' in item);
 
@@ -188,7 +213,7 @@
 				check('the grid opens in like order', page.getElementById('sort').value === 'liked-recent',
 					page.getElementById('sort').value);
 				const order = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
-				check('most recently liked first, unranked last', String(order) === '111,222,333', String(order));
+				check('most recently liked first, unranked last', String(order) === '111,222,444,333', String(order));
 
 				// The song player, in the page that actually gets written to the
 				// folder. The file 404s in here — there is no folder — but everything
@@ -207,6 +232,21 @@
 					!!song && /audio\/222\.mp3$/.test(song.querySelector('audio').getAttribute('src')));
 				check('and is labelled with the song', !!song && song.querySelector('.name').textContent.includes('a song'),
 					song && song.querySelector('.name').textContent);
+
+				// A track that was never downloadable. Without the note this is a
+				// title with an empty space under it, which is precisely what a post
+				// waiting on a slow folder read looks like — so the one case that
+				// will never resolve was drawn as the one that resolves itself.
+				page.querySelector('#lbClose').click();
+				page.querySelector('.tile[data-id="444"]').click();
+				const quietSong = page.querySelector('#lbMeta .lb-song');
+				check('a post with no obtainable song still names it', !!quietSong &&
+					quietSong.querySelector('.name').textContent.includes('Licensed Thing'),
+					quietSong && quietSong.querySelector('.name').textContent);
+				check('and says the track could not be had', !!quietSong && !!quietSong.querySelector('.nosong'),
+					quietSong && quietSong.innerHTML);
+				check('rather than offering a player with nothing behind it',
+					!!quietSong && !quietSong.querySelector('audio'));
 
 				// The other half: a video's sound is the file on the stage, so a
 				// second player over it would be two things playing at once — but the

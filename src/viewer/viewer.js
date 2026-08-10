@@ -613,7 +613,15 @@
 		name.append(icon('music'), text);
 		box.appendChild(name);
 
-		if (!path) return;
+		if (!path) {
+			// The song is absent and the archive knows why — TikTok served no track
+			// for it. Said plainly, because a title with nothing under it otherwise
+			// looks like a download that hasn't happened yet.
+			if (item.type === 'photo' && item.noAudio) {
+				box.appendChild(el('div', 'nosong', 'TikTok would not part with this track.'));
+			}
+			return;
+		}
 
 		const audio = document.createElement('audio');
 		audio.src = src(path);
@@ -630,8 +638,11 @@
 		audio.addEventListener(
 			'error',
 			() => {
-				// The span, not the row: the row also holds the icon.
-				if (audio.isConnected) text.textContent = `${label || 'Sound'} — not in this folder`;
+				// The span, not the row: the row also holds the icon. archive.json
+				// names a file that the folder no longer has — moved, deleted, or
+				// never copied along with it — which is a different thing from the
+				// track never having been downloadable, and reads differently.
+				if (audio.isConnected) text.textContent = `${label || 'Sound'} — file missing from this folder`;
 			},
 			{ once: true }
 		);

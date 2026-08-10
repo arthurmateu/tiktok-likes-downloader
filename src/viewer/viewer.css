@@ -394,7 +394,6 @@ select:focus {
 	box-shadow: 0 12px 34px rgba(0, 0, 0, 0.55);
 	font-size: 12px;
 }
-
 /* The heading and the footnote are the two rows that span the pair of columns. */
 .lb-help h2,
 .lb-help .note {
@@ -734,6 +733,14 @@ select:focus {
 	height: 34px;
 	/* Chromium's player is a light control on a light panel otherwise. */
 	color-scheme: dark;
+}
+/* Where the player would have been, so the absence sits where the thing was. */
+.lb-song .nosong {
+	margin-top: 6px;
+	color: var(--fg-dim);
+	font-size: 11px;
+	font-style: italic;
+	opacity: 0.75;
 }
 
 /* The bottom of the panel: what the post is, rather than what it says. Dim and

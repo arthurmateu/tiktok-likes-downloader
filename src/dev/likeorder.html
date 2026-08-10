@@ -37,7 +37,8 @@
 		<script>
 			// The archive page's DOM, reduced to what viewer.js binds to.
 			const IDS = ['search', 'sort', 'kind', 'libCount', 'grid', 'libMore', 'loadMore',
-				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbStage', 'lbMeta'];
+				'lightbox', 'lbClose', 'lbPrev', 'lbNext', 'lbCount', 'lbStage', 'lbMeta',
+				'lbHelp', 'lbKeys'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = id === 'search' ? 'input' : ['sort', 'kind'].includes(id) ? 'select' : 'div';

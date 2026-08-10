@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>photo post song tests</title>
+		<!--
+			Covers what happens when a photo post's song can't be had.
+
+			Worth its own page because every failure here is a *quiet* one. The
+			pictures are the post and they are already on disk, so nothing downstream
+			goes wrong — the item stays `saved`, the run stays green, and the only
+			trace is a post that plays no music in the Library. That is exactly how
+			58 posts in a real 794-post archive ended up with no track and no
+			explanation, so the assertions below are mostly about the record that
+			gets written rather than about the download.
+
+			The two halves come from different places and both are checked here:
+			a URL that was fetched and refused is written off by the downloader, and
+			a payload naming a song with no link in it is written off by
+			`noteAbsentSongLink` — that one never reaches the downloader at all,
+			because `missingParts` asks only for audio it has somewhere to fetch
+			from, so the queue skips the item entirely.
+
+			src/dev/fake-fs.js is swapped in for src/lib/fs.js by the import map, and
+			`fetch` is stubbed, so downloader.js and state.js run exactly as shipped.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/songs.html. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+			h2 { font-size: 14px; margin: 20px 0 4px; color: #a9a9c0; }
+		</style>
+		<script type="importmap">
+			{ "imports": { "/src/lib/fs.js": "/src/dev/fake-fs.js" } }
+		</script>
+	</head>
+	<body>
+		<h1>photo post songs</h1>
+		<pre id="out">running…</pre>
+
+		<script type="module">
+			import {
+				disk,
+				emptyState,
+				missingParts,
+				noteAbsentSongLink,
+				scanDisk,
+				STATUS,
+			} from '../lib/state.js';
+			import { DownloadQueue } from '../lib/downloader.js';
+			import { readBlob, reset, seed } from './fake-fs.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(
+					`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(ok || !detail ? '' : `\n        ${detail}`)
+				);
+				out.innerHTML = lines.join('\n');
+			}
+
+			const same = (label, got, want) =>
+				check(label, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}`);
+
+			function section(title) {
+				lines.push(`<h2>${title}</h2>`);
+			}
+
+			// Real magic bytes, because looksLike() checks them and a payload that
+			// fails that check is a different code path from one that fails to arrive.
+			const bytes = (sig) => new Uint8Array([...sig, ...new Array(16).fill(0)]);
+			const AUDIO = () => new Blob([bytes([0x49, 0x44, 0x33])], { type: 'audio/mpeg' }); // 'ID3'
+			const IMAGE = () => new Blob([bytes([0xff, 0xd8, 0xff])], { type: 'image/jpeg' });
+
+			/**
+			 * `fetch`, answering by URL. Anything not named here is a 404, which is
+			 * what a mirror list that has run out looks like from inside fetchFirst.
+			 */
+			let asked = [];
+			function stubFetch(routes) {
+				asked = [];
+				globalThis.fetch = async (url) => {
+					asked.push(url);
+					const body = routes[url];
+					if (!body) return { ok: false, status: 404, headers: new Headers() };
+					return { ok: true, status: 200, headers: new Headers(), blob: async () => body() };
+				};
+			}
+
+			/** A photo record as the collector sends it. */
+			const photo = (id, { images = 1, audio = [] } = {}) => ({
+				id,
+				type: 'photo',
+				desc: '',
+				createTime: 1,
+				author: {},
+				stats: {},
+				music: { id: '9', title: 'A Song', authorName: 'Artist' },
+				photos: Array.from({ length: images }, (_, i) => [`img:${id}:${i}`]),
+				audio,
+			});
+
+			function stateWith(ids) {
+				const state = emptyState();
+				for (const id of ids) state.items[id] = { id, type: 'photo', status: STATUS.saved };
+				return state;
+			}
+
+			const drain = async (queue, recs) => {
+				queue.addMany(recs);
+				await queue.idle();
+			};
+
+			// ---- a song that arrives ---------------------------------------------
+			section('the ordinary case');
+
+			reset();
+			seed('images/10.jpg', IMAGE());
+			await scanDisk();
+
+			{
+				const state = stateWith(['10']);
+				stubFetch({ 'song:10': AUDIO });
+				const queue = new DownloadQueue({ state });
+				await drain(queue, [photo('10', { audio: ['song:10'] })]);
+
+				check('the track lands in audio/', !!(await readBlob(['audio'], '10.mp3')));
+				same('and is recorded at its archive-relative path', state.items['10'].files.audio, 'audio/10.mp3');
+				check('nothing is written off', state.items['10'].noAudio === undefined);
+				same('and the queue counts no absent song', queue.stats.noAudio, 0);
+			}
+
+			// ---- a song that is refused ------------------------------------------
+			section('the CDN refuses the track');
+
+			reset();
+			seed('images/20.jpg', IMAGE());
+			await scanDisk();
+
+			{
+				const state = stateWith(['20']);
+				stubFetch({}); // every mirror 404s
+				const queue = new DownloadQueue({ state });
+				const rec = photo('20', { audio: ['song:20a', 'song:20b'] });
+				same('only the song is missing', missingParts(rec), ['audio']);
+				await drain(queue, [rec]);
+
+				const item = state.items['20'];
+				check('the reason is on the item', String(item.noAudio).startsWith('the track was refused'), String(item.noAudio));
+				check('and names the failure', String(item.noAudio).includes('404'), String(item.noAudio));
+				same('the post is still saved — the pictures are the post', item.status, STATUS.saved);
+				check('and is not listed unavailable', !state.unavailable.includes('20'));
+				same('the run records no failure', queue.stats.failed, 0);
+				same('but does count the absent song', queue.stats.noAudio, 1);
+				same('and says which post', queue.noAudio[0].id, '20');
+				check('every mirror was tried', asked.length >= 2, `asked ${asked.length}`);
+			}
+
+			// ---- a refused song must not cost the pictures ------------------------
+			section('a refused song is not a refused post');
+
+			reset();
+			await scanDisk();
+
+			{
+				const state = stateWith(['30']);
+				stubFetch({ 'img:30:0': IMAGE });
+				const queue = new DownloadQueue({ state });
+				await drain(queue, [photo('30', { audio: ['song:30'] })]);
+
+				check('the pictures are on disk', !!(await readBlob(['images'], '30.jpg')));
+				same('the item is saved', state.items['30'].status, STATUS.saved);
+				check('and the song is written off beside them', !!state.items['30'].noAudio);
+				same('which is a completed download, not a failed one', queue.stats.done, 1);
+			}
+
+			// ---- the note is cleared when the track turns up ----------------------
+			section('a track that turns up later');
+
+			reset();
+			seed('images/40.jpg', IMAGE());
+			await scanDisk();
+
+			{
+				const state = stateWith(['40']);
+				state.items['40'].noAudio = 'the track was refused — HTTP 404';
+				stubFetch({ 'song:40': AUDIO });
+				const queue = new DownloadQueue({ state });
+				await drain(queue, [photo('40', { audio: ['song:40'] })]);
+
+				check('the stale note is gone', state.items['40'].noAudio === undefined);
+			}
+
+			// ---- the half the downloader never sees -------------------------------
+			section('TikTok sends no link at all');
+
+			reset();
+			seed('images/50.jpg', IMAGE());
+			await scanDisk();
+
+			{
+				const state = stateWith(['50']);
+				const rec = photo('50', { audio: [] });
+
+				// The reason this can't be left to the downloader: there is nothing for
+				// the queue to do, so the queue never looks at the item.
+				same('nothing is missing that can be fetched', missingParts(rec), []);
+				const queue = new DownloadQueue({ state });
+				same('so the queue skips it outright', queue.add(rec), false);
+				same('and would never have written anything off', queue.stats.noAudio, 0);
+
+				check('the record itself says so', noteAbsentSongLink(state, rec));
+				check('naming the payload, not the download',
+					String(state.items['50'].noAudio).includes('no link'), String(state.items['50'].noAudio));
+				same('the post stays saved', state.items['50'].status, STATUS.saved);
+				check('a second sync writes nothing new', !noteAbsentSongLink(state, rec));
+			}
+
+			{
+				const state = stateWith(['50']);
+				check('a record with a URL is left for the download to answer',
+					!noteAbsentSongLink(state, photo('50', { audio: ['song:50'] })));
+				check('and nothing is written off', state.items['50'].noAudio === undefined);
+			}
+
+			{
+				const state = stateWith(['50']);
+				check('a video is not a photo post and has no song of its own',
+					!noteAbsentSongLink(state, { ...photo('50'), type: 'video' }));
+			}
+
+			{
+				// disk.audio not having an id mid-scan means "not listed yet", which is
+				// not the same as "not on disk" — writing the note off that would libel
+				// a track sitting in the folder.
+				const state = stateWith(['50']);
+				disk.scanning = true;
+				check('a scan in progress proves nothing', !noteAbsentSongLink(state, photo('50', { audio: [] })));
+				disk.scanning = false;
+			}
+
+			{
+				// The song arrived at some point after the note was written.
+				reset();
+				seed('images/60.jpg', IMAGE());
+				seed('audio/60.mp3', AUDIO());
+				await scanDisk();
+				const state = stateWith(['60']);
+				state.items['60'].noAudio = 'TikTok named the track but sent no link to it';
+				check('a note contradicted by the folder is cleared',
+					noteAbsentSongLink(state, photo('60', { audio: [] })));
+				check('and stays cleared', state.items['60'].noAudio === undefined);
+			}
+
+			lines.push(
+				'',
+				failures
+					? `<span class="fail">${failures} of ${checks} failing</span>`
+					: `<span class="pass">all ${checks} passing</span>`
+			);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>

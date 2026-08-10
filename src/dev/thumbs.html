@@ -415,6 +415,134 @@
 			document.getElementById('search').value = '';
 			renderLibrary(state);
 
+			// ---- a scan that fills in as it goes ----------------------------------
+			// Listing the folder is the slowest thing the archive page does, so the
+			// Library is drawn before it has finished and the tiles catch up
+			// directory batch by directory batch. Everything below is that catching
+			// up: that `disk` grows *during* a scan rather than at the end of one,
+			// that a tile notices, and that what the scan never found still goes.
+			fake.seed('videos/444.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
+			fake.batchEvery(1);
+
+			const during = [];
+			await scanDisk({
+				onBatch: () => {
+					during.push({ scanning: disk.scanning, videos: disk.videos.size });
+					refreshPresence();
+				},
+			});
+			check('a scan reports itself more than once', during.length > 1, `${during.length} batches`);
+			check('and the listing grows while it runs',
+				during[0].videos === 1 && during.at(-1).videos === 2, JSON.stringify(during));
+			check('a scan in progress says so', during[0].scanning === true);
+			check('and has the last word once it is over',
+				during.at(-1).scanning === false && disk.scanning === false);
+			check('a tile whose file turned up stops being missing',
+				tileFor('444')?.classList.contains('missing') === false);
+
+			// The other half of filling in as it goes. Batches only ever add, so that
+			// a rescan running under a sync can never make files it already holds
+			// look absent — which leaves the end of the scan as the only place a file
+			// deleted from outside can be dropped.
+			fake.remove('videos/444.mp4');
+			await scanDisk({ onBatch: refreshPresence });
+			check('a file gone from the folder drops out of the listing', !disk.videos.has('444'));
+			check('and its tile is dimmed again', tileFor('444')?.classList.contains('missing') === true);
+
+			// Drawn mid-scan, nothing is dimmed: an id the listing hasn't reached yet
+			// means "not read" and not "not on disk", and a grid that comes up grey
+			// and then un-greys in waves reads as a fault rather than as progress.
+			let mid = null;
+			await scanDisk({
+				onBatch: () => {
+					if (mid === null) {
+						renderLibrary(state);
+						mid = document.querySelectorAll('.tile.missing').length;
+					}
+					refreshPresence();
+				},
+			});
+			check('a grid drawn mid-scan dims nothing', mid === 0, `${mid} tiles dimmed`);
+			check('and is caught up by the time the scan ends',
+				document.querySelectorAll('.tile.missing').length === 1);
+
+			// Changing folder does not wait for the scan of the last one, so two can
+			// be reading at once. They share one listing now rather than each
+			// building a whole map and the last write winning, so the older one has
+			// to leave the pruning to the newer.
+			//
+			// The second is started from the first's own first batch, which is the
+			// only way to be sure the first has already read videos/ — and so cannot
+			// see the file seeded here, while the second can.
+			let newer = null;
+			await scanDisk({
+				onBatch: () => {
+					if (newer) return;
+					fake.seed('videos/555.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
+					newer = scanDisk({});
+				},
+			});
+			await newer;
+			check('an overtaken scan keeps its hands off what the newer one found',
+				disk.videos.has('555') === true, [...disk.videos].join(', '));
+
+			// ---- an item opened before its files are read -------------------------
+			// The lightbox is built once per step, so a post opened while the scan
+			// was still working held the note that said the file wasn't there and
+			// never let go of it — the worse half of the same problem the tiles had,
+			// since an empty stage reads as a lost file rather than as a slow one.
+			fake.reset();
+			await scanDisk({});
+			check('the folder starts empty for this one', disk.photos.size === 0);
+
+			fake.seed('images/333_01.jpg', await solidJPEG('#ff0000'));
+			fake.seed('images/333_02.jpg', await solidJPEG('#0000ff'));
+			fake.seed('audio/333.wav', silentWAV());
+			renderLibrary(state);
+
+			tileFor('333').click();
+			await sleep(200);
+			check('a post opened before its files are read has nothing on the stage',
+				document.querySelectorAll('#lbStage img').length === 0);
+
+			// The images land in one batch and the song several later, so this is
+			// both ways back in: the stage rebuilt from nothing, and the song mounted
+			// into a panel that is staying where it is.
+			await scanDisk({ onBatch: refreshPresence });
+			await sleep(400);
+			check('and fills itself in once the scan reaches them',
+				document.querySelectorAll('#lbStage img').length === 1);
+			check('the song catches up too, into the panel already on screen',
+				!!document.querySelector('#lbMeta .lb-song audio'));
+			check('and is named exactly once',
+				document.querySelectorAll('#lbMeta .lb-song .name').length === 1);
+			document.getElementById('lbClose').click();
+
+			// ---- a song that was never downloadable -------------------------------
+			// The pictures are on disk and the track is not, and never will be —
+			// TikTok would not serve it. That is a different thing from a folder
+			// still being read, and it has to look different: a title with an empty
+			// space under it is exactly what a post mid-scan looks like, so the one
+			// permanent case was indistinguishable from the one that fixes itself.
+			fake.reset();
+			fake.seed('images/333_01.jpg', await solidJPEG('#ff0000'));
+			fake.seed('images/333_02.jpg', await solidJPEG('#0000ff'));
+			await scanDisk({});
+			state.items['333'].noAudio = 'the track was refused — HTTP 403';
+			renderLibrary(state);
+
+			tileFor('333').click();
+			await sleep(400);
+			check('a post whose song was written off still names the song',
+				document.querySelector('#lbMeta .lb-song .name')?.textContent.includes('a song — Artist'));
+			check('and says the track could not be had',
+				!!document.querySelector('#lbMeta .lb-song .nosong'),
+				document.querySelector('#lbMeta .lb-song')?.innerHTML);
+			check('rather than showing a player with nothing behind it',
+				!document.querySelector('#lbMeta .lb-song audio'));
+			document.getElementById('lbClose').click();
+			delete state.items['333'].noAudio;
+
 			lines.push('', failures
 				? `<span class="fail">${failures} of ${checks} failing</span>`
 				: `<span class="pass">all ${checks} passing</span>`);

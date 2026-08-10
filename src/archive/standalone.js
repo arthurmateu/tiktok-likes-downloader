@@ -100,6 +100,9 @@ export function slimItems(state) {
 			photoCount: item.photoCount || 0,
 			status: item.status || '',
 			files: item.files || undefined,
+			// Whether the song is absent, not why: the panel only needs to know it
+			// has nothing to wait for. The reason stays in archive.json.
+			noAudio: item.noAudio ? true : undefined,
 			music:
 				music.title || music.authorName
 					? { title: music.title || '', authorName: music.authorName || '' }

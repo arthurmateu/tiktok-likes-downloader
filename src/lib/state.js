@@ -41,6 +41,12 @@ export function emptyState() {
 		unavailable: [],
 		/** When a run last reached the end of the list. 0 means never. */
 		fullSyncAt: 0,
+		/**
+		 * How many likes the last run that reached the end actually read. 0 means
+		 * no run ever has. It is the yardstick the next one is measured against —
+		 * see `looksTruncated`.
+		 */
+		listLength: 0,
 	};
 }
 
@@ -429,9 +435,66 @@ export function markSaved(state, id, files) {
 	item.savedAt = Date.now();
 	item.status = STATUS.saved;
 	delete item.unavailable;
+	// Only the arrival of the track itself answers the question `noAudio` asks.
+	// Saving the pictures of a post whose song is unavailable says nothing about
+	// the song, and clearing it there would make the note flicker back and forth
+	// on every run that re-fetched an image.
+	if (files && files.audio) delete item.noAudio;
 	item.files = { ...(item.files || {}), ...files };
 	const at = state.unavailable.indexOf(id);
 	if (at !== -1) state.unavailable.splice(at, 1);
+}
+
+/**
+ * The song over a photo post could not be had, and why.
+ *
+ * Deliberately *not* a status: the post is the pictures, and those are on disk.
+ * This is a note about one optional extra, so it must not touch `status`,
+ * `unavailable`, or anything that decides whether the item is archived.
+ *
+ * It exists because the alternative was silence. A track TikTok won't serve —
+ * or won't even name a URL for — used to fail into an empty `catch`, which left
+ * no way to tell a song that is missing from one that was never asked for, and
+ * showed up in the Library as a player that looked broken.
+ */
+export function markNoAudio(state, id, reason) {
+	const item = state.items[id];
+	if (!item) return;
+	item.noAudio = reason || true;
+}
+
+/**
+ * The other way a photo post ends up with no song: TikTok named the track but
+ * gave no link to it, so there was never anything to fetch.
+ *
+ * This can't live in the downloader, because a post in this state never reaches
+ * it — `missingParts` only asks for audio it has a URL for, so the queue skips
+ * the item entirely. The harvested record is the only place the distinction
+ * exists, and it is worth keeping: a refused download may be worth another try,
+ * a payload with no `playUrl` in it will not be until TikTok's answer changes.
+ *
+ * Call it with the record the list returned, after `upsertItem`. Costs nothing —
+ * there is no request behind it.
+ *
+ * @returns whether it wrote a note that wasn't there before.
+ */
+export function noteAbsentSongLink(state, rec) {
+	if (rec.type !== 'photo') return false;
+	// Mid-scan an id `disk.audio` doesn't have means "not listed yet", not "not on
+	// disk" — writing the note off that would libel a song sitting in the folder.
+	if (disk.scanning) return false;
+	const item = state.items[rec.id];
+	if (!item) return false;
+	if (hasAudio(rec.id)) {
+		// The track is right there; whatever an older run concluded is stale.
+		const had = item.noAudio != null;
+		delete item.noAudio;
+		return had;
+	}
+	if ((rec.audio || []).length) return false; // a URL to try: the download answers this
+	const was = item.noAudio;
+	item.noAudio = 'TikTok named the track but sent no link to it';
+	return was !== item.noAudio;
 }
 
 export function markUnavailable(state, id, reason) {
@@ -442,13 +505,100 @@ export function markUnavailable(state, id, reason) {
 	if (item.status !== STATUS.saved) item.status = STATUS.unavailable;
 }
 
+// --------------------------------------------------------------- truncation
+//
+// "TikTok said there was no more" and "that was the end of your likes" are not
+// the same sentence, and the payload says the first while everything downstream
+// reads it as the second. A read that stops early looks identical to one that
+// finished: `hasMore: false`, no error, no status code.
+//
+// It happens. On a 5,899-item archive the list came back 303 likes short of
+// where the previous tool had reached, in a clean run that reported success —
+// and `markGone` then wrote off the one item below that point which had no file
+// on disk to protect it. Everything else survived by accident rather than by
+// design.
+//
+// So a run that claims to have reached the end has to be plausible against what
+// the archive already knows, and the only honest yardstick is the last run that
+// did reach it.
+
+/**
+ * How many likes may vanish off the deep end of the list before it reads as a
+ * list that was cut short rather than one that shrank.
+ *
+ * Two pages, and consecutive, for the same reason `CAUGHT_UP_RUN` is four: what
+ * distinguishes a truncation from unliking is not how many went missing but
+ * *where*. Unlikes are scattered through the order — you unlike a post because
+ * of what it is, not because of when you liked it. A truncation takes the tail
+ * and nothing else, because that is the part TikTok stopped serving.
+ */
+export const TRUNCATED_TAIL = 60;
+
+/**
+ * How many likes at the deep end of the order this run failed to return, before
+ * the first one it did.
+ *
+ * Items already written off as `gone` are stepped over rather than counted:
+ * their absence is old news and says nothing about how far this run reached.
+ * Anything else missing from the tail either was unliked or was not served, and
+ * the whole point of the count is that a long consecutive run of them is much
+ * more easily the second.
+ */
+export function trailingUnseen(state, seenIds) {
+	let n = 0;
+	const order = state.likeOrder || [];
+	for (let at = order.length - 1; at >= 0; at--) {
+		const id = order[at];
+		if (seenIds.has(id)) break;
+		const item = state.items[id];
+		if (!item || item.status === STATUS.gone) continue;
+		n++;
+	}
+	return n;
+}
+
+/**
+ * Did this run really reach the end, or did TikTok just stop talking?
+ *
+ * Answers false when there is nothing to judge against. That is not a gap being
+ * shrugged off, it is the honest answer: an archive whose *first* run was
+ * already truncated has no record of the part it never saw, so nothing here can
+ * know it is missing. What this catches is a run that comes back shallower than
+ * one before it — which is the form the failure takes from the second sync on,
+ * and the form in which it would otherwise start writing items off.
+ */
+export function looksTruncated(state, seenIds) {
+	if (!(state.likeOrder || []).length) return false;
+	return trailingUnseen(state, seenIds) >= TRUNCATED_TAIL;
+}
+
+/**
+ * Items the archive holds media for that this run did not return.
+ *
+ * Reported rather than acted on. Every one is either something you unliked or
+ * something the list did not serve, and nothing in the payload distinguishes
+ * the two — but the number itself is worth seeing, because on an archive built
+ * from an older tool's records it is the size of the part your syncs can no
+ * longer reach.
+ */
+export function heldButUnseen(state, seenIds) {
+	let n = 0;
+	for (const item of Object.values(state.items)) {
+		if (seenIds.has(item.id)) continue;
+		if (disk.videos.has(item.id) || disk.photos.has(item.id)) n++;
+	}
+	return n;
+}
+
 /**
  * Called after a *complete* harvest: anything we knew about that TikTok no
  * longer returns has been deleted, privated or unliked. The media is
  * unrecoverable either way — this only records that it happened, so a future
  * reader of archive.json can tell "never downloaded" from "no longer exists".
  *
- * Never called on a stopped or errored run, where a short list means nothing.
+ * Never called on a stopped or errored run, where a short list means nothing —
+ * nor on one `looksTruncated` rejects, where it means something worse: a short
+ * list that claimed to be the whole thing.
  */
 export function markGone(state, seenIds) {
 	let gone = 0;

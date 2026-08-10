@@ -11,7 +11,11 @@ import {
 	loadState,
 	saveState,
 	scanDisk,
+	heldButUnseen,
+	looksTruncated,
 	markGone,
+	noteAbsentSongLink,
+	trailingUnseen,
 	upsertItem,
 	missingParts,
 	recordLikeOrder,
@@ -533,6 +537,10 @@ function onContentMessage(type, payload) {
 			// a run, but a duplicate here would corrupt the sequence, so check.
 			if (!app.seenIds.has(rec.id)) app.likeSeq.push(rec.id);
 			app.seenIds.add(rec.id);
+			// Here rather than in the queue: a photo post whose pictures are on disk
+			// and whose payload carries no link to its song is missing nothing the
+			// queue can fetch, so it never reaches the downloader to be written off.
+			if (noteAbsentSongLink(app.state, rec)) app.noLink++;
 			if (missingParts(rec).length) {
 				toDownload.push(rec);
 				app.newItems++;
@@ -583,6 +591,7 @@ async function startSync({ full = false } = {}) {
 	app.likeSeq = [];
 	app.full = full || !app.state.fullSyncAt;
 	app.settled = 0;
+	app.noLink = 0;
 
 	if (full) {
 		log('Full sync: reading the list to the end, retrying anything that failed before.');
@@ -663,20 +672,74 @@ async function finishSync(reason) {
 		}
 	}
 
+	// Not an error and not a failure of the item: the pictures are archived and
+	// only the song is absent. Reported because it is otherwise invisible — the
+	// Library can only show a post with no player, which reads like a download
+	// that hasn't run rather than a track TikTok will not part with.
+	//
+	// Outside the `app.queue` block above because only one of the two halves comes
+	// from the queue; the other is counted off the harvested records.
+	const refused = app.queue ? app.queue.noAudio.length : 0;
+	if (refused || app.noLink) {
+		const parts = [];
+		if (app.noLink) parts.push(`${app.noLink} that TikTok named a song for but sent no link to`);
+		if (refused) parts.push(`${refused} whose track was refused when asked for`);
+		log(
+			`${refused + app.noLink} photo post(s) kept their pictures but not their song: ${parts.join(', ')}. ` +
+				'archive.json records which, and why, under "noAudio".'
+		);
+	}
+
 	const counts = await scanDisk();
 
 	// Only a run that reached the end of the list can distinguish "TikTok didn't
 	// return it" from "we stopped scrolling early".
 	if (reason === 'complete' && app.seenIds.size) {
-		// The same thing makes it a baseline for the next run: from here on, a
-		// stretch of already-settled items means the rest of the list has been
-		// read before, so there is no need to read it again.
-		app.state.fullSyncAt = Date.now();
-		const gone = markGone(app.state, app.seenIds);
-		if (gone) {
+		// Said on every complete run, not just a suspicious one. How deep the list
+		// went is the one number that makes a truncation visible at all, and on an
+		// archive carried over from another tool the second figure is the size of
+		// the part your syncs can no longer reach — otherwise invisible, because
+		// every one of those posts is sitting in the folder looking archived.
+		const held = heldButUnseen(app.state, app.seenIds);
+		const before = app.state.listLength;
+		log(
+			`Read ${app.seenIds.size.toLocaleString()} likes` +
+				(before ? ` (the last complete run read ${before.toLocaleString()})` : '') +
+				'.' +
+				(held
+					? ` ${held.toLocaleString()} post(s) this archive holds the media for were not in the list — ` +
+						'unliked since, or no longer served.'
+					: '')
+		);
+		if (looksTruncated(app.state, app.seenIds)) {
+			// TikTok ended the list above where this archive has already been: the
+			// deepest likes on record went missing together, in a block, which is
+			// what being cut off looks like and not what unliking looks like. So
+			// nothing here may act as though it were the end — no item is written
+			// off as gone, and `fullSyncAt` is left where it was rather than being
+			// stamped on a run that did not earn it.
 			log(
-				`${gone} previously-known item(s) are no longer in your likes — deleted, privated or unliked. Kept in archive.json.`
+				`The list ended ${trailingUnseen(app.state, app.seenIds).toLocaleString()} likes above the deepest ` +
+					'this archive has reached before, all in one block. That is a truncated list, not the end of one.',
+				'err'
 			);
+			log(
+				'Nothing has been marked gone. Everything already downloaded is untouched — it only means the ' +
+					'oldest part of your likes was not served this time. Try Full sync again later.'
+			);
+		} else {
+			// The same thing makes it a baseline for the next run: from here on, a
+			// stretch of already-settled items means the rest of the list has been
+			// read before, so there is no need to read it again. The count comes with
+			// it, so the next run has something to be measured against.
+			app.state.fullSyncAt = Date.now();
+			app.state.listLength = app.seenIds.size;
+			const gone = markGone(app.state, app.seenIds);
+			if (gone) {
+				log(
+					`${gone} previously-known item(s) are no longer in your likes — deleted, privated or unliked. Kept in archive.json.`
+				);
+			}
 		}
 	}
 

@@ -38,9 +38,12 @@
 				emptyState,
 				scanDisk,
 				isSettled,
+				looksTruncated,
 				missingParts,
 				settledStreak,
+				trailingUnseen,
 				CAUGHT_UP_RUN,
+				TRUNCATED_TAIL,
 				STATUS,
 			} from '../lib/state.js';
 			import { reset, seed } from './fake-fs.js';
@@ -167,6 +170,72 @@
 				// The archive page reads this from a state it has just loaded, so a
 				// folder that predates the field has to come back as "never".
 				same('a fresh state has no complete run on record', emptyState().fullSyncAt, 0);
+			}
+
+			// ---- a list that stopped early and said it was the end ----------------
+			// The failure this exists for is silent by construction: TikTok answers
+			// `hasMore: false` partway down and the run reports success. On a real
+			// 5,899-item archive the list came back 303 likes short of where the
+			// previous tool had reached, and markGone wrote off the one item below
+			// that point which had no file on disk to shield it.
+			section('a truncated list');
+
+			/** An archive whose like order is `n` deep, every item saved. */
+			function ordered(n) {
+				const state = emptyState();
+				state.likeOrder = Array.from({ length: n }, (_, i) => `k${i}`);
+				for (const id of state.likeOrder) state.items[id] = { id, type: 'video', status: STATUS.saved };
+				return state;
+			}
+			/** What a run that reached position `n` of that order would report. */
+			const reached = (state, n) => new Set(state.likeOrder.slice(0, n));
+
+			{
+				const state = ordered(5229);
+				// The real shape: the list came back 303 short, in one block off the
+				// deep end. A ratio would have let this through — 303 of 5,229 is under
+				// six percent — which is why the test is where they went, not how many.
+				same('the tail that went missing is counted', trailingUnseen(state, reached(state, 4926)), 303);
+				check('and that reads as a truncated list', looksTruncated(state, reached(state, 4926)));
+			}
+
+			{
+				const state = ordered(5229);
+				check('a list that came back whole is the end', !looksTruncated(state, reached(state, 5229)));
+				// Unliking is not truncation, however much of it there is: what makes it
+				// different is that it is scattered, so the deepest like is still there.
+				const scattered = new Set(state.likeOrder.filter((_, i) => i % 3));
+				check('a third of the archive unliked, scattered, is still the end',
+					!looksTruncated(state, scattered));
+				check('even though far more went missing than a truncation would cost',
+					state.likeOrder.length - scattered.size > 1000);
+			}
+
+			{
+				const state = ordered(5229);
+				same('the threshold is two pages', TRUNCATED_TAIL, 60);
+				check('a short tail is unliking, not truncation',
+					!looksTruncated(state, reached(state, 5229 - 59)));
+				check('two pages of it is not', looksTruncated(state, reached(state, 5229 - 60)));
+			}
+
+			{
+				// Items already written off keep their place in the order and will
+				// never be seen again. Counting them would make every run after a
+				// deletion at the bottom of the list look truncated for good.
+				const state = ordered(200);
+				for (const id of state.likeOrder.slice(-80)) state.items[id].status = STATUS.gone;
+				same('gone items at the tail are stepped over, not counted',
+					trailingUnseen(state, reached(state, 120)), 0);
+				check('so a list ending above them is still the end',
+					!looksTruncated(state, reached(state, 120)));
+			}
+
+			{
+				// An archive whose first run was already truncated has no record of the
+				// part it never saw. Nothing can know it is missing — the honest answer
+				// is to trust the run, not to invent a suspicion.
+				check('a first run has nothing to be shallower than', !looksTruncated(emptyState(), new Set(['a'])));
 			}
 
 			lines.push('', failures
