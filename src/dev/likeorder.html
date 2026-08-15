@@ -131,6 +131,36 @@
 			}
 
 			{
+				// 20 re-liked: it leaves the middle for the top. 30 and 40 were never
+				// its followers in any meaningful sense — they follow 10 — and the run
+				// stopped before reaching them, so they must not be dragged up too.
+				const s = fixture(['10', '20', '30', '40'], ['10', '20', '30', '40']);
+				recordLikeOrder(s, ['20', '10']);
+				same('a re-liked id moves alone, not with its old tail',
+					s.likeOrder, ['20', '10', '30', '40']);
+			}
+
+			{
+				// The same on the scale it actually bites: one old like resurfacing
+				// must not turn the order below it inside out.
+				const ids = Array.from({ length: 200 }, (_, i) => String(1000 + i));
+				const s = fixture(ids, ids);
+				// '1150' re-liked, then the top two pages re-read.
+				recordLikeOrder(s, ['1150', ...ids.slice(0, 40)]);
+				same('the deep tail keeps its order behind a re-like',
+					s.likeOrder, ['1150', ...ids.filter((id) => id !== '1150')]);
+			}
+
+			{
+				// Two at once, and out of their old relative order: each is its own
+				// move, and neither takes the tail with it.
+				const s = fixture(['10', '20', '30', '40', '50'], ['10', '20', '30', '40', '50']);
+				recordLikeOrder(s, ['40', '20', '10', '30']);
+				same('several re-likes each move alone',
+					s.likeOrder, ['40', '20', '10', '30', '50']);
+			}
+
+			{
 				const s = fixture(['10', '20'], ['ghost', '10', '20']);
 				recordLikeOrder(s, ['10', '20']);
 				same('an id with no item behind it is dropped', s.likeOrder, ['10', '20']);

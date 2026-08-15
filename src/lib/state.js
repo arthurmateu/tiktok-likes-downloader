@@ -426,18 +426,44 @@ export function applyLikeRanks(state) {
  * run therefore rewrites the whole order and leaves `gone` items sitting
  * between the neighbours they were liked between; a partial run corrects the
  * top and leaves the tail as it was.
+ *
+ * With one exception, and it is the whole reason the walk below counts: an id
+ * that has *moved* is no longer a place. Re-like something from two years ago
+ * and it leaves the depths for the top of the list — and if it is still allowed
+ * to anchor, everything it used to sit above comes up with it, which on a real
+ * archive is thousands of items hoisted over the likes of the last six months.
+ * Nothing about that is visible in the payload; the list is simply wrong
+ * afterwards, in a way that survives every later sync.
+ *
+ * A move is legible without being told, because this run reports where each id
+ * it saw now sits. Walk the old order and those positions should only climb:
+ * likes added above shift the whole tail down together, and unlikes take items
+ * out without reordering what is left. An id that comes back *shallower* than
+ * one already passed is the one that jumped, so it is skipped as an anchor and
+ * its old followers stay with the last id that didn't move. It still takes its
+ * new position — it is in `seenOrder`, which is what the rebuild reads.
  */
 export function recordLikeOrder(state, seenOrder) {
-	const seen = new Set(seenOrder);
+	/** id -> where this run put it. Absent means the run never saw it. */
+	const at = new Map();
+	seenOrder.forEach((id, i) => {
+		if (!at.has(id)) at.set(id, i);
+	});
 	/** Ids that dropped out before the first surviving one: they were the newest. */
 	const head = [];
 	/** surviving id -> the ids that used to follow it */
 	const after = new Map();
 	let anchor = null;
+	/** Where the current anchor now sits, so an id that surfaced above it can tell. */
+	let anchoredAt = -1;
 
 	for (const id of state.likeOrder || []) {
-		if (seen.has(id)) {
-			anchor = id;
+		const now = at.get(id);
+		if (now !== undefined) {
+			if (now > anchoredAt) {
+				anchor = id;
+				anchoredAt = now;
+			}
 			continue;
 		}
 		if (anchor === null) head.push(id);
