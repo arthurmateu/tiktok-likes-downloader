@@ -12,9 +12,11 @@ import {
 	saveState,
 	scanDisk,
 	heldButUnseen,
+	listingComplete,
 	looksTruncated,
 	markGone,
 	noteAbsentSongLink,
+	songlessPhotoPosts,
 	trailingUnseen,
 	upsertItem,
 	missingParts,
@@ -45,6 +47,8 @@ const app = {
 	full: false,
 	/** Consecutive items an earlier run had already settled — see state.js. */
 	settled: 0,
+	/** The song pass, which runs instead of a sync rather than alongside one. */
+	songs: { running: false, stop: false, uniqueId: '' },
 };
 
 // ---------------------------------------------------------------- background
@@ -177,10 +181,11 @@ function setBusy(busy) {
 	if (busy) {
 		$('startSync').disabled = true;
 		$('syncMode').disabled = true;
+		$('fetchSongs').disabled = true;
 	} else {
 		// Rescanning mid-sync comes back through here. A run in progress has its own
 		// claim on these buttons, so hand them back to it rather than enabling them.
-		setSyncButtons(app.syncing);
+		setSyncButtons(app.syncing || app.songs.running);
 	}
 }
 
@@ -569,8 +574,53 @@ function onContentMessage(type, payload) {
 function setSyncButtons(running) {
 	$('startSync').disabled = running;
 	$('syncMode').disabled = running;
+	$('fetchSongs').disabled = running;
 	$('stopSync').disabled = !running;
 	if (running) closeSyncMenu();
+}
+
+/**
+ * The download queue both kinds of run share.
+ *
+ * `onHalt` is the only thing that differs between them, and only in what it has
+ * to wind up: a sync is a harvest plus a queue, the song pass is a loop of its
+ * own. Everything above it — the throttle both halves of a run keep each other
+ * informed of, the grid catching up as files land — is the same work either way.
+ */
+function makeQueue({ onHalt } = {}) {
+	return new DownloadQueue({
+		concurrency: Math.max(1, Math.min(8, Number($('concurrency').value) || 4)),
+		state: app.state,
+		onProgress: () => {
+			updateCounters();
+			// An item that has just been written is in `disk` already — the downloader
+			// adds to it as it writes — and the grid is the only thing that hasn't
+			// heard. Same catching-up a scan's batches get, once per finished item, so
+			// a tile lights up as its files land rather than at the end of the run.
+			refreshPresence();
+		},
+		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
+		onThrottle: (ev) => {
+			if (!ev.halted) {
+				log(
+					`TikTok refused a download (${ev.kind}). Pausing ${Math.round(ev.waitMs / 1000)}s ` +
+						`before trying again — the list stops too.`
+				);
+			}
+			shareThrottle();
+		},
+		onHalt: (reason) => {
+			log(`${reason}. Stopping the whole run rather than asking again.`, 'err');
+			log('Open the TikTok tab, clear the check, then press Sync — nothing already saved is lost.');
+			shareThrottle();
+			if (app.tabId) ask('stop-harvest', { tabId: app.tabId });
+			// Clears the parked items so the caller's `idle()` can resolve — a paused
+			// queue never drains. Nothing is lost: none of them were marked, so the
+			// next run finds them missing on disk and queues them again.
+			app.queue.stop();
+			onHalt?.(reason);
+		},
+	});
 }
 
 async function startSync({ full = false } = {}) {
@@ -608,39 +658,7 @@ async function startSync({ full = false } = {}) {
 	app.expectedTotal = Object.keys(app.state.items).length || 0;
 	setSyncButtons(true);
 
-	app.queue = new DownloadQueue({
-		concurrency: Math.max(1, Math.min(8, Number($('concurrency').value) || 4)),
-		state: app.state,
-		onProgress: () => {
-			updateCounters();
-			// An item that has just been written is in `disk` already — the downloader
-			// adds to it as it writes — and the grid is the only thing that hasn't
-			// heard. Same catching-up a scan's batches get, once per finished item, so
-			// a tile lights up as its files land rather than at the end of the run.
-			refreshPresence();
-		},
-		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
-		onThrottle: (ev) => {
-			if (!ev.halted) {
-				log(
-					`TikTok refused a download (${ev.kind}). Pausing ${Math.round(ev.waitMs / 1000)}s ` +
-						`before trying again — the list stops too.`
-				);
-			}
-			shareThrottle();
-		},
-		onHalt: (reason) => {
-			log(`${reason}. Stopping the whole run rather than asking again.`, 'err');
-			log('Open the TikTok tab, clear the check, then press Sync — nothing already saved is lost.');
-			shareThrottle();
-			if (app.tabId) ask('stop-harvest', { tabId: app.tabId });
-			// Clears the parked items so finishSync's `idle()` can resolve — a paused
-			// queue never drains. Nothing is lost: none of them were marked, so the
-			// next sync finds them missing on disk and queues them again.
-			app.queue.stop();
-			finishSync('error');
-		},
-	});
+	app.queue = makeQueue({ onHalt: () => finishSync('error') });
 
 	log(`Opening https://www.tiktok.com/@${uniqueId} in the background…`);
 	const res = await ask('ensure-profile', { uniqueId, background: true });
@@ -782,6 +800,173 @@ function beginSync(opts = {}) {
 	});
 }
 
+// ------------------------------------------------------------- song pass
+//
+// A photo post's song is the one part of the archive a sync can fail to fetch
+// without failing anything: the pictures are the post, they are on disk, and the
+// item is `saved`. `isSettled` excludes the song deliberately, so an incremental
+// run steps over such a post forever, and a full sync only reaches it if TikTok
+// serves the list that far — which is exactly what did not happen here. A run
+// that came back short of the end left the deepest likes holding pictures
+// collected before songs were fetched at all, and nothing since could get back
+// to them.
+//
+// So this pass does not use the list. It opens each post's own page in the sync
+// tab and reads the record TikTok rendered it from, which carries the
+// `music.playUrl` the list payload either never had or never sent. That also
+// answers the other half — the posts written off with "TikTok named the track
+// but sent no link to it" — because the link missing from `item_list` is
+// routinely present on the post itself.
+
+/** Between posts. A page load each, so nothing here needs to be quick. */
+const SONG_PAUSE_MS = 1500;
+
+const pause = (ms) => new Promise((r) => setTimeout(r, Math.round(ms * (1 + Math.random() * 0.6))));
+
+/** Where a post lives, so the tab can be pointed at it. */
+function postUrl(item) {
+	const uniqueId = item.author?.uniqueId || app.state.authors?.[item.author?.id]?.uniqueId;
+	if (!uniqueId) return null;
+	return `https://www.tiktok.com/@${uniqueId}/${item.type === 'photo' ? 'photo' : 'video'}/${item.id}`;
+}
+
+async function fetchMissingSongs() {
+	if (!app.state) {
+		log('Pick a folder first.', 'err');
+		return;
+	}
+	// `disk.audio` not holding an id means "not on disk" only once the listing is
+	// complete. Run this against a half-read folder and every photo post in the
+	// archive looks songless.
+	if (!listingComplete()) {
+		log('The folder is still being read — try again once the scan has finished.', 'err');
+		return;
+	}
+	const uniqueId = $('username').value.trim().replace(/^@/, '');
+	if (!uniqueId) {
+		log('Enter your TikTok username first.', 'err');
+		return;
+	}
+
+	const todo = songlessPhotoPosts(app.state);
+	if (!todo.length) {
+		log('Every photo post in the archive already has its song.', 'ok');
+		return;
+	}
+
+	app.songs = { running: true, stop: false, uniqueId };
+	// The counters are the sync's, and they read the same way here: one post
+	// opened is one item seen, and the bar is the worklist rather than the list.
+	app.seen = 0;
+	app.newItems = 0;
+	app.expectedTotal = todo.length;
+	setSyncButtons(true);
+	log(
+		`${todo.length.toLocaleString()} photo post(s) have their pictures but no song. Opening each one ` +
+			'to read the track off its own page — this takes a page load apiece, so it is slow.'
+	);
+
+	app.queue = makeQueue({ onHalt: () => (app.songs.stop = true) });
+
+	const res = await ask('ensure-profile', { uniqueId, background: true });
+	if (!res.ok) {
+		log(`Could not prepare the TikTok tab: ${res.error || 'unknown error'}`, 'err');
+		await finishSongs({ found: 0, noLink: 0 });
+		return;
+	}
+	app.tabId = res.tabId;
+
+	let found = 0;
+	let noLink = 0;
+	for (const item of todo) {
+		if (app.songs.stop) break;
+
+		const url = postUrl(item);
+		if (!url) {
+			log(`· ${item.id}: no author on record, so there is no page to open.`);
+			continue;
+		}
+
+		app.seen++;
+		const got = await ask('post-detail', { tabId: app.tabId, url, id: item.id });
+		if (!got.ok) {
+			// Never `unavailable`: the pictures are archived and this is one optional
+			// extra. A post that has been deleted since simply has no page to read.
+			log(`✗ ${item.id}: ${got.error || 'no record on the page'}`, 'err');
+			updateCounters();
+			await pause(SONG_PAUSE_MS);
+			continue;
+		}
+
+		const rec = got.item;
+		// Not `recordLikeOrder`'s business, and deliberately kept out of `likeSeq`:
+		// this pass reads posts in archive order, not in like order, and feeding that
+		// sequence in would rewrite the record of when things were liked.
+		upsertItem(app.state, rec);
+		if (missingParts(rec).length) {
+			found++;
+			app.newItems++;
+			app.queue.add(rec);
+		} else {
+			// The page agrees with the list — TikTok names the track and links
+			// nothing. Counted rather than logged one by one: on this archive it is
+			// the answer for dozens of posts, and forty identical lines is not a log.
+			noLink++;
+			noteAbsentSongLink(app.state, rec);
+		}
+
+		if (app.seen % 10 === 0) log(`Opened ${app.seen} of ${todo.length}; ${found} song(s) queued.`);
+		saveState(app.state);
+		updateCounters();
+		await pause(SONG_PAUSE_MS);
+	}
+
+	await finishSongs({ found, noLink });
+}
+
+async function finishSongs({ found, noLink }) {
+	app.songs.running = false;
+	$('stopSync').disabled = true;
+
+	if (app.queue) {
+		log(`Opened ${app.seen} post(s), ${found} with a track to fetch. Finishing ${app.queue.pending} download(s)…`);
+		await app.queue.idle();
+	}
+	const refused = app.queue ? app.queue.noAudio.length : 0;
+	if (noLink || refused) {
+		const parts = [];
+		if (noLink) parts.push(`${noLink} that TikTok's own page names a song for but links no audio to`);
+		if (refused) parts.push(`${refused} whose track was linked but refused when asked for`);
+		log(`${noLink + refused} post(s) still have no song: ${parts.join(', ')}. Recorded under "noAudio".`);
+	}
+
+	// Back to the profile, so the tab this pass has been driving is one the next
+	// sync can reuse. A tab left on a post page is not a list, and a sync that
+	// adopted it would sit there waiting for a request it never makes.
+	if (app.tabId && app.songs.uniqueId) {
+		await ask('navigate-tab', { tabId: app.tabId, url: `https://www.tiktok.com/@${app.songs.uniqueId}` });
+	}
+
+	const counts = await scanDisk();
+	renderStats(counts);
+	await saveState(app.state, { immediate: true });
+	renderLibrary(app.state);
+	log(
+		`Song pass done — the archive now holds ${counts.songs.toLocaleString()} song(s). archive.json written.`,
+		'ok'
+	);
+	await writeViewerFile();
+	setSyncButtons(false);
+}
+
+$('fetchSongs').addEventListener('click', () => {
+	fetchMissingSongs().catch((err) => {
+		log(`The song pass could not run: ${(err && err.message) || err}`, 'err');
+		app.songs.running = false;
+		setSyncButtons(false);
+	});
+});
+
 // ---------------------------------------------------------------- sync mode
 //
 // One button with a dropdown rather than two: which sync you want is a choice
@@ -830,6 +1015,15 @@ document.addEventListener('keydown', (ev) => {
 $('startSync').addEventListener('click', () => beginSync({ full: syncFull }));
 
 $('stopSync').addEventListener('click', async () => {
+	// The song pass owns the button when it is the thing running. It stops between
+	// posts rather than mid-page, so this only sets the flag its loop reads and
+	// lets that loop wind itself up.
+	if (app.songs.running) {
+		app.songs.stop = true;
+		app.queue?.stop();
+		log('Stopping after this post.');
+		return;
+	}
 	if (app.tabId) await ask('stop-harvest', { tabId: app.tabId });
 	app.queue?.stop();
 	finishSync('stopped');
@@ -904,7 +1098,9 @@ async function checkHostAccess() {
 })();
 
 window.addEventListener('beforeunload', (e) => {
-	if (app.syncing || (app.queue && app.queue.pending > 0)) {
+	// The song pass spends most of its time between downloads, waiting on a page
+	// load, so an idle queue says nothing about whether it is still running.
+	if (app.syncing || app.songs.running || (app.queue && app.queue.pending > 0)) {
 		e.preventDefault();
 		e.returnValue = '';
 	}

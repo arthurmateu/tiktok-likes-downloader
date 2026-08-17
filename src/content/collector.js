@@ -180,8 +180,23 @@
 			}
 			return;
 		}
+		if (d.kind === 'item-detail-result') {
+			const resolve = pendingDetails.get(d.payload.rid);
+			if (resolve) {
+				pendingDetails.delete(d.payload.rid);
+				resolve(d.payload.item || null);
+			}
+			return;
+		}
 		if (d.kind === 'capture') {
 			const p = d.payload;
+			// A single post is not a page of the list, and everything below treats
+			// what it is given as one. `lastCapture` is the paging cursor and the
+			// "is there more?" flag the scroll loop stops on — a detail response
+			// carries neither, so adopting one ends the harvest on the spot. Its item
+			// would also be counted as seen and reported as list output, which puts
+			// a post nobody scrolled past into this run's like order.
+			if (p.endpoint === 'detail') return;
 			state.lastCapture = { at: Date.now(), ...p };
 			const items = [];
 			for (const raw of p.itemList || []) {
@@ -398,6 +413,52 @@
 		});
 	}
 
+	// ------------------------------------------------------------ one post
+
+	/** @type {Map<number, (item: any) => void>} */
+	const pendingDetails = new Map();
+	let detailReqId = 0;
+
+	function requestDetail() {
+		const rid = ++detailReqId;
+		return new Promise((resolve) => {
+			pendingDetails.set(rid, resolve);
+			window.postMessage({ __ttarchiveCmd: true, kind: 'item-detail', rid }, '*');
+			setTimeout(() => {
+				if (pendingDetails.delete(rid)) resolve(null);
+			}, 10000);
+		});
+	}
+
+	/**
+	 * The record for the post this page is showing, once it has one.
+	 *
+	 * Polled rather than awaited once: the archive page navigates this tab and
+	 * asks as soon as the load completes, and on an SPA navigation the blob is
+	 * replaced a beat after that — asking a single time reads the previous post,
+	 * which would quietly file one post's song under another's id. So the id is
+	 * checked, and a mismatch counts as not there yet.
+	 */
+	async function itemDetail(id, { timeout = 15000 } = {}) {
+		const deadline = Date.now() + timeout;
+		let last = null;
+		while (Date.now() < deadline) {
+			const raw = await requestDetail();
+			if (raw) {
+				last = String(raw.id || '');
+				if (!id || last === String(id)) {
+					const rec = normalize(raw);
+					if (rec) return { ok: true, item: rec };
+				}
+			}
+			await nap(400);
+		}
+		return {
+			ok: false,
+			error: last ? `the page was still showing ${last}` : 'the page carried no post record',
+		};
+	}
+
 	/**
 	 * Walk the list by cursor. Returns why it stopped so harvest() can decide
 	 * whether that's the end of the list or a reason to fall back to scrolling.
@@ -611,6 +672,12 @@
 		if (msg.cmd === 'stop') {
 			state.abort = true;
 			sendResponse({ ok: true });
+			return true;
+		}
+		// One post, read off the page it is rendered on. Nothing to do with a
+		// harvest — the song pass drives this tab a post at a time instead.
+		if (msg.cmd === 'item-detail') {
+			itemDetail(msg.id).then(sendResponse);
 			return true;
 		}
 		// The archive page's downloads were refused. Adopt the longer pause of the

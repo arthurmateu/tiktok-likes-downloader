@@ -160,6 +160,12 @@ async function handleArchiveMessage(msg, port) {
 			case 'throttle':
 				reply(await sendToTab(msg.tabId, { cmd: 'throttle', payload: msg.payload }));
 				break;
+			case 'post-detail':
+				reply(await postDetail(msg.tabId, msg.url, msg.id));
+				break;
+			case 'navigate-tab':
+				reply(await navigateTab(msg.tabId, msg.url));
+				break;
 			case 'ping-tab':
 				reply(await sendToTab(msg.tabId, { cmd: 'ping' }));
 				break;
@@ -245,10 +251,29 @@ async function findTikTokTab() {
  */
 async function ensureProfileTab(uniqueId, { background = false } = {}) {
 	const target = `https://www.tiktok.com/@${uniqueId}`;
+
+	/**
+	 * The profile itself, not merely something underneath it.
+	 *
+	 * `/@user/photo/123` starts with `/@user` and is not the profile — and the
+	 * song pass leaves the tab on exactly that. Reusing one "in place" reloads it
+	 * rather than navigating, so a sync that mistook a post page for the profile
+	 * would reload the post and then wait out its timeout for a list request that
+	 * page never makes.
+	 */
+	const isProfile = (url) => {
+		if (!(url || '').startsWith(target)) return false;
+		const rest = url.slice(target.length);
+		return rest === '' || rest === '/' || rest.startsWith('?') || rest.startsWith('#');
+	};
+
 	const tabs = await ext.tabs.query({ url: ['*://*.tiktok.com/*'] });
-	const onProfile = tabs.find((t) => (t.url || '').startsWith(target));
-	let tab = background ? onProfile : onProfile || tabs[0];
-	const reusedInPlace = !!tab && (tab.url || '').startsWith(target);
+	// In background mode a tab already sitting on this profile is the only one
+	// worth having; otherwise any TikTok tab will do and gets navigated. A tab the
+	// song pass parked on a post counts as neither, and is navigated like any other.
+	const onProfile = tabs.find((t) => isProfile(t.url));
+	let tab = background ? onProfile || tabs.find((t) => (t.url || '').startsWith(target)) : onProfile || tabs[0];
+	const reusedInPlace = !!tab && isProfile(tab.url);
 
 	if (!tab) {
 		tab = await ext.tabs.create({ url: target, active: !background });
@@ -272,6 +297,41 @@ async function ensureProfileTab(uniqueId, { background = false } = {}) {
 		await new Promise((r) => setTimeout(r, 500));
 	}
 	return { ok: false, tabId: tab.id, error: 'content script never responded' };
+}
+
+/** Point a tab somewhere without bringing it forward. */
+async function navigateTab(tabId, url) {
+	try {
+		await ext.tabs.update(tabId, { url, active: false });
+	} catch (_) {
+		return { ok: false, error: 'the TikTok tab has been closed' };
+	}
+	return { ok: true };
+}
+
+/**
+ * Open one post in the sync tab and hand back the record it was rendered from.
+ *
+ * The song pass's inner step, kept here rather than on the archive page because
+ * every part of it is a tabs call: navigate, wait for the load, then ask the
+ * content script what the page is holding. The tab stays in the background
+ * throughout — a post page renders its state blob whether or not anyone is
+ * looking at it.
+ */
+async function postDetail(tabId, url, id) {
+	const went = await navigateTab(tabId, url);
+	if (!went.ok) return went;
+	await waitForLoading(tabId);
+	await waitForComplete(tabId);
+
+	// The content script is torn down and rebuilt by the navigation, and answers
+	// nothing in between. Same wait as ensureProfileTab, and for the same reason.
+	for (let i = 0; i < 20; i++) {
+		const ping = await sendToTab(tabId, { cmd: 'ping' });
+		if (ping.ok) return sendToTab(tabId, { cmd: 'item-detail', id });
+		await new Promise((r) => setTimeout(r, 500));
+	}
+	return { ok: false, error: 'the content script never came back after the navigation' };
 }
 
 /**

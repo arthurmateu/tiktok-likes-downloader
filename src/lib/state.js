@@ -559,6 +559,47 @@ export function noteAbsentSongLink(state, rec) {
 	return was !== item.noAudio;
 }
 
+/**
+ * The photo posts this archive holds pictures for but no song, in like order.
+ *
+ * The worklist for the song pass, and deliberately read off `state.items` rather
+ * than off a harvest. That is the whole point of the pass: the posts that need
+ * it are the ones a sync does not reach. A photo post whose pictures are on disk
+ * is `settled` — see `isSettled`, which excludes the song on purpose — so an
+ * incremental run steps over it, and the only thing left is a full sync, which
+ * has to be served the entire list to get there. Ours were missed by exactly
+ * that: a run that came back short of the end while the tail held the posts
+ * whose songs had never been collected.
+ *
+ * Posts already carrying a `noAudio` note are included, not skipped. The note
+ * records what the *list* payload said, and this pass asks somewhere else — a
+ * song TikTok named no link for in `item_list` is routinely sitting on the post's
+ * own page.
+ *
+ * Only ever meaningful once `listingComplete()`: before that, an id `disk.audio`
+ * does not have is one the scan has not reached, and the whole archive would
+ * look songless. Callers check that; this cannot, having no way to say so.
+ */
+export function songlessPhotoPosts(state) {
+	const out = [];
+	for (const item of Object.values(state.items || {})) {
+		if (item.type !== 'photo') continue;
+		// Nothing to open: the post is off TikTok, and its pictures survive here
+		// only because we got them first.
+		if (item.status === STATUS.gone) continue;
+		// Pictures missing too means this is ordinary sync work, not a song pass —
+		// the post has never been downloaded rather than downloaded without a track.
+		if (!hasPhotos(item.id)) continue;
+		if (hasAudio(item.id)) continue;
+		out.push(item);
+	}
+	const rank = (i) => (i.likeRank == null ? Number.MAX_SAFE_INTEGER : i.likeRank);
+	// Newest-liked first, so a pass stopped half-way has done the part of the
+	// archive you are most likely to be looking at.
+	out.sort((a, b) => rank(a) - rank(b));
+	return out;
+}
+
 export function markUnavailable(state, id, reason) {
 	if (!state.unavailable.includes(id)) state.unavailable.push(id);
 	const item = state.items[id];

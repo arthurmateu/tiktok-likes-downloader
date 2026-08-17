@@ -1,0 +1,242 @@
+<!doctype html>
+<!--
+	Dev-only: drives hook.js + collector.js against a faked post page.
+
+	The song pass reads a track off the post's own page rather than out of the
+	likes list, because the list is what failed: a run that came back short of the
+	end left the deepest likes holding pictures collected before songs were
+	fetched at all, and no later sync can reach them. So the pass navigates the
+	tab a post at a time and takes the item struct out of the page's own state
+	blob — no request, no signing.
+
+	Everything about that is quiet when it goes wrong. A blob read one beat too
+	early is the *previous* post's, and filing one post's song under another's id
+	produces a perfectly ordinary-looking archive with the wrong music in it. So
+	the id check gets a test of its own, as does the other half: a detail response
+	is not a page of the list, and must not be reported as one.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/postdetail.html
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>post detail tests</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+			h2 { font-size: 13px; margin: 18px 0 4px; color: #9a9bb0; }
+		</style>
+	</head>
+	<body>
+		<h1>post detail</h1>
+		<pre id="out">running…</pre>
+
+		<script>
+			// ---- the page's state blob -----------------------------------------
+			// What TikTok server-renders into a post page. Swapped out between tests
+			// the way a navigation replaces it.
+
+			/** An item struct as a post page carries one. */
+			function struct(id, { photos = 1, playUrl = `https://cdn/${id}.mp3`, video = false } = {}) {
+				const item = {
+					id,
+					desc: `post ${id}`,
+					createTime: 1700000000,
+					author: { id: '1', uniqueId: 'me', nickname: 'Me', avatarThumb: 'https://cdn/av.jpg' },
+					stats: { diggCount: 1, playCount: 2, commentCount: 3, shareCount: 4, collectCount: 5 },
+					music: { id: '9', title: 'song', authorName: 'someone', playUrl },
+				};
+				if (video) {
+					item.video = { playAddr: `https://cdn/${id}.mp4`, duration: 10, width: 720, height: 1280 };
+				} else {
+					item.imagePost = {
+						images: Array.from({ length: photos }, (_, i) => ({
+							imageURL: { urlList: [`https://cdn/${id}-${i}.jpg`] },
+						})),
+					};
+				}
+				return item;
+			}
+
+			function setBlob(json, { id = '__UNIVERSAL_DATA_FOR_REHYDRATION__' } = {}) {
+				for (const old of document.querySelectorAll('script[type="application/json"]')) old.remove();
+				if (!json) return;
+				const el = document.createElement('script');
+				el.type = 'application/json';
+				el.id = id;
+				el.textContent = JSON.stringify(json);
+				document.body.appendChild(el);
+			}
+
+			/** The current shape: the item under __DEFAULT_SCOPE__. */
+			const universal = (item) => ({ __DEFAULT_SCOPE__: { 'webapp.video-detail': { itemInfo: { itemStruct: item } } } });
+			/** The older one, keyed by id under ItemModule. */
+			const sigi = (item) => ({ ItemModule: { [item.id]: item } });
+
+			// ---- extension API ---------------------------------------------------
+			const messages = [];
+			const listeners = [];
+			window.browser = {
+				runtime: {
+					sendMessage: (msg) => {
+						if (msg.type !== 'sleep') messages.push(msg);
+						// A timer, shortened. Answering on a microtask would let the
+						// collector's poll spin without handing the event loop back.
+						if (msg.type === 'sleep') {
+							return new Promise((r) => setTimeout(() => r({ ok: true }), Math.min(msg.ms, 5)));
+						}
+						return Promise.resolve({ ok: true });
+					},
+					onMessage: { addListener: (fn) => listeners.push(fn) },
+				},
+			};
+
+			/** Ask the collector the way the background does. */
+			function command(msg) {
+				return new Promise((resolve) => {
+					for (const fn of listeners) fn(msg, {}, resolve);
+				});
+			}
+
+			// ---- a stub for the two endpoints the hook watches --------------------
+			const realFetch = window.fetch.bind(window);
+			window.fetch = async (input, init) => {
+				const url = typeof input === 'string' ? input : input.url;
+				if (!url.startsWith('https://www.tiktok.com/api/')) return realFetch(input, init);
+				const body = url.includes('/item/detail/')
+					? { statusCode: 0, itemInfo: { itemStruct: struct('900') } }
+					: { statusCode: 0, itemList: [struct('800')], hasMore: true, cursor: 'c1' };
+				return new Response(JSON.stringify(body), {
+					status: 200,
+					headers: { 'content-type': 'application/json' },
+				});
+			};
+		</script>
+
+		<script src="../content/hook.js"></script>
+		<script src="../content/collector.js"></script>
+
+		<script type="module">
+			const out = document.getElementById('out');
+			const lines = [];
+			let failures = 0;
+
+			const die = (what) => {
+				out.textContent = `${what}\n\ngot as far as:\n${lines.join('\n').replace(/<[^>]+>/g, '')}`;
+			};
+			window.addEventListener('error', (e) => die(`ERROR  ${e.message}`));
+			window.addEventListener('unhandledrejection', (e) => die(`UNHANDLED  ${e.reason}`));
+
+			function check(label, ok, detail = '') {
+				if (!ok) failures++;
+				lines.push(
+					`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(ok || !detail ? '' : `\n        ${detail}`)
+				);
+				out.innerHTML = lines.join('\n');
+			}
+			const same = (label, got, want) =>
+				check(label, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}`);
+			const section = (t) => lines.push(`<h2>${t}</h2>`);
+
+			const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+			// ---- the ordinary read -----------------------------------------------
+			section('reading a post off its own page');
+
+			setBlob(universal(struct('100', { photos: 3 })));
+			{
+				const res = await command({ cmd: 'item-detail', id: '100' });
+				check('the page hands over a record', res.ok, JSON.stringify(res));
+				same('normalized as a photo post', res.item.type, 'photo');
+				same('with every image', res.item.photos.length, 3);
+				same('and the song the list would not give us', res.item.audio, ['https://cdn/100.mp3']);
+				same('the caption comes with it', res.item.desc, 'post 100');
+				same('and the author', res.item.author.uniqueId, 'me');
+			}
+
+			// ---- the shapes a page can arrive in ----------------------------------
+			section('both blob shapes');
+
+			setBlob(sigi(struct('110')), { id: 'SIGI_STATE' });
+			{
+				const res = await command({ cmd: 'item-detail', id: '110' });
+				check('the older SIGI_STATE shape is read too', res.ok, JSON.stringify(res));
+				same('and gives the same song', res.item.audio, ['https://cdn/110.mp3']);
+			}
+
+			// The app-shaped payload wraps playUrl in a url list, the way PlayAddr does.
+			setBlob(universal(struct('120', { playUrl: { urlList: ['https://cdn/120a.mp3', 'https://cdn/120b.mp3'] } })));
+			{
+				const res = await command({ cmd: 'item-detail', id: '120' });
+				same('a url list is read as the mirrors it is', res.item.audio, [
+					'https://cdn/120a.mp3',
+					'https://cdn/120b.mp3',
+				]);
+			}
+
+			// ---- what the pass must not do ----------------------------------------
+			section('the post it was asked for, and no other');
+
+			// The archive page navigates the tab and asks as soon as the load
+			// completes; on an SPA navigation the blob is replaced a beat later. Ask
+			// once and you read the post before it — and file its song under this id.
+			setBlob(universal(struct('200')));
+			{
+				const started = Date.now();
+				const pending = command({ cmd: 'item-detail', id: '201' });
+				await sleep(300);
+				setBlob(universal(struct('201')));
+				const res = await pending;
+				check('a stale blob is waited out, not accepted', res.ok, JSON.stringify(res));
+				same('and the record is the post that was asked for', res.item.id, '201');
+				check('which took the wait it needed', Date.now() - started >= 300);
+			}
+
+			setBlob(universal(struct('300')));
+			{
+				const res = await command({ cmd: 'item-detail', id: '301' });
+				check('a page that never catches up is a failure', !res.ok);
+				check('naming what it was showing instead', String(res.error).includes('300'), res.error);
+			}
+
+			setBlob(null);
+			{
+				const res = await command({ cmd: 'item-detail', id: '400' });
+				check('so is a page with no record in it at all', !res.ok);
+				check('and says that rather than the wrong post', String(res.error).includes('no post record'), res.error);
+			}
+
+			// ---- a post is not a page of the list ----------------------------------
+			section('a detail response is not list output');
+
+			// Both go through the hook's fetch wrapper and both land in `handle`. Only
+			// one of them is a page of the likes list. A detail response carries no
+			// cursor and no hasMore, so adopting it as `lastCapture` ends the harvest
+			// on the spot — and its item would be counted as seen and reported as list
+			// output, putting a post nobody scrolled past into this run's like order.
+			messages.length = 0;
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=900');
+			await sleep(200);
+			same('nothing is reported to the archive page', messages.filter((m) => m.type === 'items').length, 0);
+
+			messages.length = 0;
+			await window.fetch('https://www.tiktok.com/api/favorite/item_list/?cursor=0');
+			await sleep(200);
+			{
+				const items = messages.filter((m) => m.type === 'items');
+				same('while a page of the list still is', items.length, 1);
+				same('carrying the item it held', items[0].payload.items[0].id, '800');
+			}
+
+			lines.push(
+				'',
+				failures ? `<span class="fail">${failures} failing</span>` : '<span class="pass">all passed</span>'
+			);
+			out.innerHTML = lines.join('\n');
+			console.log(`POSTDETAILTEST ${failures} failing`);
+		</script>
+	</body>
+</html>

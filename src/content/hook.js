@@ -240,11 +240,46 @@
 		reply({ ok: true, count: items.length, hasMore, cursor: json.cursor != null ? String(json.cursor) : null });
 	}
 
+	// --- one post at a time --------------------------------------------------
+
+	/**
+	 * The post a detail page was rendered for, out of the page's own state blob.
+	 *
+	 * No request and no signing, which is the reason this exists rather than a
+	 * `detail(id)` sibling of `paginate` above. The song pass needs posts the
+	 * likes list will not hand over, and a replay of `/api/item/detail/` needs a
+	 * signed seed the page only produces if someone opened a post in it — which
+	 * in a background tab nobody has. Server-rendered HTML needs neither: opening
+	 * the post is a page load, and the blob it arrives with carries the whole
+	 * item struct, `music.playUrl` included.
+	 *
+	 * Both shapes are read for the same reason `scrapeUniversalState` reads both:
+	 * which one a page ships has changed before.
+	 */
+	function scrapeItemDetail() {
+		const el =
+			document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') ||
+			document.getElementById('SIGI_STATE');
+		if (!el) return null;
+		try {
+			const data = JSON.parse(el.textContent);
+			const struct = (data.__DEFAULT_SCOPE__ || {})['webapp.video-detail']?.itemInfo?.itemStruct;
+			if (struct && struct.id) return struct;
+			for (const item of Object.values(data.ItemModule || {})) {
+				if (item && item.id) return item;
+			}
+		} catch (_) {
+			/* not the page we thought it was */
+		}
+		return null;
+	}
+
 	window.addEventListener('message', (ev) => {
 		if (ev.source !== window) return;
 		const d = ev.data;
 		if (!d || d.__ttarchiveCmd !== true) return;
 		if (d.kind === 'paginate') paginate(d.rid, d.payload || {});
+		if (d.kind === 'item-detail') emit('item-detail-result', { rid: d.rid, item: scrapeItemDetail() });
 	});
 
 	// --- initial page state ------------------------------------------------

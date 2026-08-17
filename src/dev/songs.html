@@ -49,6 +49,7 @@
 				missingParts,
 				noteAbsentSongLink,
 				scanDisk,
+				songlessPhotoPosts,
 				STATUS,
 			} from '../lib/state.js';
 			import { DownloadQueue } from '../lib/downloader.js';
@@ -260,6 +261,47 @@
 				check('a note contradicted by the folder is cleared',
 					noteAbsentSongLink(state, photo('60', { audio: [] })));
 				check('and stays cleared', state.items['60'].noAudio === undefined);
+			}
+
+			// ---- what the song pass goes looking for -----------------------------
+			section('the pass worklist');
+
+			reset();
+			// 70: pictures and a song — finished. 71: pictures, no song — the case the
+			// pass exists for. 72: pictures and a note already written off. 73: nothing
+			// on disk at all. 74: a video, which carries its sound inside the mp4.
+			seed('images/70.jpg', IMAGE());
+			seed('audio/70.mp3', AUDIO());
+			seed('images/71.jpg', IMAGE());
+			seed('images/72.jpg', IMAGE());
+			seed('videos/74.mp4', IMAGE());
+			await scanDisk();
+
+			{
+				const state = stateWith(['70', '71', '72', '73']);
+				state.items['72'].noAudio = 'TikTok named the track but sent no link to it';
+				state.items['74'] = { id: '74', type: 'video', status: STATUS.saved };
+				const ids = () => songlessPhotoPosts(state).map((i) => i.id);
+
+				same('only photo posts with pictures and no song', ids(), ['71', '72']);
+
+				// The note records what `item_list` said. The pass asks the post's own
+				// page, which is a different answer — so a written-off post is exactly
+				// what it is for, not something to step over.
+				check('a post already written off is included', ids().includes('72'));
+				check('one whose pictures never arrived is not', !ids().includes('73'));
+				check('nor is a video', !ids().includes('74'));
+
+				state.items['71'].status = STATUS.gone;
+				check('nor one TikTok no longer has a page for', !ids().includes('71'));
+				state.items['71'].status = STATUS.saved;
+
+				state.items['71'].likeRank = 9;
+				state.items['72'].likeRank = 2;
+				same('newest-liked first', ids(), ['72', '71']);
+
+				delete state.items['72'].likeRank;
+				same('and anything unranked goes last', ids(), ['71', '72']);
 			}
 
 			lines.push(
