@@ -180,14 +180,6 @@
 			}
 			return;
 		}
-		if (d.kind === 'item-detail-result') {
-			const resolve = pendingDetails.get(d.payload.rid);
-			if (resolve) {
-				pendingDetails.delete(d.payload.rid);
-				resolve(d.payload.item || null);
-			}
-			return;
-		}
 		if (d.kind === 'capture') {
 			const p = d.payload;
 			// A single post is not a page of the list, and everything below treats
@@ -415,48 +407,79 @@
 
 	// ------------------------------------------------------------ one post
 
-	/** @type {Map<number, (item: any) => void>} */
-	const pendingDetails = new Map();
-	let detailReqId = 0;
-
-	function requestDetail() {
-		const rid = ++detailReqId;
-		return new Promise((resolve) => {
-			pendingDetails.set(rid, resolve);
-			window.postMessage({ __ttarchiveCmd: true, kind: 'item-detail', rid }, '*');
-			setTimeout(() => {
-				if (pendingDetails.delete(rid)) resolve(null);
-			}, 10000);
-		});
+	/**
+	 * The post this page is showing, read off the page itself.
+	 *
+	 * No request of our own and no signing: the song pass needs posts the likes
+	 * list will not hand over, and a replay of `/api/item/detail/` needs a signed
+	 * seed the page only produces if someone opened a post in it — which in a
+	 * background tab nobody has. Opening the post as a page load needs neither,
+	 * and the record then turns up in one of two places:
+	 *
+	 * - A video page server-renders it into the state blob, `music.playUrl`
+	 *   included. Both blob shapes are read, for the same reason the hook's
+	 *   `scrapeUniversalState` reads both: which one a page ships has changed.
+	 * - A photo page does not. Its blob carries the app context and nothing
+	 *   about the post; the page fetches the record for itself once it is up,
+	 *   and the hook keeps those responses in a JSON element of its own, since
+	 *   it lives in the other world and the DOM is what the two share.
+	 *
+	 * Answered synchronously, and once: everything here is a DOM read. The
+	 * archive page asks again every half second until the record is there,
+	 * because it arrives a beat after the page does — a photo page has to fetch
+	 * it — and because the answer to an early ask is the *previous* post on an
+	 * SPA navigation, whose blob is replaced late. So the id is checked, and a
+	 * mismatch is reported as what the page is showing instead, which the archive
+	 * page treats as not there yet. Waiting here instead, with the worker holding
+	 * the request open meanwhile, would work too; it is just a longer request to
+	 * a worker that can be stopped at any moment, for no gain.
+	 */
+	function itemDetail(id) {
+		const want = id ? String(id) : '';
+		let raw = scrapeBlobItem();
+		if (!raw || (want && String(raw.id) !== want)) {
+			const fetched = scrapeFetchedDetail(want);
+			if (fetched) raw = fetched;
+		}
+		if (!raw) return { ok: false, error: 'the page carried no post record' };
+		if (want && String(raw.id) !== want) {
+			return { ok: false, error: `the page was still showing ${raw.id}` };
+		}
+		const rec = normalize(raw);
+		return rec ? { ok: true, item: rec } : { ok: false, error: 'the page carried no post record' };
 	}
 
-	/**
-	 * The record for the post this page is showing, once it has one.
-	 *
-	 * Polled rather than awaited once: the archive page navigates this tab and
-	 * asks as soon as the load completes, and on an SPA navigation the blob is
-	 * replaced a beat after that — asking a single time reads the previous post,
-	 * which would quietly file one post's song under another's id. So the id is
-	 * checked, and a mismatch counts as not there yet.
-	 */
-	async function itemDetail(id, { timeout = 15000 } = {}) {
-		const deadline = Date.now() + timeout;
-		let last = null;
-		while (Date.now() < deadline) {
-			const raw = await requestDetail();
-			if (raw) {
-				last = String(raw.id || '');
-				if (!id || last === String(id)) {
-					const rec = normalize(raw);
-					if (rec) return { ok: true, item: rec };
-				}
+	function scrapeBlobItem() {
+		const el =
+			document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__') ||
+			document.getElementById('SIGI_STATE');
+		if (!el) return null;
+		try {
+			const data = JSON.parse(el.textContent);
+			const struct = (data.__DEFAULT_SCOPE__ || {})['webapp.video-detail']?.itemInfo?.itemStruct;
+			if (struct && struct.id) return struct;
+			for (const item of Object.values(data.ItemModule || {})) {
+				if (item && item.id) return item;
 			}
-			await nap(400);
+		} catch (_) {
+			/* not the page we thought it was */
 		}
-		return {
-			ok: false,
-			error: last ? `the page was still showing ${last}` : 'the page carried no post record',
-		};
+		return null;
+	}
+
+	/** The struct the hook published for this id, or the newest one if none. */
+	function scrapeFetchedDetail(want) {
+		const el = document.getElementById('__ttarchive_details__');
+		if (!el) return null;
+		try {
+			const all = JSON.parse(el.textContent || '{}');
+			if (want && all[want]) return all[want];
+			let newest = null;
+			for (const struct of Object.values(all)) newest = struct;
+			return newest;
+		} catch (_) {
+			return null;
+		}
 	}
 
 	/**
@@ -677,7 +700,7 @@
 		// One post, read off the page it is rendered on. Nothing to do with a
 		// harvest — the song pass drives this tab a post at a time instead.
 		if (msg.cmd === 'item-detail') {
-			itemDetail(msg.id).then(sendResponse);
+			sendResponse(itemDetail(msg.id));
 			return true;
 		}
 		// The archive page's downloads were refused. Adopt the longer pause of the

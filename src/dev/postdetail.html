@@ -106,7 +106,7 @@
 				const url = typeof input === 'string' ? input : input.url;
 				if (!url.startsWith('https://www.tiktok.com/api/')) return realFetch(input, init);
 				const body = url.includes('/item/detail/')
-					? { statusCode: 0, itemInfo: { itemStruct: struct('900') } }
+					? { statusCode: 0, itemInfo: { itemStruct: struct(new URL(url).searchParams.get('itemId')) } }
 					: { statusCode: 0, itemList: [struct('800')], hasMore: true, cursor: 'c1' };
 				return new Response(JSON.stringify(body), {
 					status: 200,
@@ -180,26 +180,20 @@
 			// ---- what the pass must not do ----------------------------------------
 			section('the post it was asked for, and no other');
 
-			// The archive page navigates the tab and asks as soon as the load
-			// completes; on an SPA navigation the blob is replaced a beat later. Ask
-			// once and you read the post before it — and file its song under this id.
+			// The archive page navigates the tab and asks as soon as the page
+			// answers pings; on an SPA navigation the blob is replaced a beat later.
+			// Accept the first answer and you read the post before it — and file its
+			// song under this id. The page answers with what it holds right now and
+			// the archive page asks again, so a stale blob has to be refused by name.
 			setBlob(universal(struct('200')));
 			{
-				const started = Date.now();
-				const pending = command({ cmd: 'item-detail', id: '201' });
-				await sleep(300);
+				const res = await command({ cmd: 'item-detail', id: '201' });
+				check('a stale blob is refused, not accepted', !res.ok, JSON.stringify(res));
+				check('naming what the page was showing instead', String(res.error).includes('200'), res.error);
 				setBlob(universal(struct('201')));
-				const res = await pending;
-				check('a stale blob is waited out, not accepted', res.ok, JSON.stringify(res));
-				same('and the record is the post that was asked for', res.item.id, '201');
-				check('which took the wait it needed', Date.now() - started >= 300);
-			}
-
-			setBlob(universal(struct('300')));
-			{
-				const res = await command({ cmd: 'item-detail', id: '301' });
-				check('a page that never catches up is a failure', !res.ok);
-				check('naming what it was showing instead', String(res.error).includes('300'), res.error);
+				const again = await command({ cmd: 'item-detail', id: '201' });
+				check('and the next ask gets the post once it is there', again.ok, JSON.stringify(again));
+				same('the one that was asked for', again.item.id, '201');
 			}
 
 			setBlob(null);
@@ -207,6 +201,72 @@
 				const res = await command({ cmd: 'item-detail', id: '400' });
 				check('so is a page with no record in it at all', !res.ok);
 				check('and says that rather than the wrong post', String(res.error).includes('no post record'), res.error);
+			}
+
+			// Every answer is immediate: the worker relaying the ask holds nothing
+			// open, and the waiting is the archive page's.
+			setBlob(universal(struct('410')));
+			{
+				const started = Date.now();
+				const res = await command({ cmd: 'item-detail', id: '411' });
+				check('an answer never waits', Date.now() - started < 200, `${Date.now() - started}ms`);
+				check('and a miss still names the post shown', !res.ok && String(res.error).includes('410'), res.error);
+			}
+
+			// ---- a photo page fetches its record instead --------------------------
+			section('a photo page carries its record in a fetch, not the blob');
+
+			// A photo page's blob holds the app context and nothing about the post;
+			// the page then fetches /api/item/detail/ for itself. That response is
+			// the same item struct, and it is the only place a photo post's song is.
+			setBlob({ __DEFAULT_SCOPE__: { 'webapp.app-context': {} } });
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=500');
+			await sleep(50); // the capture lands a beat after the response
+			{
+				const res = await command({ cmd: 'item-detail', id: '500' });
+				check('the fetched record is read', res.ok, JSON.stringify(res));
+				same('as the post that was asked for', res.item.id, '500');
+				same('with its song', res.item.audio, ['https://cdn/500.mp3']);
+			}
+
+			// The fetch lands after the first ask, the way it does on a real load: the
+			// content script answers pings from document_start, the record follows.
+			{
+				const early = await command({ cmd: 'item-detail', id: '510' });
+				check('before it lands the page says it is not there yet', !early.ok && String(early.error).includes('500'), JSON.stringify(early));
+				await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=510');
+				await sleep(50);
+				const res = await command({ cmd: 'item-detail', id: '510' });
+				check('and the next ask gets it', res.ok, JSON.stringify(res));
+				same('the right one', res.item.id, '510');
+			}
+
+			// A post page also fetches details for the posts it recommends alongside.
+			// Those arriving after ours must not hide it.
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=520');
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=521');
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=522');
+			await sleep(50); // the capture lands a beat after the response
+			{
+				const res = await command({ cmd: 'item-detail', id: '520' });
+				check('a later fetch for another post does not hide it', res.ok, JSON.stringify(res));
+				same('the record is still the one asked for', res.item.id, '520');
+			}
+
+			// On an SPA navigation from a video the blob stays the video's. The photo
+			// asked for is in the fetch; the blob's post must not be handed over.
+			setBlob(universal(struct('530', { video: true })));
+			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=531');
+			await sleep(50); // the capture lands a beat after the response
+			{
+				const res = await command({ cmd: 'item-detail', id: '531' });
+				check('the fetched post wins over a blob for a different one', res.ok, JSON.stringify(res));
+				same('and it is the one asked for', res.item.id, '531');
+				same('as a photo post', res.item.type, 'photo');
+			}
+			{
+				const res = await command({ cmd: 'item-detail', id: '530' });
+				same('while the blob still answers for its own post', res.ok && res.item.id, '530');
 			}
 
 			// ---- a post is not a page of the list ----------------------------------

@@ -106,7 +106,13 @@ function ask(cmd, extra = {}) {
 	return new Promise((resolve) => {
 		waiting.set(id, resolve);
 
-		const message = { id, cmd, ...extra };
+		// The envelope goes last so nothing in `extra` can take its place. A
+		// request that carried the post under `id` overwrote its own request id
+		// with it; the worker answered at once, its reply named the post instead
+		// of the request, nothing here was waiting under that key, and the ask
+		// hung until the idle worker was stopped half a minute later — reported,
+		// truthfully but uselessly, as a worker restart.
+		const message = { ...extra, id, cmd };
 		let err = post(message);
 		// One retry on a fresh port: the disconnect may not have been delivered
 		// yet, in which case the port looks alive right up until it is posted to.
@@ -830,6 +836,87 @@ function postUrl(item) {
 	return `https://www.tiktok.com/@${uniqueId}/${item.type === 'photo' ? 'photo' : 'video'}/${item.id}`;
 }
 
+/** How long a navigated tab is given to arrive at the post. */
+const POST_ARRIVE_MS = 30000;
+/** And, once there, how long the record is given to turn up on it. */
+const POST_RECORD_MS = 15000;
+/** Posts whose step timings are logged, so a slow pass says where the time goes. */
+const POST_TIMINGS_LOGGED = 3;
+
+/**
+ * Open one post in the sync tab and hand back the record it was rendered from.
+ *
+ * Driven from here in short steps rather than handed to the worker as one
+ * request. Chromium stops the extension worker on its own schedule, and a
+ * request still in flight when it does is lost: the port drops, and everything
+ * waiting on it fails as "restarted mid-request". So every ask here is one the
+ * worker answers at once — point the tab somewhere, ping it, read what the page
+ * holds right now — and the waiting between asks happens on this page, whose
+ * timers are its own. A worker restart between steps costs nothing; the next
+ * ask reconnects.
+ *
+ * (The first version was one request to the worker, and every post in a pass
+ * failed as a worker restart. So did this one, until the cause turned out to
+ * be in `ask` — see the note on the envelope there — rather than anything the
+ * worker was made to wait for. The shape stayed because it is the right one.)
+ *
+ * "Arrived at the post" is judged by the href the content script reports, not
+ * by the tab reporting `complete`: the script runs at document_start and
+ * answers as soon as the navigation has committed, while a post page holds its
+ * load event back for a long while prefetching the posts it recommends. The old
+ * page's script answers pings too, right up until it is torn down, which is why
+ * the href is checked at all. A deleted post redirects, and is reported with
+ * where the tab ended up.
+ */
+async function readPostPage(url, id) {
+	const failed = (what, res) => ({ ok: false, error: `${what}: ${res.error || 'no answer'}` });
+	const t0 = Date.now();
+	const since = () => `${((Date.now() - t0) / 1000).toFixed(1)}s`;
+	const timings = [];
+
+	const went = await ask('navigate-tab', { tabId: app.tabId, url });
+	if (!went.ok) return failed('opening the page', went);
+	timings.push(`navigated at ${since()}`);
+
+	const onPost = (href) => (href || '').split(/[?#]/)[0].endsWith(`/${id}`);
+	let lastHref = null;
+	let arrived = false;
+	const deadline = Date.now() + POST_ARRIVE_MS;
+	while (Date.now() < deadline && !app.songs.stop) {
+		await pause(500);
+		const ping = await ask('ping-tab', { tabId: app.tabId });
+		if (!ping.ok) continue;
+		if (onPost(ping.href)) {
+			arrived = true;
+			break;
+		}
+		lastHref = ping.href;
+	}
+	if (!arrived) {
+		return {
+			ok: false,
+			error: lastHref
+				? `the tab never arrived at the post (it is on ${lastHref})`
+				: 'the content script never came back after the navigation',
+		};
+	}
+	timings.push(`arrived at ${since()}`);
+
+	// The record follows the page by a beat — a photo page has to fetch it — so
+	// the page is asked again every half second until it has it.
+	let last = { ok: false, error: 'not asked' };
+	const recordBy = Date.now() + POST_RECORD_MS;
+	while (!app.songs.stop) {
+		last = await ask('detail-tab', { tabId: app.tabId, postId: id });
+		if (last.ok) break;
+		if (Date.now() >= recordBy) break;
+		await pause(500);
+	}
+	timings.push(`${last.ok ? 'record' : 'gave up'} at ${since()}`);
+	if (app.seen <= POST_TIMINGS_LOGGED) log(`· ${id}: ${timings.join(', ')}`);
+	return last.ok ? last : failed('reading the record', last);
+}
+
 async function fetchMissingSongs() {
 	if (!app.state) {
 		log('Pick a folder first.', 'err');
@@ -863,7 +950,8 @@ async function fetchMissingSongs() {
 	setSyncButtons(true);
 	log(
 		`${todo.length.toLocaleString()} photo post(s) have their pictures but no song. Opening each one ` +
-			'to read the track off its own page — this takes a page load apiece, so it is slow.'
+			'to read the track off its own page — this takes a page load apiece, so it is slow. ' +
+			`(extension ${ext.runtime.getManifest().version})`
 	);
 
 	app.queue = makeQueue({ onHalt: () => (app.songs.stop = true) });
@@ -888,7 +976,7 @@ async function fetchMissingSongs() {
 		}
 
 		app.seen++;
-		const got = await ask('post-detail', { tabId: app.tabId, url, id: item.id });
+		const got = await readPostPage(url, item.id);
 		if (!got.ok) {
 			// Never `unavailable`: the pictures are archived and this is one optional
 			// extra. A post that has been deleted since simply has no page to read.

@@ -141,6 +141,18 @@ async function handleArchiveMessage(msg, port) {
 		return;
 	}
 
+	// Chromium stops this worker after thirty seconds without an extension API
+	// call or event, in-flight request or not, and the port dies with it. Most
+	// of what is below finishes well inside that; ensure-profile need not — a
+	// profile reload can sit between tab events for longer, with the archive
+	// page still waiting on the reply. Any API call resets the clock, so one is
+	// made every so often for as long as a request is being handled.
+	const heartbeat = setInterval(() => {
+		try {
+			ext.runtime.getPlatformInfo();
+		} catch (_) {}
+	}, 20000);
+
 	try {
 		switch (msg.cmd) {
 			case 'find-tiktok-tab':
@@ -160,8 +172,10 @@ async function handleArchiveMessage(msg, port) {
 			case 'throttle':
 				reply(await sendToTab(msg.tabId, { cmd: 'throttle', payload: msg.payload }));
 				break;
-			case 'post-detail':
-				reply(await postDetail(msg.tabId, msg.url, msg.id));
+			// The song pass's inner step, driven from the archive page in short asks
+			// — see readPostPage there for why it is not one request here.
+			case 'detail-tab':
+				reply(await sendToTab(msg.tabId, { cmd: 'item-detail', id: msg.postId }));
 				break;
 			case 'navigate-tab':
 				reply(await navigateTab(msg.tabId, msg.url));
@@ -178,6 +192,8 @@ async function handleArchiveMessage(msg, port) {
 		}
 	} catch (err) {
 		reply({ ok: false, error: String((err && err.message) || err) });
+	} finally {
+		clearInterval(heartbeat);
 	}
 }
 
@@ -307,31 +323,6 @@ async function navigateTab(tabId, url) {
 		return { ok: false, error: 'the TikTok tab has been closed' };
 	}
 	return { ok: true };
-}
-
-/**
- * Open one post in the sync tab and hand back the record it was rendered from.
- *
- * The song pass's inner step, kept here rather than on the archive page because
- * every part of it is a tabs call: navigate, wait for the load, then ask the
- * content script what the page is holding. The tab stays in the background
- * throughout — a post page renders its state blob whether or not anyone is
- * looking at it.
- */
-async function postDetail(tabId, url, id) {
-	const went = await navigateTab(tabId, url);
-	if (!went.ok) return went;
-	await waitForLoading(tabId);
-	await waitForComplete(tabId);
-
-	// The content script is torn down and rebuilt by the navigation, and answers
-	// nothing in between. Same wait as ensureProfileTab, and for the same reason.
-	for (let i = 0; i < 20; i++) {
-		const ping = await sendToTab(tabId, { cmd: 'ping' });
-		if (ping.ok) return sendToTab(tabId, { cmd: 'item-detail', id });
-		await new Promise((r) => setTimeout(r, 500));
-	}
-	return { ok: false, error: 'the content script never came back after the navigation' };
 }
 
 /**
