@@ -295,6 +295,13 @@ async function ensureProfileTab(uniqueId, { background = false } = {}) {
 		tab = await ext.tabs.create({ url: target, active: !background });
 	} else if (!reusedInPlace) {
 		tab = await ext.tabs.update(tab.id, { url: target, active: !background });
+		// Same reason the reload below waits: `waitForComplete` would otherwise
+		// return on the `complete` the tab is still reporting for the page we just
+		// told it to leave. That is not a cosmetic race — the ping that follows is
+		// then answered by the outgoing page's content script, which reports ready
+		// and is destroyed a moment later, so the harvest is started on a page that
+		// no longer exists and the run collects nothing.
+		await waitForLoading(tab.id);
 	} else {
 		if (!background) await ext.tabs.update(tab.id, { active: true });
 		// A tab left behind by an earlier sync is still holding that run's cursor
