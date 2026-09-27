@@ -521,6 +521,11 @@ function onContentMessage(type, payload) {
 		return;
 	}
 
+	// Every TikTok tab in the browser runs the collector, and the background fans
+	// all of them out to here. Only the one this run opened is the sync; a list
+	// arriving from any other is whatever you happened to be browsing meanwhile.
+	if ((type === 'status' || type === 'items') && payload.tabId !== app.tabId) return;
+
 	if (type === 'status') {
 		log(payload.msg, payload.fatal ? 'err' : '');
 		if (payload.fatal || payload.done) finishSync(payload.fatal ? 'error' : 'complete');
@@ -529,6 +534,11 @@ function onContentMessage(type, payload) {
 
 	if (type === 'pagestate' && payload.profileUser) {
 		if (!app.state) return;
+		// Any profile page in any tab reports itself, and the username box is
+		// prefilled from this record when the folder is next opened. Taken from
+		// whoever you last looked at, the next sync would be of their likes.
+		const want = $('username').value.trim().replace(/^@/, '').toLowerCase();
+		if (!want || (payload.profileUser.uniqueId || '').toLowerCase() !== want) return;
 		app.state.user = { ...(app.state.user || {}), ...payload.profileUser };
 		return;
 	}

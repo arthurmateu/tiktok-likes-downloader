@@ -22,6 +22,8 @@
 		profileUser: null,
 		me: null,
 		harvesting: false,
+		/** The item_list endpoint the current harvest is reading; null between runs. */
+		endpoint: null,
 		abort: false,
 		focusBorrowed: false,
 		lastCapture: null,
@@ -189,6 +191,15 @@
 			// would also be counted as seen and reported as list output, which puts
 			// a post nobody scrolled past into this run's like order.
 			if (p.endpoint === 'detail') return;
+			// Nor is any list but the one being harvested. The hook reads every
+			// item_list the page loads, and a TikTok page loads more than one: a
+			// profile's Videos grid, the creator shelf beside a post, somebody's
+			// bookmarks. Reported as items, each of those is a like — which is how one
+			// creator's profile, 48 posts in her own grid order, came to sit in an
+			// archive's like order after it was scrolled while a sync ran. Adopted
+			// as `lastCapture`, it is worse: its cursor would seed the paging of a
+			// different list.
+			if (!state.harvesting || p.endpoint !== state.endpoint) return;
 			state.lastCapture = { at: Date.now(), ...p };
 			const items = [];
 			for (const raw of p.itemList || []) {
@@ -593,6 +604,7 @@
 	async function harvest({ which = 'likes', mode = 'auto', maxIdleRounds = 6 } = {}) {
 		if (state.harvesting) return;
 		state.harvesting = true;
+		state.endpoint = ENDPOINT[which] || null;
 		state.abort = false;
 
 		// Every run reports the whole list, not just what this page hasn't sent
@@ -667,6 +679,7 @@
 			await harvestByScrolling({ maxIdleRounds });
 		} finally {
 			state.harvesting = false;
+			state.endpoint = null;
 			returnFocus();
 		}
 	}

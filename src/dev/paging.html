@@ -74,9 +74,23 @@
 				}));
 			}
 
+			/**
+			 * Somebody's Videos grid, which the same hook reads as readily as the
+			 * likes: any profile page asks for it, and so does the creator shelf
+			 * beside a post. One page, and always answered.
+			 */
+			const POSTS_API = 'https://www.tiktok.com/api/post/item_list/';
+
 			const realFetch = window.fetch.bind(window);
 			window.fetch = async (input, init) => {
 				const url = typeof input === 'string' ? input : input.url;
+				if (url.startsWith(POSTS_API)) {
+					const itemList = itemsFor('post');
+					return new Response(JSON.stringify({ statusCode: 0, itemList, hasMore: false, cursor: '0' }), {
+						status: 200,
+						headers: { 'content-type': 'application/json' },
+					});
+				}
 				if (!url.startsWith(API)) return realFetch(input, init);
 
 				const fromPage = server.expectPage;
@@ -117,10 +131,14 @@
 
 			// ---- the page's own requests ---------------------------------------
 			// TikTok's code, in miniature: one request when the Liked tab is opened,
-			// one more per scroll to the bottom.
-			const page = { cursor: '0', requests: 0 };
+			// one more per scroll to the bottom. `browsing` has somebody's profile
+			// grid load alongside each one, as it does when the tab is being used.
+			const page = { cursor: '0', requests: 0, browsing: false };
+
+			const loadProfileGrid = () => window.fetch(`${POSTS_API}?count=3&cursor=0&secUid=someone-else`);
 
 			async function pageRequest() {
+				if (page.browsing) await loadProfileGrid();
 				page.requests++;
 				const url = `${API}?count=3&cursor=${page.cursor}&msToken=stale&X-Bogus=seed`;
 				server.expectPage = true;
@@ -249,6 +267,7 @@
 				messages.length = 0;
 				page.cursor = '0';
 				page.requests = 0;
+				page.browsing = false;
 				scrolls.count = 0;
 				document.getElementById('grid').replaceChildren();
 			}
@@ -295,6 +314,29 @@
 			reset('ok');
 			await run({ which: 'likes' });
 			check('a repeat run reports the whole list again, not just changes', collected().size, 9);
+
+			// ---- another list on the page is not the likes -------------------------
+			// The hook reads every item_list the page loads. Somebody's profile grid,
+			// scrolled while a sync ran, used to arrive at the archive as a block of
+			// likes — 48 of them, in that creator's own post order.
+			const LIKES = new Set(['0-a', '0-b', '0-c', 'c1-a', 'c1-b', 'c1-c', 'c2-a', 'c2-b', 'c2-c']);
+
+			reset('ok');
+			await loadProfileGrid();
+			await new Promise((r) => setTimeout(r, 100));
+			check('a profile grid loaded between runs reports nothing', messages.filter((m) => m.type === 'items').length, 0);
+
+			reset('ok');
+			page.browsing = true;
+			const browsedRun = await run({ which: 'likes' });
+			check('a run with a profile grid loading beside it still finishes', browsedRun.done, true);
+			check('and reports the likes and only the likes', collected(), LIKES);
+
+			reset('reject');
+			page.browsing = true;
+			const browsedScroll = await run({ which: 'likes' });
+			check('so does the scroll fallback, which sees the grid on every scroll', browsedScroll.done, true);
+			check('with the same list', collected(), LIKES);
 
 			// ---- a captcha stops the run, it does not reroute it -------------------
 			// The distinction this checks is the whole point: a *signature* refusal

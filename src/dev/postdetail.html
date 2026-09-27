@@ -277,19 +277,33 @@
 			// cursor and no hasMore, so adopting it as `lastCapture` ends the harvest
 			// on the spot — and its item would be counted as seen and reported as list
 			// output, putting a post nobody scrolled past into this run's like order.
+			//
+			// So both are asked for with a harvest running and waiting on its first
+			// page. Outside one, nothing the page loads is reported at all — that has
+			// its own tests in paging.html — and the control below would prove nothing.
+			const likedTab = document.createElement('button');
+			likedTab.dataset.e2e = 'liked-tab';
+			likedTab.hidden = true;
+			document.body.appendChild(likedTab);
 			messages.length = 0;
+			command({ cmd: 'harvest', opts: { which: 'likes', mode: 'paging' } });
+			await sleep(200);
+
 			await window.fetch('https://www.tiktok.com/api/item/detail/?itemId=900');
 			await sleep(200);
 			same('nothing is reported to the archive page', messages.filter((m) => m.type === 'items').length, 0);
+			same('and the harvest is still waiting for its list', (await command({ cmd: 'ping' })).harvesting, true);
 
-			messages.length = 0;
 			await window.fetch('https://www.tiktok.com/api/favorite/item_list/?cursor=0');
 			await sleep(200);
 			{
-				const items = messages.filter((m) => m.type === 'items');
+				// Only the ones with something in them: the harvest goes on to page from
+				// here, and a replay of this stub's one-item page is all repeats.
+				const items = messages.filter((m) => m.type === 'items' && m.payload.items.length);
 				same('while a page of the list still is', items.length, 1);
-				same('carrying the item it held', items[0].payload.items[0].id, '800');
+				same('carrying the item it held', items[0]?.payload.items[0].id, '800');
 			}
+			await command({ cmd: 'stop' });
 
 			lines.push(
 				'',

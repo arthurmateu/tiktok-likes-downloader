@@ -159,6 +159,8 @@ From there a sync pages the list one of two ways:
 
 Both feed the same normalizer, so nothing downstream knows which one ran. A run that falls back partway just re-walks the list from the top; already-downloaded items are skipped on disk.
 
+The hook sees every item list a TikTok page loads, not just the likes: a profile's Videos grid, the creator shelf beside a post. So a harvest only reports responses from the endpoint it is reading (`favorite` for likes), and the archive page only accepts them from the tab it opened for the sync. Before both checks existed, scrolling a creator's profile during a sync put their whole grid into the archive as likes: 48 posts in one run, downloaded and slotted into the like order in the creator's own post order.
+
 ### Where a sync stops
 
 The list is newest-first, so everything liked since the last sync is above everything already archived. **Sync likes** reads down it until it has passed 32 items in a row that an earlier run had already finished with — a page or two — and stops there. A daily sync is then two or three requests instead of two hundred, which is worth more than the time it saves: [every request is attributable to the account](#being-refused), and the cheapest way not to be rate-limited is not to ask.
