@@ -1,0 +1,255 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>tab ready tests</title>
+		<!--
+			Drives src/background.js — the shipped file, imported as-is — against a
+			fake tabs API, to pin down the one question a sync asks before anything
+			else: is the TikTok tab ready, and is the page that says so the one that
+			will still be there?
+
+			A tab told to reload keeps its old page, answering pings, until the new
+			one commits. A page that has sat in a background tab for days can take
+			seconds to let go, and a sync that asked during those seconds started its
+			harvest on the outgoing page and never heard another word. The fake tab
+			here lets go as slowly as it is told to, so that is reproduced on demand
+			rather than after leaving a browser open for a week.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/tabready.html. Takes ten seconds or so,
+			most of it the slow tabs being slow. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 16px 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+		</style>
+	</head>
+	<body>
+		<pre id="out">running…</pre>
+
+		<script>
+			// ------------------------------------------------------- a fake browser
+			//
+			// Pages are only what the worker can see of them: an id, whether a harvest
+			// is running in them, and that they answer messages for as long as they
+			// are the tab's page. Every page announces itself as it commits, the way
+			// the collector does at document_start.
+
+			const listeners = { connect: [], message: [], updated: new Set() };
+			const tabs = new Map();
+			let nextTab = 1;
+			let nextPage = 1;
+			/** How the next navigation behaves; set per case. */
+			let timing = { letGoMs: 0, commitMs: 100, loadMs: 300 };
+
+			const snapshot = (t) => ({ id: t.id, url: t.url, status: t.status, windowId: 1, active: false });
+
+			function newPage(tab) {
+				tab.page = { instance: `page-${nextPage++}`, harvesting: false };
+				for (const l of listeners.message) {
+					l({ type: 'collector-ready', payload: { href: tab.url, instance: tab.page.instance } }, { tab: snapshot(tab) }, () => {});
+				}
+			}
+
+			function setStatus(tab, status) {
+				tab.status = status;
+				for (const l of [...listeners.updated]) l(tab.id, { status }, snapshot(tab));
+			}
+
+			/** The old page lingers for `letGoMs`, then the new one commits and loads. */
+			function navigate(tab, url) {
+				const { letGoMs, commitMs, loadMs } = timing;
+				tab.navigating++;
+				setTimeout(() => {
+					tab.page = null;
+					setStatus(tab, 'loading');
+					setTimeout(() => {
+						tab.url = url;
+						newPage(tab);
+						setTimeout(() => {
+							setStatus(tab, 'complete');
+							tab.navigating--;
+						}, loadMs);
+					}, commitMs);
+				}, letGoMs);
+			}
+
+			function openTab(url) {
+				const tab = { id: nextTab++, url, status: 'complete', page: null, navigating: 0 };
+				tabs.set(tab.id, tab);
+				newPage(tab);
+				return tab;
+			}
+
+			function answer(page, msg) {
+				if (msg.cmd === 'ping') return { ok: true, instance: page.instance, harvesting: page.harvesting };
+				if (msg.cmd === 'harvest') {
+					page.harvesting = true;
+					return { ok: true };
+				}
+				return { ok: false, error: `fake page has no ${msg.cmd}` };
+			}
+
+			window.chrome = {
+				runtime: {
+					getURL: (p) => p,
+					getPlatformInfo: () => Promise.resolve({}),
+					onConnect: { addListener: (l) => listeners.connect.push(l) },
+					onMessage: { addListener: (l) => listeners.message.push(l) },
+					onInstalled: { addListener: () => {} },
+				},
+				storage: { local: { get: () => Promise.resolve({}), set: () => Promise.resolve() } },
+				windows: { update: () => Promise.resolve() },
+				tabs: {
+					query: async () => [...tabs.values()].map(snapshot),
+					get: async (id) => {
+						if (!tabs.has(id)) throw new Error(`No tab with id: ${id}`);
+						return snapshot(tabs.get(id));
+					},
+					// A page quick enough to commit before `create` has even returned —
+					// the worker has to be listening before it asks, not after.
+					create: async ({ url }) => {
+						const tab = { id: nextTab++, url, status: 'loading', page: null, navigating: 0 };
+						tabs.set(tab.id, tab);
+						newPage(tab);
+						setTimeout(() => setStatus(tab, 'complete'), timing.loadMs);
+						return snapshot(tab);
+					},
+					update: async (id, { url }) => {
+						const tab = tabs.get(id);
+						if (url) navigate(tab, url);
+						return snapshot(tab);
+					},
+					reload: async (id) => navigate(tabs.get(id), tabs.get(id).url),
+					sendMessage: async (id, msg) => {
+						const tab = tabs.get(id);
+						if (!tab || !tab.page) throw new Error('Could not establish connection. Receiving end does not exist.');
+						return answer(tab.page, msg);
+					},
+					onUpdated: {
+						addListener: (l) => listeners.updated.add(l),
+						removeListener: (l) => listeners.updated.delete(l),
+					},
+				},
+			};
+		</script>
+
+		<script type="module">
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+					(ok || !detail ? '' : `\n        ${detail}`));
+				out.innerHTML = lines.join('\n');
+			}
+			const heading = (text) => {
+				lines.push('', text);
+				out.innerHTML = lines.join('\n');
+			};
+
+			await import('../background.js');
+
+			// The archive page's end of the port, as archive.js holds it.
+			const port = {
+				name: 'archive',
+				heard: [],
+				onMessage: { addListener: (l) => port.heard.push(l) },
+				onDisconnect: { addListener: () => {} },
+				postMessage: (m) => {
+					if (m.type !== 'reply') return;
+					const resolve = waiting.get(m.id);
+					waiting.delete(m.id);
+					resolve?.(m.payload);
+				},
+			};
+			const waiting = new Map();
+			let rid = 0;
+			const ask = (cmd, extra = {}) =>
+				new Promise((resolve) => {
+					const id = ++rid;
+					waiting.set(id, resolve);
+					for (const l of port.heard) l({ ...extra, id, cmd });
+				});
+			for (const l of listeners.connect) l(port);
+
+			/**
+			 * What startSync does: get the tab ready, then start the harvest in it.
+			 * Returns once the tab has settled, so a harvest started on a page that
+			 * was on its way out has had the chance to go with it.
+			 */
+			async function sync() {
+				const res = await ask('ensure-profile', { uniqueId: 'me', background: true });
+				const started = res.ok ? await ask('start-harvest', { tabId: res.tabId, opts: { which: 'likes' } }) : null;
+				const tab = tabs.get(res.tabId);
+				while (tab?.navigating) await new Promise((r) => setTimeout(r, 100));
+				return { res, started, tab };
+			}
+
+			const PROFILE = 'https://www.tiktok.com/@me';
+
+			heading('a profile tab left open for days, five seconds letting go of its page');
+			{
+				tabs.clear();
+				const tab = openTab(PROFILE);
+				const old = tab.page.instance;
+				timing = { letGoMs: 5000, commitMs: 100, loadMs: 300 };
+				const { res, started } = await sync();
+				check('the tab is reported ready', res.ok, res.error);
+				check('by the page that replaced the old one', res.ping?.instance === tab.page?.instance && res.ping?.instance !== old,
+					`answered by ${res.ping?.instance}; the old page was ${old}, the tab now holds ${tab.page?.instance}`);
+				check('the harvest is asked of that page', !!started?.ok, started?.error);
+				check('and is running in the page the tab still has', !!tab.page?.harvesting,
+					'the harvest went to a page that is no longer there');
+			}
+
+			heading('a tab the song pass left on a post, just as slow to let go');
+			{
+				tabs.clear();
+				const tab = openTab(`${PROFILE}/photo/7000000000000000001`);
+				const old = tab.page.instance;
+				timing = { letGoMs: 5000, commitMs: 100, loadMs: 300 };
+				const { res } = await sync();
+				check('the tab is reported ready', res.ok, res.error);
+				check('it is on the profile, not the post', tab.url === PROFILE, tab.url);
+				check('and it is the new page answering', res.ping?.instance === tab.page?.instance && res.ping?.instance !== old,
+					`answered by ${res.ping?.instance}; the old page was ${old}`);
+				check('which is where the harvest runs', !!tab.page?.harvesting);
+			}
+
+			heading('a tab that lets go at once');
+			{
+				tabs.clear();
+				const tab = openTab(PROFILE);
+				timing = { letGoMs: 30, commitMs: 50, loadMs: 100 };
+				const t0 = performance.now();
+				const { res } = await sync();
+				check('is ready', res.ok, res.error);
+				check('without waiting on anything that is not coming', performance.now() - t0 < 3000,
+					`took ${Math.round(performance.now() - t0)}ms`);
+				check('and runs the harvest', !!tab.page?.harvesting);
+			}
+
+			heading('no TikTok tab at all, and a new one whose page is up before create returns');
+			{
+				tabs.clear();
+				timing = { letGoMs: 0, commitMs: 0, loadMs: 200 };
+				const { res, tab } = await sync();
+				check('a tab is opened and reported ready', res.ok, res.error);
+				check('the harvest runs in it', !!tab?.page?.harvesting);
+			}
+
+			lines.push('', failures
+				? `<span class="fail">${failures} of ${checks} failing</span>`
+				: `<span class="pass">all ${checks} passing</span>`);
+			out.innerHTML = lines.join('\n');
+		</script>
+	</body>
+</html>

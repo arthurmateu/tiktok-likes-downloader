@@ -17,6 +17,14 @@
 	// See src/lib/ext.js — Gecko only returns promises from `browser.*`.
 	const ext = globalThis.browser ?? globalThis.chrome;
 
+	/**
+	 * Which page this script belongs to. A tab told to reload keeps answering
+	 * from the page it is leaving until the new one commits, and from outside
+	 * the two are the same tab on the same URL — this is how the worker tells
+	 * them apart. See ensureProfileTab in src/background.js.
+	 */
+	const instance = crypto.randomUUID();
+
 	const state = {
 		hooked: false,
 		profileUser: null,
@@ -691,6 +699,7 @@
 		if (msg.cmd === 'ping') {
 			sendResponse({
 				ok: true,
+				instance,
 				hooked: state.hooked,
 				href: location.href,
 				profileUser: state.profileUser,
@@ -733,5 +742,5 @@
 		}
 	});
 
-	toBackground('collector-ready', { href: location.href });
+	toBackground('collector-ready', { href: location.href, instance });
 })();

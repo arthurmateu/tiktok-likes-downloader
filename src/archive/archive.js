@@ -49,6 +49,8 @@ const app = {
 	settled: 0,
 	/** The song pass, which runs instead of a sync rather than alongside one. */
 	songs: { running: false, stop: false, uniqueId: '' },
+	/** Counts syncs, so anything still waiting on an earlier one can tell it is over. */
+	run: 0,
 };
 
 // ---------------------------------------------------------------- background
@@ -101,7 +103,7 @@ function channel() {
 	return port;
 }
 
-function ask(cmd, extra = {}) {
+function ask(cmd, extra = {}, { timeout = 60000 } = {}) {
 	const id = ++msgId;
 	return new Promise((resolve) => {
 		waiting.set(id, resolve);
@@ -131,7 +133,7 @@ function ask(cmd, extra = {}) {
 				waiting.delete(id);
 				resolve({ ok: false, error: 'timed out' });
 			}
-		}, 60000);
+		}, timeout);
 	});
 }
 
@@ -650,6 +652,7 @@ async function startSync({ full = false } = {}) {
 		return;
 	}
 
+	const run = ++app.run;
 	app.syncing = true;
 	app.seen = 0;
 	app.newItems = 0;
@@ -677,7 +680,10 @@ async function startSync({ full = false } = {}) {
 	app.queue = makeQueue({ onHalt: () => finishSync('error') });
 
 	log(`Opening https://www.tiktok.com/@${uniqueId} in the background…`);
-	const res = await ask('ensure-profile', { uniqueId, background: true });
+	const res = await ask('ensure-profile', { uniqueId, background: true }, { timeout: PREPARE_TAB_MS });
+	// Stopped while the tab was being got ready. Starting the harvest anyway would
+	// leave it paging a list nobody is listening to any more.
+	if (app.run !== run || !app.syncing) return;
 	if (!res.ok) {
 		log(`Could not prepare the TikTok tab: ${res.error || 'unknown error'}`, 'err');
 		finishSync('error');
@@ -685,7 +691,63 @@ async function startSync({ full = false } = {}) {
 	}
 	app.tabId = res.tabId;
 	log('Tab ready. Leave it open — it does not need to be in front unless the log says so.');
-	await ask('start-harvest', { tabId: app.tabId, opts: { which: 'likes', mode: 'auto' } });
+	const started = await ask('start-harvest', { tabId: app.tabId, opts: { which: 'likes', mode: 'auto' } });
+	if (app.run !== run || !app.syncing) return;
+	if (!started.ok) {
+		log(`The TikTok tab would not start reading the list: ${started.error || 'no answer'}`, 'err');
+		finishSync('error');
+		return;
+	}
+	watchHarvest(run);
+}
+
+/**
+ * How long the worker is given to get the tab onto the profile — longer than an
+ * ordinary ask, because it waits for the old page to make way and then for the
+ * new one to load, up to half a minute apiece. See ensureProfileTab.
+ */
+const PREPARE_TAB_MS = 120000;
+
+/** How often a running sync checks that its tab is still reading the list. */
+const HARVEST_CHECK_MS = 15000;
+
+/**
+ * The harvest lives in the TikTok tab's page and goes when the page does —
+ * reloaded, navigated away from, closed — taking with it the collector that
+ * would have said so. Nothing else on this page would ever notice: the run sat
+ * there greyed out, waiting on a list that was no longer being read. So the
+ * tab is asked every so often whether it is still at it, and the run ends out
+ * loud once it twice running is not.
+ *
+ * Twice, because a harvest that has just finished stops saying it is harvesting
+ * a moment before the message saying it finished gets here.
+ */
+async function watchHarvest(run) {
+	const current = () => app.run === run && app.syncing;
+	let misses = 0;
+	while (current()) {
+		await new Promise((r) => setTimeout(r, HARVEST_CHECK_MS));
+		if (!current()) return;
+		const ping = await ask('ping-tab', { tabId: app.tabId });
+		if (!current()) return;
+		if (ping.ok && ping.harvesting) {
+			misses = 0;
+			continue;
+		}
+		if (++misses < 2) continue;
+		log(
+			ping.ok
+				? 'The TikTok tab stopped reading the list without saying why — most likely its page was reloaded ' +
+						'or navigated away mid-run. Press Sync to start again; nothing already saved is lost.'
+				: `The TikTok tab stopped answering (${ping.error || 'no answer'}). Press Sync to start again.`,
+			'err'
+		);
+		// In case a tab that stopped answering comes back and carries on: it would
+		// be paging a list nobody is listening to any more.
+		ask('stop-harvest', { tabId: app.tabId });
+		finishSync('error');
+		return;
+	}
 }
 
 /** How the log describes a run that has just ended. */
@@ -966,7 +1028,7 @@ async function fetchMissingSongs() {
 
 	app.queue = makeQueue({ onHalt: () => (app.songs.stop = true) });
 
-	const res = await ask('ensure-profile', { uniqueId, background: true });
+	const res = await ask('ensure-profile', { uniqueId, background: true }, { timeout: PREPARE_TAB_MS });
 	if (!res.ok) {
 		log(`Could not prepare the TikTok tab: ${res.error || 'unknown error'}`, 'err');
 		await finishSongs({ found: 0, noLink: 0 });

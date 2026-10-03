@@ -70,6 +70,12 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 		return true;
 	}
 
+	// Still fanned out below like any other, but a tab being got ready for a sync
+	// may be waiting on exactly this — see ensureProfileTab.
+	if (msg.type === 'collector-ready' && sender.tab) {
+		for (const arrived of arrivalWatches) arrived(sender.tab.id, msg.payload && msg.payload.instance);
+	}
+
 	if (sender.tab) {
 		broadcast(msg.type, { ...msg.payload, tabId: sender.tab.id });
 	}
@@ -291,35 +297,99 @@ async function ensureProfileTab(uniqueId, { background = false } = {}) {
 	let tab = background ? onProfile || tabs.find((t) => (t.url || '').startsWith(target)) : onProfile || tabs[0];
 	const reusedInPlace = !!tab && isProfile(tab.url);
 
-	if (!tab) {
-		tab = await ext.tabs.create({ url: target, active: !background });
-	} else if (!reusedInPlace) {
-		tab = await ext.tabs.update(tab.id, { url: target, active: !background });
-		// Same reason the reload below waits: `waitForComplete` would otherwise
-		// return on the `complete` the tab is still reporting for the page we just
-		// told it to leave. That is not a cosmetic race — the ping that follows is
-		// then answered by the outgoing page's content script, which reports ready
-		// and is destroyed a moment later, so the harvest is started on a page that
-		// no longer exists and the run collects nothing.
-		await waitForLoading(tab.id);
-	} else {
-		if (!background) await ext.tabs.update(tab.id, { active: true });
-		// A tab left behind by an earlier sync is still holding that run's cursor
-		// and its set of already-seen ids. Both are wrong now: paging would resume
-		// from the end of the last run, and anything it remembers seeing would be
-		// filtered out before the archive page ever hears about it.
-		await ext.tabs.reload(tab.id);
-		await waitForLoading(tab.id);
-	}
+	// Begun before the tab is touched, so that a page quick enough to announce
+	// itself before the call below returns is not missed.
+	const arrivals = watchArrivals();
+	try {
+		if (!tab) {
+			tab = await ext.tabs.create({ url: target, active: !background });
+		} else if (!reusedInPlace) {
+			tab = await ext.tabs.update(tab.id, { url: target, active: !background });
+		} else {
+			if (!background) await ext.tabs.update(tab.id, { active: true });
+			// A tab left behind by an earlier sync is still holding that run's cursor
+			// and its set of already-seen ids. Both are wrong now: paging would resume
+			// from the end of the last run, and anything it remembers seeing would be
+			// filtered out before the archive page ever hears about it.
+			await ext.tabs.reload(tab.id);
+		}
 
-	await waitForComplete(tab.id);
-	// The content script needs a beat after load before it answers pings.
-	for (let i = 0; i < 20; i++) {
-		const ping = await sendToTab(tab.id, { cmd: 'ping' });
-		if (ping.ok) return { ok: true, tabId: tab.id, ping };
-		await new Promise((r) => setTimeout(r, 500));
+		// Either way the page that was there is on its way out, and it goes on
+		// answering pings — ready as ever — until the new one replaces it. Asked too
+		// early, it is the old page that says yes, the harvest is started on it, and
+		// it is destroyed a moment later: the run collects nothing and never hears
+		// another word. So nothing is asked until the new page has said it is here.
+		//
+		// This used to be a wait for the tab to stop reporting `complete`, given
+		// three seconds. A page that has sat in a background tab for days can take
+		// longer than that to let go — its renderer has been pushed down the queue,
+		// and the reload does not begin until it has run its unload handlers — and
+		// that is the first sync after a long while failing where the next one, on
+		// a page now minutes old, went through.
+		if (!(await arrivals.from(tab.id, ARRIVAL_MS))) {
+			return {
+				ok: false,
+				tabId: tab.id,
+				error: `the TikTok tab did not load the profile within ${ARRIVAL_MS / 1000}s`,
+			};
+		}
+		await waitForComplete(tab.id);
+		for (let i = 0; i < 20; i++) {
+			const ping = await sendToTab(tab.id, { cmd: 'ping' });
+			if (ping.ok && arrivals.isNew(tab.id, ping.instance)) return { ok: true, tabId: tab.id, ping };
+			await new Promise((r) => setTimeout(r, 500));
+		}
+		return { ok: false, tabId: tab.id, error: 'content script never responded' };
+	} finally {
+		arrivals.stop();
 	}
-	return { ok: false, tabId: tab.id, error: 'content script never responded' };
+}
+
+/** How long a reloaded or redirected tab is given to bring its new page up. */
+const ARRIVAL_MS = 30000;
+
+/**
+ * Collectors that start up while this is listening, by tab.
+ *
+ * Each announces itself as its page begins, under an id of its own, and every
+ * ping it answers carries the same id. A page that announced itself after a
+ * reload was asked for is the new page; any other answer is from the one being
+ * left behind.
+ *
+ * @type {Set<(tabId: number, instance: string) => void>}
+ */
+const arrivalWatches = new Set();
+
+function watchArrivals() {
+	/** @type {Map<number, Set<string>>} */
+	const seen = new Map();
+	let wake = null;
+	const arrived = (tabId, instance) => {
+		if (!instance) return;
+		if (!seen.has(tabId)) seen.set(tabId, new Set());
+		seen.get(tabId).add(instance);
+		if (wake) wake();
+	};
+	arrivalWatches.add(arrived);
+	return {
+		/** True once a new page is up in the tab; false if none is by `timeout`. */
+		from(tabId, timeout) {
+			return new Promise((resolve) => {
+				const done = (ok) => {
+					clearTimeout(timer);
+					wake = null;
+					resolve(ok);
+				};
+				const timer = setTimeout(() => done(false), timeout);
+				wake = () => {
+					if (seen.has(tabId)) done(true);
+				};
+				wake();
+			});
+		},
+		isNew: (tabId, instance) => !!instance && !!seen.get(tabId)?.has(instance),
+		stop: () => arrivalWatches.delete(arrived),
+	};
 }
 
 /** Point a tab somewhere without bringing it forward. */
@@ -330,23 +400,6 @@ async function navigateTab(tabId, url) {
 		return { ok: false, error: 'the TikTok tab has been closed' };
 	}
 	return { ok: true };
-}
-
-/**
- * Wait for a reload to actually start, so waitForComplete doesn't return on the
- * "complete" the tab is still reporting from the page we just told it to leave.
- */
-async function waitForLoading(tabId, timeout = 3000) {
-	const deadline = Date.now() + timeout;
-	while (Date.now() < deadline) {
-		try {
-			const t = await ext.tabs.get(tabId);
-			if (t.status !== 'complete') return;
-		} catch (_) {
-			return;
-		}
-		await new Promise((r) => setTimeout(r, 100));
-	}
 }
 
 function waitForComplete(tabId) {
