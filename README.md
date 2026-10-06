@@ -100,6 +100,24 @@ On Chromium it can also talk back to the extension, which makes it a front-end r
 
 Firefox does not run extensions on `file://` pages at all, and rejects `file:///*` match patterns outright, so there is no counterpart in `manifest.firefox.json`. There the page stays a snapshot, says so in a banner, and offers the archive page's URL to copy.
 
+### Show in folder
+
+An opened post has a **Show in folder** button at the bottom right of its panel. It opens Explorer with the file selected — the video, or for a photo post the image on screen — so it can be dragged into a chat or copied somewhere.
+
+On Chromium that takes a small helper, set up once with one command from the repo folder:
+
+```bash
+python tools/show_in_folder.py install
+```
+
+Chromium's own downloads page can show a file because Chromium wrote it and kept the path; `downloads.show` gives an extension the same, but only for downloads, and downloads can only land under the browser's download folder. The archive is written through File System Access instead, which never tells the extension where anything is on disk, and no extension API opens Explorer on an arbitrary file. So [`tools/show_in_folder.py`](tools/show_in_folder.py) does it from outside the browser, over native messaging.
+
+It takes no arguments because it doesn't need telling anything. Chromium records the folder an extension picked, full path included, in the profile's `Preferences`, and starts a helper with the extension's origin as its first argument — so the helper looks the folder up on every press, and picking a different folder later just works. `install` finds the extension's id the same way, as an unpacked extension loaded from the repo in any Chrome, Chromium, Edge or Brave profile. It copies the helper into `%LOCALAPPDATA%\ttarchive-show-in-folder` beside a `.bat` that runs it with the same Python, and registers it under `HKCU` for those four browsers — nothing outside your own user profile. `--id` and `--root` override the two lookups if they ever come up empty; `uninstall` takes it all back out. It is Windows only, and it will only ever select a file inside the archive folder.
+
+Pressing the button before the helper is set up shows that command, ready to copy. `viewer.html` has the same button whenever the extension is attached to it, even with the archive page closed.
+
+Firefox needs no helper: it downloaded every file itself, so `downloads.show` knows where each one is. A file that only came in by **Scan an existing folder…**, or whose download history has been cleared, has nothing to point at, and the button says so.
+
 ## Converting an existing archive
 
 [`tools/script.py`](tools/script.py) turns a myfaveTT folder — or an older version of this one, which used `data/Likes/` — into the layout above. Copy it into the folder and run it:
@@ -230,6 +248,7 @@ The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its 
 | `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
 | `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
 | `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
+| `tools/show_in_folder.py` | Windows native-messaging helper behind **Show in folder** on Chromium, and its own installer. |
 
 All fetching happens on the extension page rather than in a content script: since Chrome 85 content-script requests obey the page's CORS policy, while extension pages get host-permission-based access.
 

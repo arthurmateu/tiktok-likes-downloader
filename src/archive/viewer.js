@@ -15,7 +15,7 @@
  * to their metadata and the lightbox says the file isn't readable.
  */
 
-import { LAYOUT, readBlob, hasReadableFiles } from '../lib/fs.js';
+import { LAYOUT, readBlob, hasReadableFiles, showInFolder } from '../lib/fs.js';
 import { disk, listingComplete } from '../lib/state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -71,6 +71,7 @@ const ICONS = {
 	play: '<circle cx="12" cy="12" r="9"/><path d="M10.2 8.3 15.8 12l-5.6 3.7z"/>',
 	music: '<path d="M9 17.6V5.4l10-2v12.2"/><circle cx="6.5" cy="17.9" r="2.6"/><circle cx="16.5" cy="15.6" r="2.6"/>',
 	link: '<path d="M14 4.5h5.5V10"/><path d="M19.5 4.5 11 13"/><path d="M18 13.5v5.2a1.3 1.3 0 0 1-1.3 1.3H5.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H11"/>',
+	folder: '<path d="M3.5 7.2a1.7 1.7 0 0 1 1.7-1.7h4.1l2 2.2h7.5a1.7 1.7 0 0 1 1.7 1.7v8.4a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7z"/>',
 };
 
 function icon(name) {
@@ -1336,9 +1337,113 @@ function metaPanel(item) {
 	link.title = 'Open this post on TikTok';
 	link.appendChild(icon('link'));
 	idRow.appendChild(link);
+	if (folderTarget(item)) idRow.appendChild(folderButton(item));
 	out.push(idRow);
 
 	return out;
+}
+
+// ----------------------------------------------------------- show in folder
+
+/**
+ * The file "Show in folder" points at: the video, or the image on the stage —
+ * a gallery is several files, and that is the one being looked at. Null when
+ * nothing of the post is on disk.
+ *
+ * This section is kept in step with its namesake in src/viewer/viewer.js by hand.
+ */
+function folderTarget(item) {
+	if (item.type === 'photo') {
+		const names = photoNames(item);
+		return names.length ? [LAYOUT.images, names[Math.min(lbPhoto, names.length - 1)]] : null;
+	}
+	const name = disk.videos.has(item.id) ? `${item.id}.mp4` : recordedVideo(item.id);
+	return name ? [LAYOUT.videos, name] : null;
+}
+
+/**
+ * Bottom right of the panel, on the id's row: the id names the post on TikTok,
+ * this names it on disk. Asked for the target at the click rather than when
+ * the panel is built, since the image on the stage changes under it.
+ */
+function folderButton(item) {
+	const button = el('button', 'lb-folder');
+	button.title = 'Show this file in its folder';
+	button.append(icon('folder'), el('span', null, 'Show in folder'));
+	button.addEventListener('click', async () => {
+		const target = folderTarget(item);
+		if (!target) return;
+		const label = button.querySelector('span');
+		button.disabled = true;
+		label.textContent = 'Opening…';
+		// Whatever goes wrong has to end in a note and a working button: one that
+		// stays disabled after a failed call ignores every press after it, silently.
+		let res;
+		try {
+			res = await Promise.race([
+				showInFolder(...target),
+				new Promise((r) => setTimeout(() => r({ ok: false, error: 'no answer after 15 seconds' }), 15000)),
+			]);
+		} catch (err) {
+			res = { ok: false, error: String(err?.message || err) };
+		} finally {
+			button.disabled = false;
+			label.textContent = 'Show in folder';
+		}
+		// The feed may have stepped on while the helper was answering.
+		if (!button.isConnected) return;
+		$('lbMeta').querySelector('.lb-folder-note')?.remove();
+		if (!res?.ok) $('lbMeta').appendChild(folderNote(res));
+	});
+	return button;
+}
+
+/**
+ * Why it didn't, under the row it was pressed in. The missing helper is the
+ * case given room: it is set up once, by one command, and this is where that
+ * command can be copied from.
+ */
+function folderNote(res) {
+	const note = el('div', 'lb-folder-note');
+	const error = res?.error || 'no answer';
+	if (error === 'no-helper') {
+		note.append(
+			el('p', null, 'Opening Explorer takes a small helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
+			commandRow(res.setup),
+			el('p', null, 'then press the button again.')
+		);
+		if (res.detail) note.appendChild(el('p', null, `Chromium said: ${res.detail}`));
+	} else if (error === 'not-found') {
+		note.append(el('p', null, `Not on disk at ${res.path}.`));
+	} else if (error === 'not-downloaded') {
+		note.append(el('p', null, 'Firefox can only show a file it downloaded itself, and this one isn’t in its download history.'));
+	} else {
+		note.append(el('p', null, `Couldn’t show it: ${error}`));
+	}
+	return note;
+}
+
+/** A command to run, selectable in full, with a button that copies it. */
+function commandRow(command) {
+	const row = el('div', 'cmd');
+	const field = el('input');
+	field.readOnly = true;
+	field.value = command;
+	field.spellcheck = false;
+	field.addEventListener('focus', () => field.select());
+	const copy = el('button', 'btn', 'Copy');
+	copy.addEventListener('click', async () => {
+		field.select();
+		try {
+			await navigator.clipboard.writeText(command);
+			copy.textContent = 'Copied';
+		} catch (_) {
+			copy.textContent = 'Press Ctrl+C';
+		}
+		setTimeout(() => (copy.textContent = 'Copy'), 2000);
+	});
+	row.append(field, copy);
+	return row;
 }
 
 // ---------------------------------------------------------------- shortcuts

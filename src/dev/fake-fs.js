@@ -98,6 +98,13 @@ export async function fileSize(parts, name) {
 	return blob ? blob.size : null;
 }
 
+/** There is no file manager to open here, so it records what it was asked to show. */
+export let shownInFolder = null;
+export async function showInFolder(parts, name) {
+	shownInFolder = [...parts, name].join('/');
+	return { ok: true };
+}
+
 export async function refresh() {}
 export function hasReadableFiles() {
 	return true;

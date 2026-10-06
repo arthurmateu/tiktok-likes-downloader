@@ -38,6 +38,8 @@
 	let shown = 0;
 	let observer = null;
 	let live = false;
+	/** A content script answered at all — enough for Show in folder, which the background handles itself. */
+	let bridged = false;
 	let pollTimer = null;
 
 	// ------------------------------------------------------------------ bridge
@@ -93,6 +95,7 @@
 
 	async function probe() {
 		const res = await call('status', {}, 2500);
+		bridged = !!res && (res.ok || res.error === 'no-archive-page');
 		if (!res || !res.ok) {
 			// A bridge that answers 'no-archive-page' is still a bridge: the archive
 			// tab is just closed. Say so rather than falling back to the generic
@@ -152,6 +155,7 @@
 		play: '<circle cx="12" cy="12" r="9"/><path d="M10.2 8.3 15.8 12l-5.6 3.7z"/>',
 		music: '<path d="M9 17.6V5.4l10-2v12.2"/><circle cx="6.5" cy="17.9" r="2.6"/><circle cx="16.5" cy="15.6" r="2.6"/>',
 		link: '<path d="M14 4.5h5.5V10"/><path d="M19.5 4.5 11 13"/><path d="M18 13.5v5.2a1.3 1.3 0 0 1-1.3 1.3H5.8a1.3 1.3 0 0 1-1.3-1.3V7.8a1.3 1.3 0 0 1 1.3-1.3H11"/>',
+		folder: '<path d="M3.5 7.2a1.7 1.7 0 0 1 1.7-1.7h4.1l2 2.2h7.5a1.7 1.7 0 0 1 1.7 1.7v8.4a1.7 1.7 0 0 1-1.7 1.7H5.2a1.7 1.7 0 0 1-1.7-1.7z"/>',
 	};
 
 	function icon(name) {
@@ -166,20 +170,20 @@
 		return svg;
 	}
 
-	/** A read-only field plus a copy button, for the extension page's URL. */
-	function urlRow() {
-		if (!config.bridgeURL) return null;
-		const row = el('div', 'row');
+	/** A read-only field plus a copy button: the extension page's URL, or a command to run. */
+	function copyRow(value, rowCls, fieldCls) {
+		const row = el('div', rowCls);
 		const field = document.createElement('input');
-		field.className = 'url';
+		if (fieldCls) field.className = fieldCls;
 		field.readOnly = true;
-		field.value = config.bridgeURL;
+		field.spellcheck = false;
+		field.value = value;
 		field.addEventListener('focus', () => field.select());
 		const copy = el('button', 'btn', 'Copy');
 		copy.addEventListener('click', async () => {
 			field.select();
 			try {
-				await navigator.clipboard.writeText(config.bridgeURL);
+				await navigator.clipboard.writeText(value);
 				copy.textContent = 'Copied';
 			} catch (_) {
 				// Clipboard access can be refused even on a file:// page; the field
@@ -190,6 +194,10 @@
 		});
 		row.append(field, copy);
 		return row;
+	}
+
+	function urlRow() {
+		return config.bridgeURL ? copyRow(config.bridgeURL, 'row', 'url') : null;
 	}
 
 	function renderBanner(status) {
@@ -1261,9 +1269,65 @@
 		link.title = 'Open this post on TikTok';
 		link.appendChild(icon('link'));
 		idRow.appendChild(link);
+		// Only with the extension attached: a page on its own can't open Explorer.
+		if (bridged && folderPath(item)) idRow.appendChild(folderButton(item));
 		out.push(idRow);
 
 		return out;
+	}
+
+	// ------------------------------------------------------- show in folder
+
+	/**
+	 * The file "Show in folder" points at: the video, or the image on the stage.
+	 * The same choice as the archive page's, and the same button and notes — this
+	 * section is kept in step with its namesake in src/archive/viewer.js by hand.
+	 */
+	function folderPath(item) {
+		if (!present(item)) return null;
+		if (item.type !== 'photo') return videoPath(item);
+		const paths = photoPaths(item);
+		return paths[Math.min(lbPhoto, paths.length - 1)];
+	}
+
+	function folderButton(item) {
+		const button = el('button', 'lb-folder');
+		button.title = 'Show this file in its folder';
+		button.append(icon('folder'), el('span', null, 'Show in folder'));
+		button.addEventListener('click', async () => {
+			const path = folderPath(item);
+			if (!path) return;
+			const label = button.querySelector('span');
+			button.disabled = true;
+			label.textContent = 'Opening…';
+			// `call` never rejects: no answer within the timeout resolves null.
+			const res = await call('show-in-folder', { path }, 15000);
+			button.disabled = false;
+			label.textContent = 'Show in folder';
+			if (!button.isConnected) return;
+			const old = $('lbMeta').querySelector('.lb-folder-note');
+			if (old) old.remove();
+			if (!res || !res.ok) $('lbMeta').appendChild(folderNote(res));
+		});
+		return button;
+	}
+
+	function folderNote(res) {
+		const note = el('div', 'lb-folder-note');
+		const error = (res && res.error) || 'the extension did not answer';
+		if (error === 'no-helper') {
+			note.append(
+				el('p', null, 'Opening Explorer takes a small helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
+				copyRow(res.setup, 'cmd'),
+				el('p', null, 'then press the button again.')
+			);
+			if (res.detail) note.appendChild(el('p', null, `Chromium said: ${res.detail}`));
+		} else if (error === 'not-found') {
+			note.append(el('p', null, `Not on disk at ${res.path}.`));
+		} else {
+			note.append(el('p', null, `Couldn’t show it: ${error}`));
+		}
+		return note;
 	}
 
 	function renderLightbox() {

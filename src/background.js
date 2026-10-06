@@ -53,6 +53,10 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 		openArchive().then(() => sendResponse({ ok: true }));
 		return true;
 	}
+	if (msg.type === 'show-in-folder') {
+		showInFolder(msg.path).then(sendResponse);
+		return true;
+	}
 
 	// The collector's clock. Its own timers are clamped while its tab is in the
 	// background — which is where we want that tab — and ours are not.
@@ -127,8 +131,44 @@ async function handleViewerRequest(msg) {
 		await openArchive();
 		return { ok: true };
 	}
+	// Answered here, not by the archive page: the helper needs no folder handle,
+	// so the button works with that page closed.
+	if (msg.cmd === 'show-in-folder') return showInFolder(msg.args && msg.args.path);
 	if (!archivePorts.size) return { ok: false, error: 'no-archive-page' };
 	return askArchivePage(msg.cmd, msg.args);
+}
+
+// ------------------------------------------------------------ show in folder
+
+/**
+ * "Show in folder" on Chromium. File System Access never says where a handle is
+ * on disk and no extension API opens Explorer on a file it didn't download, so
+ * the work is done by a native helper, tools/show_in_folder.py, which reads the
+ * folder's path out of the browser's own record of what was picked. `path` is
+ * archive-relative.
+ *
+ * Gecko never comes here: its backend downloaded every file itself and asks
+ * `downloads.show` instead.
+ */
+const FOLDER_HOST = 'com.ttarchive.show_in_folder';
+
+async function showInFolder(path) {
+	// Printed by the Library when the helper is missing. It needs no arguments: the
+	// helper finds this extension's id, and the folder, in the browser's profile.
+	const setup = 'python tools/show_in_folder.py install';
+	if (typeof path !== 'string' || !path) return { ok: false, error: 'no path' };
+	try {
+		const res = await ext.runtime.sendNativeMessage(FOLDER_HOST, { path });
+		if (res && res.error === 'no-helper') return { ...res, setup };
+		return res || { ok: false, error: 'the helper gave no answer' };
+	} catch (err) {
+		// Chromium's own wording: "Specified native messaging host not found." when
+		// nothing is registered, "…is forbidden." when it is but not for this id.
+		const text = String((err && err.message) || err);
+		// `detail` keeps Chromium's wording, which the Library quotes: "not found"
+		// once the helper is installed means the lookup is failing, not the setup.
+		return { ok: false, error: /not found|forbidden/i.test(text) ? 'no-helper' : text, detail: text, setup };
+	}
 }
 
 // ---------------------------------------------------------------- from archive

@@ -175,3 +175,16 @@ export function fileSize(parts, name) {
 	if (!backend) return Promise.resolve(null);
 	return backend.fileSize(parts, name);
 }
+
+/**
+ * Open the system file manager with this file selected. Resolves to `{ ok }`,
+ * or `{ ok: false, error }` with `error` one of:
+ *   'no-helper'      — Chromium's native helper isn't installed; `setup` is the command that installs it
+ *   'not-found'      — the helper looked and the file isn't there; `path` is where it looked
+ *   'not-downloaded' — Firefox has no download on record for this file
+ * or anything else as plain text.
+ */
+export function showInFolder(parts, name) {
+	if (!backend) return Promise.resolve({ ok: false, error: 'no storage backend' });
+	return backend.showInFolder(parts, name);
+}

@@ -313,3 +313,23 @@ export async function fileSize(parts, name) {
 	const entry = index.get([...parts, name].join('/'));
 	return entry ? entry.size : null;
 }
+
+/**
+ * Every file here was downloaded by this browser, which therefore already knows
+ * where it is: no helper, just the download behind the file. A file that only
+ * came in by a folder scan, or whose history was cleared, has none to point at.
+ */
+export async function showInFolder(parts, name) {
+	const want = `/${requireFolder()}/${[...parts, name].join('/')}`;
+	try {
+		const rows = await ext.downloads.search({ query: [name], orderBy: ['-startTime'] });
+		const row = rows.find(
+			(r) => r.state === 'complete' && r.exists !== false && String(r.filename || '').replace(/\\/g, '/').endsWith(want)
+		);
+		if (!row) return { ok: false, error: 'not-downloaded' };
+		await ext.downloads.show(row.id);
+		return { ok: true };
+	} catch (err) {
+		return { ok: false, error: String((err && err.message) || err) };
+	}
+}
