@@ -6,21 +6,30 @@ Built as a replacement for [myfaveTT](https://myfavett.com/), but not as a clone
 
 ## Install
 
-Chromium and Gecko need different manifests, so they can't share one folder. Build both:
+On Chromium — Chrome 111+, Edge, Brave:
 
-```bash
-python tools/build.py
-```
+1. Clone this repo.
+2. *Optional, Windows, Python 3.10+.* From Windows Terminal, in the repo folder:
 
-**Edge, or Chrome 111+** — open `edge://extensions` (or `chrome://extensions`), turn on **Developer mode**, **Load unpacked** → `dist/chrome`. The repo root also loads directly if you'd rather skip the build.
+   ```bash
+   python tools\helper.py install
+   ```
 
-**Firefox 128+** — open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → `dist/firefox/manifest.json`. Then open the extension's entry in `about:addons` → **Permissions** and allow it to access tiktok.com and the CDNs, or use the **Grant access to TikTok** button the archive page shows; Firefox treats manifest host permissions as optional and every download 403s until they're granted.
+   That is the [local helper](#local-helper): no folder permission to grant every session, the Library in a tab of its own, and **Show in folder**. Everything else works without it.
+3. Open `chrome://extensions`, turn on **Developer mode**, **Load unpacked** → the repo folder.
+4. Pin the extension, click it, **Open archive**.
 
-Either way: pin the extension, click it, **Open archive**.
+Steps 2 and 3 go in either order. `manifest.json` carries a fixed `key`, so the extension has the same id — `ophgeakaeoecinbejnhkjfbagkmciphd` — on every machine and at every path, and the helper is registered for that id without the browser being asked anything.
+
+After a `git pull`, reload the extension on its card in `chrome://extensions`: Chromium keeps an unpacked extension's old background running, through browser restarts too, until it is reloaded. If it hasn't been, the archive page says so and has a **Reload the extension** button that does it. The helper needs nothing — it runs straight from the checkout.
+
+Coming from a version without the fixed id: remove the old card in `chrome://extensions` and **Load unpacked** again — Chromium won't load an extension whose id has changed under it. Its settings start afresh; the helper finds your archive again by itself, and without the helper it is one **Choose folder…**.
+
+**Firefox 128+** needs its own manifest, so build a folder for it first with `python tools/build.py`, then open `about:debugging#/runtime/this-firefox` → **Load Temporary Add-on…** → `dist/firefox/manifest.json`. Then open the extension's entry in `about:addons` → **Permissions** and allow it to access tiktok.com and the CDNs, or use the **Grant access to TikTok** button the archive page shows; Firefox treats manifest host permissions as optional and every download 403s until they're granted.
 
 ## Use
 
-1. On the archive page, click **Choose folder…** and pick your archive folder. Chromium asks for read/write permission once per browser session. On Firefox the button instead asks for a *name*, and the archive lands in that subfolder of your browser's download folder — see [Firefox](#firefox) for why.
+1. On the archive page, click **Choose folder…** and pick your archive folder. With the [local helper](#local-helper) that is its own folder dialog, once; and if the browser's picker has chosen an archive before, the helper takes that one over without asking. Without it, Chromium asks for read/write permission once per browser session. On Firefox the button instead asks for a *name*, and the archive lands in that subfolder of your browser's download folder — see [Firefox](#firefox) for why.
 2. If it's an existing myfaveTT folder, convert it first — see below. The page says so if it spots one.
 3. Enter your TikTok username and press **Sync likes**.
 4. A TikTok tab opens on your profile in the background and pages through the **Liked** tab from there. Leave it open, but you don't have to look at it — carry on browsing. It may come to the front for a second or two to open the Liked tab, then hands the foreground back.
@@ -104,48 +113,36 @@ Firefox does not run extensions on `file://` pages at all, and rejects `file:///
 
 An opened post has a **Show in folder** button at the bottom right of its panel. It opens Explorer with the file selected — the video, or for a photo post the image on screen — so it can be dragged into a chat or copied somewhere.
 
-On Chromium that takes a small helper, set up once with one command from the repo folder:
+On Chromium that is the [local helper](#local-helper)'s job; pressing the button without it shows the command that installs it. Chromium's own downloads page can show a file because Chromium wrote it and kept the path; `downloads.show` gives an extension the same, but only for downloads, and no extension API opens Explorer on an arbitrary file. So the helper does it from outside the browser. When it owns the folder it knows where everything is; when the browser does, it reads the folder out of the profile's `Preferences`, where Chromium records the folder an extension's picker chose, path and all. It will only ever select a file inside the archive.
 
-```bash
-python tools/show_in_folder.py install
-```
-
-Run it from Windows Terminal, or any terminal opened from the Start menu — **not** from a terminal inside another app. A packaged desktop app's terminal (the Claude desktop app's is one) has Windows redirect what it writes to `%LOCALAPPDATA%` and `HKCU\Software` into that app's private copy, which a browser started from the taskbar never sees: the install reports success, the browser says *Specified native messaging host not found.*, and only browsers started from inside that app work. The installer now notices, and refuses with the command to run instead. The same goes for `tools/helper.py install`.
-
-Chromium's own downloads page can show a file because Chromium wrote it and kept the path; `downloads.show` gives an extension the same, but only for downloads, and downloads can only land under the browser's download folder. The archive is written through File System Access instead, which never tells the extension where anything is on disk, and no extension API opens Explorer on an arbitrary file. So [`tools/show_in_folder.py`](tools/show_in_folder.py) does it from outside the browser, over native messaging.
-
-It takes no arguments because it doesn't need telling anything. Chromium records the folder an extension picked, full path included, in the profile's `Preferences`, and starts a helper with the extension's origin as its first argument — so the helper looks the folder up on every press, and picking a different folder later just works. `install` finds the extension's id the same way, as an unpacked extension loaded from the repo in any Chrome, Chromium, Edge or Brave profile. It copies the helper into `%LOCALAPPDATA%\ttarchive-show-in-folder` beside a `.bat` that runs it with the same Python, and registers it under `HKCU` for those four browsers — nothing outside your own user profile. `--id` and `--root` override the two lookups if they ever come up empty; `uninstall` takes it all back out. It is Windows only, and it will only ever select a file inside the archive folder.
-
-Pressing the button before the helper is set up shows that command, ready to copy. `viewer.html` has the same button whenever the extension is attached to it, even with the archive page closed.
+`viewer.html` has the same button whenever the extension is attached to it, even with the archive page closed.
 
 Firefox needs no helper: it downloaded every file itself, so `downloads.show` knows where each one is. A file that only came in by **Scan an existing folder…**, or whose download history has been cleared, has nothing to point at, and the button says so.
 
-## Local helper (experimental)
+## Local helper
 
-A second way to own the folder on Chromium, there to be tried before anything depends on it. The extension still does everything that needs TikTok — the list is read and every file is downloaded in your own logged-in session, exactly as before — but instead of writing through File System Access it hands each file to [`tools/helper.py`](tools/helper.py), a small process outside the browser that writes it with an ordinary path. That buys what an extension can't have on its own:
+[`tools/helper.py`](tools/helper.py): everything the extension needs from outside the browser, as one small process. Optional, Windows and Chromium only, and used on its own once installed — there is no setting. The extension still does everything that needs TikTok: the list is read and every file is downloaded in your own logged-in session. What the helper adds:
 
-- **No folder permission to grant again.** File System Access asks once per browser session; the helper has the folder for as long as it runs.
-- **The Library at a real address.** The helper serves the folder on `http://127.0.0.1:8737/`, so **Library → Open in a tab** opens the folder's `viewer.html` there — live, connected to the extension, with no *Allow access to file URLs* — and an address you can bookmark. The extension's own Library streams from the same address by range, rather than reading each file into memory first.
-- **Explorer by real path.** **Show in folder** asks the helper, which knows where the archive is because it was told, not because it read the browser's profile. If the helper can't answer — no folder chosen in it yet, or not installed — the click falls through to `show_in_folder.py` as before.
-
-Set up once, from the repo folder, then pick **Local helper (experimental)** in the Storage menu at the top of the archive page:
+- **The folder.** Instead of writing through File System Access, the extension hands each file to the helper, which writes it with an ordinary path — so there is no folder permission to grant again every browser session. The first time, it takes over the archive the browser's picker last chose; **Change folder…** opens its own folder dialog.
+- **The Library at a real address.** The helper serves the folder on `http://127.0.0.1:8737/`, so **Library → Open in a tab** opens the folder's `viewer.html` there — live, connected to the extension, no *Allow access to file URLs* — at an address you can bookmark. The extension's own Library streams from the same address by range, rather than reading each file into memory first.
+- **Show in folder**, above.
 
 ```bash
-python tools/helper.py install
+python tools\helper.py install
 ```
 
-Reload the extension in `chrome://extensions` after updating it. Chromium keeps running an unpacked extension's old background — through browser restarts too — until it is reloaded, and an old background knows nothing about the helper. If it hasn't been, the archive page says so when the helper is chosen and has a **Reload the extension** button that does it and comes back.
+Run it from **Windows Terminal**, or any terminal opened from the Start menu — not from a terminal inside another app. A packaged desktop app's terminal (the Claude desktop app's is one) has Windows redirect what it writes to `%LOCALAPPDATA%` and `HKCU\Software` into that app's private copy, which a browser started from the taskbar never sees: the install would report success and the browser would say *Specified native messaging host not found.* The installer checks for this first and refuses, with the command to run instead.
 
-`install` finds the extension's id the same way `show_in_folder.py` does, copies the helper (and `show_in_folder.py`, whose profile lookups and Explorer call it reuses) into `%LOCALAPPDATA%\ttarchive-helper`, and registers `com.ttarchive.helper` under `HKCU` for Chrome, Chromium, Edge and Brave. `uninstall` takes it back out. Switching back to **Browser storage** is the same menu; nothing about the folder changes either way, since both write the same layout into the same place. The first time, the helper's folder dialog opens on the folder the browser picker last chose, so it is one click to keep the archive where it is.
+`install` registers `com.ttarchive.helper` for Chrome, Chromium, Edge and Brave under `HKCU`, pointing at a manifest and a `.bat` it writes into `tools/native-host/` (gitignored, since both name this machine's Python and this checkout's path). Nothing is copied anywhere, so a `git pull` updates the helper; reinstall only if you move the checkout or change Python. `uninstall` takes it back out, and the extension goes back to writing through the browser — same folder, same layout. Both also clear away what earlier versions installed (a separate `com.ttarchive.show_in_folder` host and copies under `%LOCALAPPDATA%`).
 
 How it fits together:
 
 - **The background starts it and holds it.** `src/background.js` opens a native-messaging port to the helper, which serves HTTP until that port closes. An open native port is also what keeps an MV3 worker alive, so the helper is up for as long as the browser is, and the Library's address keeps answering with the archive page closed. If the worker is stopped anyway, the next request from the archive page brings both back — a write that fails because the helper went away is retried once on the new one.
-- **Bytes go over HTTP, not native messaging.** `src/lib/backends/helper.js` is a third backend behind `src/lib/fs.js`, beside File System Access and the downloads API: `PUT` to write (to a `.ttarchive-part` file, renamed into place once whole), `GET`/`HEAD` with ranges to read, `/api/list` for the directory listing that still decides what needs downloading. The choice of backend is stored, and the page reloads to apply it; nothing above `fs.js` knows which one ran.
+- **Bytes go over HTTP, not native messaging.** `src/lib/backends/helper.js` is a third backend behind `src/lib/fs.js`, beside File System Access and the downloads API: `PUT` to write (to a `.ttarchive-part` file, renamed into place once whole), `GET`/`HEAD` with ranges to read, `/api/list` for the directory listing that still decides what needs downloading. The archive page asks for the helper once as it loads and uses it if it answers; installed but unable to start, the page says why and carries on with File System Access. Nothing above `fs.js` knows which backend ran.
 - **Dialogs and Explorer are processes of their own.** The folder dialog and **Show in folder** start a fresh helper per click with `sendNativeMessage` rather than asking the running server, because Windows only lets a process come to the front when the foreground process just started it — a dialog from a server that has been up for an hour opens behind the browser.
 - **Only the extension gets in.** Every request needs a token the extension generates and keeps; writes take it only as a header, which a page on another site can't send here without a CORS preflight the helper answers for the extension's origin alone. Opening the Library turns the token into an `HttpOnly`, `SameSite=Lax` cookie, so the page's own media requests are let in and another site's `<img>` pointed at this address is not. Requests naming any host other than `127.0.0.1` or `localhost` are refused, which is what stops DNS rebinding.
 
-What it doesn't change: anything about TikTok, the folder layout, `archive.json`, or `viewer.html` opened by double-click. Windows and Chromium only, like **Show in folder**. Firefox keeps its downloads backend.
+What it doesn't change: anything about TikTok, the folder layout, `archive.json`, or `viewer.html` opened by double-click. Firefox keeps its downloads backend.
 
 ## Converting an existing archive
 
@@ -272,14 +269,13 @@ The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its 
 | `src/lib/fs.js` | Storage façade: folder layout, backend selection by feature detection. |
 | `src/lib/backends/fsa.js` | Chromium backend — File System Access, write retries. |
 | `src/lib/backends/downloads.js` | Gecko backend — downloads API, history-derived listing, folder snapshot. |
-| `src/lib/backends/helper.js` | Experimental Chromium backend — the folder over HTTP to `tools/helper.py`. See [Local helper](#local-helper-experimental). |
+| `src/lib/backends/helper.js` | Chromium backend when the local helper is installed — the folder over HTTP to `tools/helper.py`. See [Local helper](#local-helper). |
 | `src/lib/ext.js` | `browser ?? chrome`, so every call site can `await`. |
 | `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status, and how far down the list a sync still has to read. |
 | `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
 | `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
 | `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
-| `tools/show_in_folder.py` | Windows native-messaging helper behind **Show in folder** on Chromium, and its own installer. |
-| `tools/helper.py` | The experimental local helper: serves and writes the archive folder on 127.0.0.1, opens the folder dialog and Explorer. Its own installer. |
+| `tools/helper.py` | The local helper: writes and serves the archive folder on 127.0.0.1, opens the folder dialog and Explorer (Show in folder). Its own installer. |
 
 All fetching happens on the extension page rather than in a content script: since Chrome 85 content-script requests obey the page's CORS policy, while extension pages get host-permission-based access.
 
@@ -354,8 +350,8 @@ Then open `http://127.0.0.1:8777/syntaxcheck.html`. Add `?gecko` to make it stub
 
 `src/dev/selftest.html` answers what a stubbed API can't, by running inside the loaded extension: whether a credentialed fetch from `moz-extension://` carries TikTok's cookies, whether a root-level `archive.json` lands where it was asked to, whether `conflictAction: 'overwrite'` really overwrites instead of uniquifying to `probe(1).txt`, whether `downloads.search` returns paths in the shape `refresh()` parses, and whether the `world: "MAIN"` hook actually installed. Build with `python tools/build.py firefox --dev`, then open the archive page and replace `src/archive/archive.html` in the URL with `src/dev/selftest.html`. It writes only into `<Downloads>/ttarchive-selftest/`, saves and restores the stored folder setting around the run, and has a button to delete everything it wrote.
 
-`tools/test_helper.py` runs `tools/helper.py` the way Chromium does — a child process started with an extension origin, spoken to over a length-prefixed pipe — and then over HTTP: writes landing whole and never half-listed, ranges, the token being required everywhere and accepted only as a header for writes, paths that try to leave the folder, other hosts and other origins being refused, the port falling back when it's taken, and the process going away when the pipe closes. `python tools/test_helper.py`; nothing it does opens a window or touches anything outside a temporary folder. `syntaxcheck.html?helper` evaluates the archive page with the helper chosen and not installed.
+`tools/test_helper.py` runs `tools/helper.py` the way Chromium does — a child process started with an extension origin, spoken to over a length-prefixed pipe — and then over HTTP: writes landing whole and never half-listed, ranges, the token being required everywhere and accepted only as a header for writes, paths that try to leave the folder, other hosts and other origins being refused, the port falling back when it's taken, and the process going away when the pipe closes. It also covers what the helper makes of the browser's record of a picked folder — taking it over at start, under the fixed id or one from before it, preferring a folder that holds an archive, and Show in folder looking there when it has no folder of its own — against `Preferences` files it writes into a fake `%LOCALAPPDATA%`, so the real profiles are never read. `python tools/test_helper.py`; nothing it does opens a window or touches anything outside a temporary folder. `syntaxcheck.html?helper` evaluates the archive page as it is with the helper installed, `?helper=broken` with it installed and failing to start.
 
-`tools/e2e/helper_flow.py` first asks a process outside any app package whether both helpers are registered where a browser started from the Start menu would look, and stops if not — run from inside the Claude desktop app it would otherwise test registrations only that app can see. Then it clicks through the whole helper flow in a headless Chromium on a copy of your own profile: choosing the helper with whatever background the profile last registered (and reloading the extension from the page when that one is stale), the folder dialog, the scan, playback, **Show in folder** from both the Library and the tab at the helper's address, the fallback to `show_in_folder.py`, and switching back. Nothing shows on screen: `TTARCHIVE_TEST_NO_WINDOWS` tells both helpers to answer without opening the dialog or Explorer, and `TTARCHIVE_TEST_PICK` is the folder the dialog answers with. Writes go to a scratch archive copied from a few real posts; the real archive is only read. `python tools/e2e/helper_flow.py`, with both helpers installed.
+`tools/e2e/helper_flow.py` runs the extension against the helper as it is really installed: it loads the extension fresh into a throwaway profile — which is what a new clone looks like to Chromium — in a headless Chromium started through WMI, outside whatever app the script runs in, so it sees the registry your own browser does and not a packaged app's private copy. It checks the helper is registered for the fixed id, then clicks through: the helper taking over the archive the browser's picker chose (read only), the folder dialog, the scan, playback, **Show in folder** from the Library, with and without a folder of the helper's own, and from the tab at the helper's address. `TTARCHIVE_TEST_NO_WINDOWS` tells the helper to answer without opening the dialog or Explorer, and `TTARCHIVE_TEST_PICK` is the folder the dialog answers with; writes go to a scratch archive copied from a few real posts. `python tools/e2e/helper_flow.py`, after `python tools\helper.py install`.
 
 `src/dev/verify.html` downloads a list of media URLs from the extension's own origin and POSTs the bytes to a local receiver, so the results can be inspected with ffmpeg. It reads its target list from `http://127.0.0.1:8899/targets.json` and needs a CORS-enabled receiver on that port (plain `python -m http.server` will not do — no `Access-Control-Allow-Origin`). To run it, load the extension with a real TikTok tab open in the same profile, then navigate to the page. Also dev-only.

@@ -3,3 +3,4 @@ _metadata/
 _looptest*
 tools/helper.log
 __pycache__/
+tools/native-host/

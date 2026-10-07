@@ -1,8 +1,8 @@
 /**
  * Local-helper backend: the archive folder, written by tools/helper.py.
  *
- * Experimental, and only ever chosen on purpose — see `init` in fs.js. The
- * extension still fetches every file itself, in the session TikTok handed the
+ * Used whenever the helper is installed — see `init` in fs.js. The extension
+ * still fetches every file itself, in the session TikTok handed the
  * URL to; what changes is where the bytes go. Instead of a File System Access
  * handle they are PUT to a small server on 127.0.0.1, which the background
  * starts over native messaging and which writes them with an ordinary path.
@@ -118,9 +118,22 @@ export function rootPath() {
  * one it remembers that isn't (a drive not plugged in); 'unavailable', with
  * the reason on `problem`, when the helper itself can't be had.
  */
-export async function restore() {
+/**
+ * Whether the helper can be had, starting it if it has to be: `{ ok: true }`,
+ * or the background's reason it can't — `'no-helper'` when it isn't installed.
+ */
+export async function probe() {
 	try {
 		await connect({ fresh: true });
+		return { ok: true };
+	} catch (err) {
+		return err.helper || { ok: false, error: String((err && err.message) || err) };
+	}
+}
+
+export async function restore() {
+	try {
+		await connect();
 	} catch (err) {
 		return { state: 'unavailable', label: null, problem: err.helper };
 	}

@@ -1,20 +1,26 @@
 """
-End-to-end run of the local-helper flow, clicked through the way a person
-would, in a copy of your own Chromium profile.
+End-to-end run of the extension with the local helper, clicked through the way
+a person would, against the helper as it is really installed.
 
     python tools/e2e/helper_flow.py
 
-Headless, so nothing appears on screen or takes focus while the machine is in
-use. The helpers are told by TTARCHIVE_TEST_NO_WINDOWS not to open the folder
-dialog or Explorer — the dialog is answered with TTARCHIVE_TEST_PICK — and each
-records what it was asked in helper.log / last-call.json, which is what the
-checks read. Needs both helpers installed (tools/helper.py install,
-tools/show_in_folder.py install).
+Needs `python tools/helper.py install` to have been run — from Windows Terminal,
+like any install — and nothing else: the extension is loaded fresh into a
+throwaway profile, which is what a newly cloned checkout looks like to Chromium.
 
-The profile copy leaves out caches, cookies and saved logins, so it is signed
-in to nothing. Anything that writes goes to a scratch archive built from a few
-of the real archive's posts; the real archive is only read. Both are deleted
-afterwards.
+The browser is started outside whatever app this script runs in, through WMI,
+and headless. Outside, because a terminal inside a packaged app (the Claude
+desktop app's) sees that app's private copy of the registry, and a browser it
+starts inherits the same view, so everything would pass for a browser the user
+doesn't have. Headless, so nothing appears on screen while the machine is in use.
+TTARCHIVE_TEST_NO_WINDOWS keeps the helper from opening the folder dialog or
+Explorer — the dialog is answered with TTARCHIVE_TEST_PICK — and what it was
+asked lands in tools/helper.log, which is what the checks read.
+
+The helper takes over the real archive to begin with, as it would for you; that
+part only reads. Everything that writes is pointed at a scratch archive built
+from a few of the real one's posts. Both the profile and the scratch archive are
+deleted afterwards.
 """
 
 import json
@@ -30,93 +36,115 @@ from pathlib import Path
 from cdp import CDP
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from show_in_folder import picked_folders, unpacked_ids  # noqa: E402
+import helper  # noqa: E402
 
+REPO = Path(__file__).resolve().parent.parent.parent
 SCRATCH = Path(tempfile.gettempdir()) / "ttarchive-e2e"
 PROFILE = SCRATCH / "profile"
 ARCHIVE = SCRATCH / "archive"
-REAL_PROFILE = Path(os.environ["LOCALAPPDATA"]) / "Chromium" / "User Data"
 CHROME = r"C:\Program Files\Chromium\Application\chrome.exe"
-EXT = unpacked_ids()[0]
-# The archive the browser's own picker last chose: read from, never written to.
-REAL_ARCHIVE = next(p for p in picked_folders(EXT) if (p / "archive.json").is_file())
+PORT = 9333
+EXT = helper.extension_id()
 ARCHIVE_URL = f"chrome-extension://{EXT}/src/archive/archive.html"
-HELPER_LOG = Path(os.environ["LOCALAPPDATA"]) / "ttarchive-helper" / "helper.log"
-OLD_LAST_CALL = Path(os.environ["LOCALAPPDATA"]) / "ttarchive-show-in-folder" / "last-call.json"
+HELPER_LOG = REPO / "tools" / "helper.log"
 
 results = []
 
 
 def check(name, ok, detail=""):
-    results.append(ok)
+    results.append(bool(ok))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
 
 
-HOSTS = ("com.ttarchive.helper", "com.ttarchive.show_in_folder")
+# ------------------------------------------------------------ outside the app
 
 
-def registered_outside():
-    """
-    Which helpers a browser started from the Start menu would find.
-
-    Not something this script can see for itself: run from a terminal inside a
-    packaged app — the Claude desktop app's is one — it reads the registry
-    through that app's private copy, finds registrations nobody else can, and
-    the Chromium it launches inherits the same view, so every check below
-    passes for a browser the user doesn't have. A process the WMI service
-    starts is outside any package, so it is asked instead.
-    """
-    out = Path(r"C:\Users\Public") / f"ttarchive-e2e-{os.getpid()}.txt"
-    cmd = f'cmd.exe /c "reg query HKCU\\Software\\Chromium\\NativeMessagingHosts /s > {out} 2>&1"'
+def outside(command: str) -> None:
+    """Run `command` from a process the WMI service starts: outside any app package."""
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{cmd}'}} | Out-Null"],
-        capture_output=True,
+         f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{command}'}} | Out-Null"],
+        capture_output=True, check=True,
     )
-    text = ""
+
+
+def registered_manifest() -> dict:
+    """
+    The helper's host manifest, found the way a browser started from the taskbar
+    finds it: the registry as seen from outside, then the file it names. The file
+    can be read from here — it is in the checkout, which no package redirects.
+    """
+    out = SCRATCH / "registration.txt"
+    key = rf"HKCU\Software\Chromium\NativeMessagingHosts\{helper.HOST}"
+    outside(f'cmd.exe /c "reg query {key} /ve > "{out}" 2>&1"')
     for _ in range(40):
         time.sleep(0.25)
         try:
-            text = out.read_text(errors="replace")
-            if text:
-                break
+            lines = out.read_text(errors="replace").splitlines()
         except OSError:
-            pass
-    out.unlink(missing_ok=True)
-    return {h: h in text for h in HOSTS}
+            continue
+        if lines:
+            value = next((line.split("REG_SZ", 1)[1].strip() for line in lines if "REG_SZ" in line), None)
+            return helper.read_json(Path(value)) if value else {}
+    return {}
 
 
-def copy_profile():
-    shutil.rmtree(PROFILE, ignore_errors=True)
+def launch_outside() -> None:
+    env = f"set TTARCHIVE_TEST_NO_WINDOWS=1&& set TTARCHIVE_TEST_PICK={ARCHIVE}&& "
+    args = (
+        f'"{CHROME}" --headless --user-data-dir="{PROFILE}" --remote-debugging-port={PORT} --no-first-run '
+        f'--no-default-browser-check --window-size=1280,900 --load-extension="{REPO}" '
+        f"--disable-features=DisableLoadExtensionCommandLineSwitch about:blank"
+    )
+    outside(f'cmd.exe /c "{env}{args}"')
+    for _ in range(60):
+        try:
+            urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version", timeout=1)
+            return
+        except OSError:
+            time.sleep(0.5)
+    raise SystemExit("Chromium did not come up")
+
+
+def stop_browser() -> None:
+    try:
+        CDP(PORT).call("Browser.close")
+    except Exception:
+        pass
+    # Anything left of it, by the profile it was started on.
+    time.sleep(2)
     subprocess.run(
-        ["robocopy", str(REAL_PROFILE / "Default"), str(PROFILE / "Default"), "/E", "/NFL", "/NDL", "/NJH", "/NJS",
-         "/NP", "/R:0", "/W:0", "/XD", "Cache", "Code Cache", "GPUCache", "Dawn*", "Shared Dictionary", "Network",
-         "/XF", "Login Data*", "Web Data*", "Cookies*"],
+        ["powershell", "-NoProfile", "-Command",
+         f"Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='python.exe'\" | "
+         f"Where-Object {{ $_.CommandLine -like '*{SCRATCH.name}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
         capture_output=True,
     )
-    shutil.copy2(REAL_PROFILE / "Local State", PROFILE / "Local State")
+    time.sleep(1)
 
 
-def build_archive():
+# -------------------------------------------------------------------- setup
+
+
+def build_archive(real: Path):
     """A few real posts, copied — never the live archive, for anything that writes."""
     shutil.rmtree(ARCHIVE, ignore_errors=True)
     for d in ("videos", "images", "audio"):
         (ARCHIVE / d).mkdir(parents=True)
-    state = json.loads((REAL_ARCHIVE / "archive.json").read_text(encoding="utf-8"))
+    state = json.loads((real / "archive.json").read_text(encoding="utf-8"))
     vids, photos = [], []
     for i in state.get("likeOrder", []):
         it = state["items"].get(i) or {}
         if it.get("status") != "saved":
             continue
         if it.get("type") == "photo" and len(photos) < 2:
-            imgs, aud = sorted((REAL_ARCHIVE / "images").glob(f"{i}*")), list((REAL_ARCHIVE / "audio").glob(f"{i}.*"))
+            imgs, aud = sorted((real / "images").glob(f"{i}*")), list((real / "audio").glob(f"{i}.*"))
             if imgs and aud:
                 photos.append(i)
                 for f in imgs + aud:
                     shutil.copy2(f, ARCHIVE / f.parent.name)
-        elif it.get("type") != "photo" and len(vids) < 4 and (REAL_ARCHIVE / "videos" / f"{i}.mp4").exists():
+        elif it.get("type") != "photo" and len(vids) < 4 and (real / "videos" / f"{i}.mp4").exists():
             vids.append(i)
-            shutil.copy2(REAL_ARCHIVE / "videos" / f"{i}.mp4", ARCHIVE / "videos")
+            shutil.copy2(real / "videos" / f"{i}.mp4", ARCHIVE / "videos")
         if len(vids) == 4 and len(photos) == 2:
             break
     keep = set(vids) | set(photos)
@@ -126,20 +154,7 @@ def build_archive():
     return vids, photos
 
 
-def launch():
-    env = {**os.environ, "TTARCHIVE_TEST_NO_WINDOWS": "1", "TTARCHIVE_TEST_PICK": str(ARCHIVE)}
-    proc = subprocess.Popen(
-        [CHROME, "--headless", f"--user-data-dir={PROFILE}", "--remote-debugging-port=9333", "--no-first-run",
-         "--no-default-browser-check", "--window-size=1280,900", "about:blank"],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    for _ in range(60):
-        try:
-            urllib.request.urlopen("http://127.0.0.1:9333/json/version", timeout=1)
-            return proc
-        except OSError:
-            time.sleep(0.5)
-    raise SystemExit("Chromium did not come up")
+# ---------------------------------------------------------------- page bits
 
 
 def archive_page(c, timeout=20):
@@ -149,7 +164,7 @@ def archive_page(c, timeout=20):
         if t:
             s = c.attach(t["targetId"])
             try:
-                c.wait(s, "document.readyState === 'complete' && !!document.getElementById('storage')", timeout=10)
+                c.wait(s, "document.readyState === 'complete' && !!document.getElementById('pickFolder')", timeout=10)
                 return s
             except Exception:
                 pass
@@ -172,130 +187,108 @@ def text(c, s, id_):
     return c.eval(s, f"(document.getElementById('{id_}') || {{}}).innerText || ''")
 
 
-def log_lines(path):
+def new_log_lines(before):
     try:
-        return path.read_text(encoding="utf-8").splitlines()
+        return HELPER_LOG.read_text(encoding="utf-8").splitlines()[before:]
     except OSError:
         return []
 
 
-def main():
-    missing = [h for h, ok in registered_outside().items() if not ok]
-    check("both helpers are registered where a browser started from the Start menu looks", not missing,
-          f"missing: {', '.join(missing)} - install from Windows Terminal, not a terminal inside another app" if missing else "")
-    if missing:
-        # Everything after this would be testing a registration only this
-        # terminal's app can see.
-        sys.exit(1)
-    print("copying profile + building scratch archive…", flush=True)
-    copy_profile()
-    vids, photos = build_archive()
-    proc = launch()
+def log_length():
     try:
-        run(vids, photos)
+        return len(HELPER_LOG.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return 0
+
+
+# --------------------------------------------------------------------- run
+
+
+def main():
+    shutil.rmtree(SCRATCH, ignore_errors=True)
+    SCRATCH.mkdir(parents=True)
+    try:
+        manifest = registered_manifest()
+        ok = f"chrome-extension://{EXT}/" in manifest.get("allowed_origins", []) and Path(manifest.get("path", "")).is_file()
+        check("the helper is registered, for this extension's fixed id, where a browser started from the taskbar looks",
+              ok, "" if ok else "run `python tools\\helper.py install` from Windows Terminal")
+        if not ok:
+            return
+        real = helper.remembered_folders(f"chrome-extension://{EXT}/")
+        real = next((p for p in real if (p / "archive.json").is_file()), None)
+        if not real:
+            check("there is an archive on record to take over", False)
+            return
+        vids, photos = build_archive(real)
+        launch_outside()
+        try:
+            run(real, vids, photos)
+        finally:
+            stop_browser()
     finally:
-        try:
-            CDP().call("Browser.close")
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-        time.sleep(1)
         shutil.rmtree(SCRATCH, ignore_errors=True)
-    print(f"\n{sum(results)}/{len(results)} passed")
-    sys.exit(0 if all(results) else 1)
+        print(f"\n{sum(results)}/{len(results)} passed")
+        sys.exit(0 if results and all(results) else 1)
 
 
-def run(vids, photos):
-    c = CDP()
+def run(real, vids, photos):
+    c = CDP(PORT)
     c.open(ARCHIVE_URL)
     s = archive_page(c)
-    # Browser storage to start with, whatever the real profile was last left on.
-    # Its worker is left alone: if that is stale, it is the first thing to check.
-    c.eval(s, "chrome.storage.local.remove(['backend', 'helper'])")
-    c.call("Page.reload", session=s)
-    time.sleep(1)
-    s = archive_page(c)
-    time.sleep(1)
-    check("starts on Browser storage", c.eval(s, "document.getElementById('storage').value") == "browser")
 
-    # --- 1. choose the helper, the way the user did, with the old worker still running
-    c.eval(s, "(e => { e.value = 'helper'; e.dispatchEvent(new Event('change')); })(document.getElementById('storage')); 1")
-    time.sleep(2)
-    s = archive_page(c)
-    c.wait(s, "!document.getElementById('helperSetup').classList.contains('hidden') || /Found/.test(document.getElementById('log').innerText)", timeout=15)
-    # A copied profile runs the worker the real one last registered, which is
-    # stale whenever the extension has changed since it was last reloaded.
-    stale = visible(c, s, "helperReload")
-    if stale:
-        check("an old background is recognised, and the page offers to reload the extension", True, text(c, s, "helperProblem")[:110])
-        check("…without a folder button that can only fail", not visible(c, s, "pickFolder"))
-        check("…and without the install instructions", not visible(c, s, "helperInstall"))
+    # --- 1. a freshly loaded extension, with the helper installed: nothing to choose
+    c.wait(s, "/Found|Could not/.test(document.getElementById('log').innerText)", timeout=30)
+    check("there is no storage menu to choose from", c.eval(s, "document.getElementById('storage') === null"))
+    check("no helper notice", not visible(c, s, "helperSetup"), text(c, s, "helperProblem")[:120])
+    check("the helper took over the archive the browser's picker chose, without being asked",
+          c.eval(s, "document.getElementById('folderName').title") == str(real), c.eval(s, "document.getElementById('folderName').title"))
+    log = text(c, s, "log")
+    check("…and read it", "Found" in log, log.strip().splitlines()[-1][:120])
 
-        # --- 2. reload the extension from that button; the page should come back by itself
-        click(c, s, "#helperReload")
-        time.sleep(4)
-        c = CDP()
-        s = archive_page(c, timeout=20)
-        check("the archive page reopens after the reload", True)
-    else:
-        print("SKIP  the profile's background is current, so there is no stale one to recognise", flush=True)
-    c.wait(s, "document.getElementById('storage').value === 'helper'", timeout=10)
-    time.sleep(1.5)
-    check("Storage still says Local helper", c.eval(s, "document.getElementById('storage').value") == "helper")
-    check("no problem notice now", not visible(c, s, "helperSetup"), text(c, s, "helperProblem")[:100])
-    check("Choose folder… is offered", visible(c, s, "pickFolder"))
-
-    # --- 3. choose the folder through the helper's dialog (answered without a window)
-    before = len(log_lines(HELPER_LOG))
+    # --- 2. Change folder… goes through the helper's dialog (answered without a window)
+    before = log_length()
     click(c, s, "#pickFolder")
     check("the button is held while the dialog is open", c.eval(s, "document.getElementById('pickFolder').disabled"))
-    c.wait(s, "/Found|failed/.test(document.getElementById('log').innerText)", timeout=20)
-    log = text(c, s, "log")
-    check("the folder is read through the helper", "Found" in log and "failed" not in log, log.strip().splitlines()[-1][:120])
-    new = log_lines(HELPER_LOG)[before:]
-    check("the helper's dialog was what answered", any(l.split(" ", 2)[-1].startswith("pick ") and '"ok": true' in l for l in new), " | ".join(new)[:200])
-    check("the button is free again", not c.eval(s, "document.getElementById('pickFolder').disabled"))
-    check("the folder is the one chosen", c.eval(s, "document.getElementById('folderName').title") == str(ARCHIVE))
+    c.wait(s, f"document.getElementById('folderName').title === {json.dumps(str(ARCHIVE))}", timeout=20)
+    c.wait(s, "/Found 6|failed/.test(document.getElementById('log').innerText)", timeout=20)
+    new = new_log_lines(before)
+    check("the helper's dialog answered", any(" pick " in f" {l} " and '"ok": true' in l for l in new), " | ".join(new)[:200])
     cards = c.eval(s, "['statPosts','statVideos'].map(i => document.getElementById(i).textContent)")
-    check("posts and videos counted", cards == [str(len(vids) + len(photos)), str(len(vids))], str(cards))
+    check("the chosen folder is the one read", cards == [str(len(vids) + len(photos)), str(len(vids))], str(cards))
 
-    # --- 4. Library: playback from the helper, then Show in folder
+    # --- 3. Library: playback from the helper, then Show in folder
     c.eval(s, "document.querySelector('.tab[data-panel=library]').click(); 1")
     time.sleep(3)
     c.eval(s, "document.querySelector('#grid > *').click(); 1")
     time.sleep(2)
     v = json.loads(c.eval(s, "JSON.stringify((v => v ? {src: v.src.split('?')[0], ready: v.readyState} : null)(document.querySelector('#lbStage video')))") or "null")
     check("a video plays from the helper", bool(v) and v["src"].startswith("http://127.0.0.1:") and v["ready"] >= 2, str(v))
-    before = len(log_lines(HELPER_LOG))
+    before = log_length()
     click(c, s, ".lb-folder")
     time.sleep(3)
-    new = log_lines(HELPER_LOG)[before:]
+    new = new_log_lines(before)
     note = c.eval(s, "(document.querySelector('.lb-folder-note') || {}).innerText || ''")
-    check("Show in folder is answered by the local helper", any(" show " in f" {l} " and '"ok": true' in l for l in new) and not note, (" | ".join(new) or note)[:200])
+    check("Show in folder is answered by the helper, in the folder it writes",
+          any(" show " in f" {l} " and '"ok": true' in l and ARCHIVE.name in l for l in new) and not note, (" | ".join(new) or note)[:200])
 
-    # --- 5. Show in folder when the local helper has no folder: falls back to the old helper
-    old_before = OLD_LAST_CALL.stat().st_mtime if OLD_LAST_CALL.exists() else 0
-    saved = c.eval(s, "chrome.storage.local.get('helper').then(o => JSON.stringify(o.helper))")
-    c.eval(s, "chrome.storage.local.get('helper').then(o => chrome.storage.local.set({helper: {...o.helper, root: null}}))")
+    # --- 4. with no folder of its own, Show in folder looks where the browser's picker chose
+    c.eval(s, "chrome.runtime.sendMessage({type: 'helper-root', root: null})")
+    before = log_length()
     c.eval(s, "document.querySelector('.lb-folder').click(); 1")
     time.sleep(3)
-    old_after = OLD_LAST_CALL.stat().st_mtime if OLD_LAST_CALL.exists() else 0
-    last = json.loads(OLD_LAST_CALL.read_text(encoding="utf-8")) if OLD_LAST_CALL.exists() else {}
-    note = c.eval(s, "(document.querySelector('.lb-folder-note') || {}).innerText || ''")
-    check("…and without a folder in it, the old helper takes over", old_after > old_before and last.get("answer", {}).get("ok") is True and not note,
-          f"{last.get('answer')} {note}"[:200])
-    c.eval(s, f"chrome.storage.local.set({{helper: {saved}}})")
+    new = new_log_lines(before)
+    check("…and with none, in the folder the browser's picker chose",
+          any(" show " in f" {l} " and '"ok": true' in l and str(real).replace("\\", "\\\\") in l for l in new), " | ".join(new)[:200])
+    c.eval(s, f"chrome.runtime.sendMessage({{type: 'helper-root', root: {json.dumps(str(ARCHIVE))}}})")
     c.eval(s, "document.getElementById('lbClose').click(); 1")
 
-    # --- 6. the Library in a tab, live
+    # --- 5. the Library in a tab, live
     before_t = {t["targetId"] for t in c.targets()}
     c.eval(s, "document.getElementById('openLibrary').click(); 1")
     time.sleep(3)
     tab = next((t for t in c.targets() if t["targetId"] not in before_t and t["type"] == "page"), None)
-    check("Open in a tab lands on the helper's Library", bool(tab) and tab["url"].startswith("http://127.0.0.1:") and tab["url"].endswith("/viewer.html"), tab and tab["url"])
+    check("Open in a tab lands on the helper's Library",
+          bool(tab) and tab["url"].startswith("http://127.0.0.1:") and tab["url"].endswith("/viewer.html"), tab and tab["url"])
     if tab:
         t = c.attach(tab["targetId"])
         c.wait(t, "!document.getElementById('banner').classList.contains('hidden')", timeout=10)
@@ -303,19 +296,10 @@ def run(vids, photos):
         check("…connected to the extension", "Connected to the extension" in banner, banner.split("\n")[0])
         c.eval(t, "document.querySelector('#grid > *').click(); 1")
         time.sleep(2)
-        before = len(log_lines(HELPER_LOG))
+        before = log_length()
         c.eval(t, "document.querySelector('.lb-folder').click(); 1")
         time.sleep(3)
-        new = log_lines(HELPER_LOG)[before:]
-        check("…and its Show in folder reaches the helper too", any('"ok": true' in l for l in new), " | ".join(new)[:200])
-
-    # --- 7. back to Browser storage: nothing the helper set up is left in the way
-    c.eval(s, "(e => { e.value = 'browser'; e.dispatchEvent(new Event('change')); })(document.getElementById('storage')); 1")
-    time.sleep(2)
-    s = archive_page(c)
-    time.sleep(1)
-    check("switching back lands on Browser storage", c.eval(s, "document.getElementById('storage').value") == "browser")
-    check("…with no helper notice", not visible(c, s, "helperSetup"))
+        check("…and its Show in folder reaches the helper too", any('"ok": true' in l for l in new_log_lines(before)))
 
 
 if __name__ == "__main__":

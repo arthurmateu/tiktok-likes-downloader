@@ -10,14 +10,6 @@
 		<header class="topbar">
 			<h1>TikTok Likes Archiver</h1>
 			<div class="folder">
-				<!--
-					Only where the local helper can run at all (Chromium). Changing it
-					reloads the page, since the storage backend is fixed for the life of one.
-				-->
-				<select id="storage" class="hidden" aria-label="Storage" title="What writes the archive folder">
-					<option value="browser">Browser storage</option>
-					<option value="helper">Local helper (experimental)</option>
-				</select>
 				<span id="folderName" class="folder-name">No folder selected</span>
 				<button id="pickFolder" class="btn">Choose folder…</button>
 				<button id="grantFolder" class="btn hidden">Re-grant access</button>
@@ -41,25 +33,17 @@
 					<button id="grantHost" class="btn primary">Grant access to TikTok</button>
 				</div>
 
-				<!-- Only while the local helper is chosen and can't be started. -->
+				<!--
+					Only when the local helper is installed and can't be used: it failed to
+					start, or the background is too old to know about it. Not having the
+					helper at all is normal, and says nothing here.
+				-->
 				<div id="helperSetup" class="notice warn hidden">
-					<p id="helperProblem">The local helper isn't installed yet.</p>
-					<!-- The install instructions, for when the helper is what's missing. -->
-					<div id="helperInstall">
-						<p>
-							It is set up once, by one command. Open a terminal in the extension's own folder — the
-							one with <code>manifest.json</code> in it — and run:
-						</p>
-						<div class="cmd">
-							<input id="helperCmd" type="text" readonly spellcheck="false" value="python tools/helper.py install" />
-							<button id="helperCopy" class="btn">Copy</button>
-						</div>
-					</div>
+					<p id="helperProblem"></p>
 					<div class="row">
 						<!-- For a background older than this page; it reopens the page afterwards. -->
 						<button id="helperReload" class="btn primary hidden">Reload the extension</button>
-						<button id="helperRetry" class="btn primary">Try again</button>
-						<button id="helperLeave" class="btn">Use browser storage instead</button>
+						<button id="helperRetry" class="btn">Try again</button>
 					</div>
 				</div>
 
