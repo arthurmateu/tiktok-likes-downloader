@@ -57,6 +57,7 @@ from show_in_folder import (
     picked_folders,
     read_json,
     read_message,
+    refuse_if_redirected,
     resolve,
     select_in_explorer,
     send_message,
@@ -703,6 +704,7 @@ def install(ids: list[str]) -> None:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}") as reg:
             winreg.SetValueEx(reg, "", 0, winreg.REG_SZ, str(manifest_path))
 
+    refuse_if_redirected(manifest_path, "python tools/helper.py install")
     print(f"Installed in {dest}")
     for origin in origins:
         print(f"  extension {origin.split('/')[2]}")

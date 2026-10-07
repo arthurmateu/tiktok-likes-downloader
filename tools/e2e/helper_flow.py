@@ -52,6 +52,40 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
 
 
+HOSTS = ("com.ttarchive.helper", "com.ttarchive.show_in_folder")
+
+
+def registered_outside():
+    """
+    Which helpers a browser started from the Start menu would find.
+
+    Not something this script can see for itself: run from a terminal inside a
+    packaged app — the Claude desktop app's is one — it reads the registry
+    through that app's private copy, finds registrations nobody else can, and
+    the Chromium it launches inherits the same view, so every check below
+    passes for a browser the user doesn't have. A process the WMI service
+    starts is outside any package, so it is asked instead.
+    """
+    out = Path(r"C:\Users\Public") / f"ttarchive-e2e-{os.getpid()}.txt"
+    cmd = f'cmd.exe /c "reg query HKCU\\Software\\Chromium\\NativeMessagingHosts /s > {out} 2>&1"'
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{cmd}'}} | Out-Null"],
+        capture_output=True,
+    )
+    text = ""
+    for _ in range(40):
+        time.sleep(0.25)
+        try:
+            text = out.read_text(errors="replace")
+            if text:
+                break
+        except OSError:
+            pass
+    out.unlink(missing_ok=True)
+    return {h: h in text for h in HOSTS}
+
+
 def copy_profile():
     shutil.rmtree(PROFILE, ignore_errors=True)
     subprocess.run(
@@ -146,6 +180,13 @@ def log_lines(path):
 
 
 def main():
+    missing = [h for h, ok in registered_outside().items() if not ok]
+    check("both helpers are registered where a browser started from the Start menu looks", not missing,
+          f"missing: {', '.join(missing)} - install from Windows Terminal, not a terminal inside another app" if missing else "")
+    if missing:
+        # Everything after this would be testing a registration only this
+        # terminal's app can see.
+        sys.exit(1)
     print("copying profile + building scratch archive…", flush=True)
     copy_profile()
     vids, photos = build_archive()
