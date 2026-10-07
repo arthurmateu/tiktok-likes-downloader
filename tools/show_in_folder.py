@@ -75,6 +75,43 @@ def read_json(path: Path) -> dict:
         return {}
 
 
+def redirected_into(written: Path) -> str | None:
+    """
+    The app package that kept `written` — a file this run just wrote under
+    %LOCALAPPDATA% — to itself, if one did.
+
+    A terminal opened inside a packaged desktop app (the Claude desktop app is
+    one) runs with that app's view of the user's files and registry: what it
+    writes to %LOCALAPPDATA% and HKCU\\Software lands in the package's private
+    copy, which nothing started from outside the package can see. An install run
+    there reports success, and every browser started from the Start menu or the
+    taskbar answers "Specified native messaging host not found." — which is how
+    Show in folder spent a day and a half failing with everything looking right.
+    It gives itself away on resolving: a redirected file resolves to where it
+    really is, %LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\....
+    """
+    try:
+        rel = written.resolve().relative_to(local_appdata() / "Packages")
+    except ValueError:
+        return None
+    return rel.parts[0] if len(rel.parts) > 2 and rel.parts[1].lower() == "localcache" else None
+
+
+def refuse_if_redirected(written: Path, command: str) -> None:
+    package = redirected_into(written)
+    if not package:
+        return
+    # ASCII: a Windows console prints anything else as mojibake.
+    raise SystemExit(
+        f"\nNOT INSTALLED where your browser can see it.\n"
+        f"This terminal runs inside the app package {package}, and Windows kept everything\n"
+        f"it just wrote private to that app. A browser you start yourself will say\n"
+        f'"Specified native messaging host not found."\n\n'
+        f"Run the same command from Windows Terminal, or any terminal opened from the Start\n"
+        f"menu - not from a terminal inside another app:\n\n    {command}\n"
+    )
+
+
 def profiles():
     for data in BROWSERS.values():
         base = local_appdata() / data
@@ -280,6 +317,7 @@ def install(ids: list[str], root: Path | None) -> None:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}") as reg:
             winreg.SetValueEx(reg, "", 0, winreg.REG_SZ, str(manifest_path))
 
+    refuse_if_redirected(manifest_path, "python tools/show_in_folder.py install")
     print(f"Installed in {dest}")
     for origin in origins:
         ext_id = origin.split("/")[2]
