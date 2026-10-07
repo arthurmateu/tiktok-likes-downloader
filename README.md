@@ -118,6 +118,31 @@ Pressing the button before the helper is set up shows that command, ready to cop
 
 Firefox needs no helper: it downloaded every file itself, so `downloads.show` knows where each one is. A file that only came in by **Scan an existing folder…**, or whose download history has been cleared, has nothing to point at, and the button says so.
 
+## Local helper (experimental)
+
+A second way to own the folder on Chromium, there to be tried before anything depends on it. The extension still does everything that needs TikTok — the list is read and every file is downloaded in your own logged-in session, exactly as before — but instead of writing through File System Access it hands each file to [`tools/helper.py`](tools/helper.py), a small process outside the browser that writes it with an ordinary path. That buys what an extension can't have on its own:
+
+- **No folder permission to grant again.** File System Access asks once per browser session; the helper has the folder for as long as it runs.
+- **The Library at a real address.** The helper serves the folder on `http://127.0.0.1:8737/`, so **Library → Open in a tab** opens the folder's `viewer.html` there — live, connected to the extension, with no *Allow access to file URLs* — and an address you can bookmark. The extension's own Library streams from the same address by range, rather than reading each file into memory first.
+- **Explorer by real path.** **Show in folder** asks the helper, which knows where the archive is because it was told, not because it read the browser's profile.
+
+Set up once, from the repo folder, then pick **Local helper (experimental)** in the Storage menu at the top of the archive page:
+
+```bash
+python tools/helper.py install
+```
+
+`install` finds the extension's id the same way `show_in_folder.py` does, copies the helper (and `show_in_folder.py`, whose profile lookups and Explorer call it reuses) into `%LOCALAPPDATA%\ttarchive-helper`, and registers `com.ttarchive.helper` under `HKCU` for Chrome, Chromium, Edge and Brave. `uninstall` takes it back out. Switching back to **Browser storage** is the same menu; nothing about the folder changes either way, since both write the same layout into the same place. The first time, the helper's folder dialog opens on the folder the browser picker last chose, so it is one click to keep the archive where it is.
+
+How it fits together:
+
+- **The background starts it and holds it.** `src/background.js` opens a native-messaging port to the helper, which serves HTTP until that port closes. An open native port is also what keeps an MV3 worker alive, so the helper is up for as long as the browser is, and the Library's address keeps answering with the archive page closed. If the worker is stopped anyway, the next request from the archive page brings both back — a write that fails because the helper went away is retried once on the new one.
+- **Bytes go over HTTP, not native messaging.** `src/lib/backends/helper.js` is a third backend behind `src/lib/fs.js`, beside File System Access and the downloads API: `PUT` to write (to a `.ttarchive-part` file, renamed into place once whole), `GET`/`HEAD` with ranges to read, `/api/list` for the directory listing that still decides what needs downloading. The choice of backend is stored, and the page reloads to apply it; nothing above `fs.js` knows which one ran.
+- **Dialogs and Explorer are processes of their own.** The folder dialog and **Show in folder** start a fresh helper per click with `sendNativeMessage` rather than asking the running server, because Windows only lets a process come to the front when the foreground process just started it — a dialog from a server that has been up for an hour opens behind the browser.
+- **Only the extension gets in.** Every request needs a token the extension generates and keeps; writes take it only as a header, which a page on another site can't send here without a CORS preflight the helper answers for the extension's origin alone. Opening the Library turns the token into an `HttpOnly`, `SameSite=Lax` cookie, so the page's own media requests are let in and another site's `<img>` pointed at this address is not. Requests naming any host other than `127.0.0.1` or `localhost` are refused, which is what stops DNS rebinding.
+
+What it doesn't change: anything about TikTok, the folder layout, `archive.json`, or `viewer.html` opened by double-click. Windows and Chromium only, like **Show in folder**. Firefox keeps its downloads backend.
+
 ## Converting an existing archive
 
 [`tools/script.py`](tools/script.py) turns a myfaveTT folder — or an older version of this one, which used `data/Likes/` — into the layout above. Copy it into the folder and run it:
@@ -243,12 +268,14 @@ The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its 
 | `src/lib/fs.js` | Storage façade: folder layout, backend selection by feature detection. |
 | `src/lib/backends/fsa.js` | Chromium backend — File System Access, write retries. |
 | `src/lib/backends/downloads.js` | Gecko backend — downloads API, history-derived listing, folder snapshot. |
+| `src/lib/backends/helper.js` | Experimental Chromium backend — the folder over HTTP to `tools/helper.py`. See [Local helper](#local-helper-experimental). |
 | `src/lib/ext.js` | `browser ?? chrome`, so every call site can `await`. |
 | `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status, and how far down the list a sync still has to read. |
 | `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
 | `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
 | `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
 | `tools/show_in_folder.py` | Windows native-messaging helper behind **Show in folder** on Chromium, and its own installer. |
+| `tools/helper.py` | The experimental local helper: serves and writes the archive folder on 127.0.0.1, opens the folder dialog and Explorer. Its own installer. |
 
 All fetching happens on the extension page rather than in a content script: since Chrome 85 content-script requests obey the page's CORS policy, while extension pages get host-permission-based access.
 
@@ -322,5 +349,7 @@ Then open `http://127.0.0.1:8777/syntaxcheck.html`. Add `?gecko` to make it stub
 `src/dev/viewer.html` builds a `viewer.html` from sample state and checks the inlining, which is the part that goes wrong once and silently in someone's folder. A caption is arbitrary text from TikTok, and the fixture's caption carries the three sequences that break a naive generator: `</script>`, which ends the element it sits in; `$&`, which `String.replace` reads out of a *replacement*; and U+2028, a line terminator to a JavaScript parser but not to JSON. The result is rendered into a `blob:` iframe, whose origin is opaque like a `file://` document's. Open `http://127.0.0.1:8777/src/dev/viewer.html`.
 
 `src/dev/selftest.html` answers what a stubbed API can't, by running inside the loaded extension: whether a credentialed fetch from `moz-extension://` carries TikTok's cookies, whether a root-level `archive.json` lands where it was asked to, whether `conflictAction: 'overwrite'` really overwrites instead of uniquifying to `probe(1).txt`, whether `downloads.search` returns paths in the shape `refresh()` parses, and whether the `world: "MAIN"` hook actually installed. Build with `python tools/build.py firefox --dev`, then open the archive page and replace `src/archive/archive.html` in the URL with `src/dev/selftest.html`. It writes only into `<Downloads>/ttarchive-selftest/`, saves and restores the stored folder setting around the run, and has a button to delete everything it wrote.
+
+`tools/test_helper.py` runs `tools/helper.py` the way Chromium does — a child process started with an extension origin, spoken to over a length-prefixed pipe — and then over HTTP: writes landing whole and never half-listed, ranges, the token being required everywhere and accepted only as a header for writes, paths that try to leave the folder, other hosts and other origins being refused, the port falling back when it's taken, and the process going away when the pipe closes. `python tools/test_helper.py`; nothing it does opens a window or touches anything outside a temporary folder. `syntaxcheck.html?helper` evaluates the archive page with the helper chosen and not installed.
 
 `src/dev/verify.html` downloads a list of media URLs from the extension's own origin and POSTs the bytes to a local receiver, so the results can be inspected with ffmpeg. It reads its target list from `http://127.0.0.1:8899/targets.json` and needs a CORS-enabled receiver on that port (plain `python -m http.server` will not do — no `Access-Control-Allow-Origin`). To run it, load the extension with a real TikTok tab open in the same profile, then navigate to the page. Also dev-only.

@@ -1071,11 +1071,16 @@ select:focus {
 	font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 	word-break: break-all;
 }
-.lb-folder-note .cmd {
+.lb-folder-note .cmd,
+.notice .cmd {
 	display: flex;
 	gap: 6px;
 }
-.lb-folder-note .cmd input {
+.notice .cmd {
+	margin-bottom: 12px;
+}
+.lb-folder-note .cmd input,
+.notice .cmd input {
 	flex: 1;
 	min-width: 0;
 	color: var(--fg);
@@ -1085,7 +1090,8 @@ select:focus {
 	padding: 5px 7px;
 	font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.lb-folder-note .cmd .btn {
+.lb-folder-note .cmd .btn,
+.notice .cmd .btn {
 	padding: 4px 10px;
 	font-size: 12px;
 }

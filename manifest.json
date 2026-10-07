@@ -17,7 +17,8 @@
 		"*://*.byteoversea.com/*",
 		"*://*.ibytedtos.com/*",
 		"*://*.muscdn.com/*",
-		"*://*.isnssdk.com/*"
+		"*://*.isnssdk.com/*",
+		"http://127.0.0.1/*"
 	],
 	"background": {
 		"service_worker": "src/background.js",
@@ -43,8 +44,8 @@
 			"all_frames": false
 		},
 		{
-			"_comment": "The viewer.html written into the archive folder. Inert unless the page carries our meta tag, and dead entirely until the user turns on 'Allow access to file URLs' — Chromium will not run an extension on a local file otherwise. Firefox has no equivalent and rejects file:// match patterns, so manifest.firefox.json has no counterpart to this.",
-			"matches": ["file:///*"],
+			"_comment": "The viewer.html written into the archive folder. Inert unless the page carries our meta tag. Opened from disk it is dead entirely until the user turns on 'Allow access to file URLs' — Chromium will not run an extension on a local file otherwise; served by the local helper on 127.0.0.1 it needs nothing. Firefox has no equivalent and rejects file:// match patterns, so manifest.firefox.json has no counterpart to this.",
+			"matches": ["file:///*", "http://127.0.0.1/*"],
 			"js": ["src/content/viewer-bridge.js"],
 			"run_at": "document_idle",
 			"world": "ISOLATED",
@@ -53,9 +54,9 @@
 	],
 	"web_accessible_resources": [
 		{
-			"_comment": "So a generated viewer.html can link back to the archive page.",
+			"_comment": "So a generated viewer.html can link back to the archive page, opened from disk or served by the local helper.",
 			"resources": ["src/archive/archive.html"],
-			"matches": ["file:///*"]
+			"matches": ["file:///*", "http://127.0.0.1/*"]
 		}
 	],
 	"declarative_net_request": {

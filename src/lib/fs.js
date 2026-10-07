@@ -8,11 +8,15 @@
  * over. Both are behind this one interface, so state.js, downloader.js and
  * viewer.js never learn which browser they're on.
  *
- * The backend is chosen by feature detection, not by user agent.
+ * The backend is chosen by feature detection, not by user agent — except for
+ * the local helper, which is a third way to do the same four things on
+ * Chromium and is only used once the user has chosen it. See `init`.
  */
 
+import { ext } from './ext.js';
 import * as fsa from './backends/fsa.js';
 import * as downloads from './backends/downloads.js';
+import * as helper from './backends/helper.js';
 
 /**
  * Folder layout inside the archive root. Flat on purpose: three media
@@ -62,7 +66,40 @@ export function audioOwner(name) {
 	return m ? m[1] : null;
 }
 
-const backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
+let backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
+
+/** Where the choice of the local helper is kept. The background reads it too. */
+const BACKEND_KEY = 'backend';
+
+/**
+ * Swap in the local helper if the user chose it. The archive page calls this
+ * once, before anything touches the folder; anything that never does — the dev
+ * harnesses — keeps the backend feature detection picked.
+ */
+export async function init() {
+	if (!helper.supported()) return;
+	let chosen = null;
+	try {
+		chosen = (await ext.storage.local.get(BACKEND_KEY))[BACKEND_KEY];
+	} catch (_) {
+		return;
+	}
+	if (chosen === 'helper') {
+		backend = helper;
+		capabilities = helper.capabilities;
+	}
+}
+
+/** Whether this browser can use the local helper at all. */
+export function helperSupported() {
+	return helper.supported();
+}
+
+/** Takes effect on the next load of the page — the backend is fixed for the life of one. */
+export async function chooseBackend(id) {
+	if (id === 'helper') await ext.storage.local.set({ [BACKEND_KEY]: 'helper' });
+	else await ext.storage.local.remove(BACKEND_KEY);
+}
 
 export function supported() {
 	return backend !== null;
@@ -77,7 +114,7 @@ export function backendId() {
  * `readBack`: true (always) | 'snapshot' (only after a folder scan) | false
  * `liveListing`: whether a listing reflects outside changes without a refresh
  */
-export const capabilities = backend
+export let capabilities = backend
 	? backend.capabilities
 	: { pick: null, readBack: false, liveListing: false };
 
@@ -90,6 +127,16 @@ function must() {
 
 export function rootName() {
 	return backend ? backend.rootLabel() : null;
+}
+
+/** The folder's full path, where the backend knows it. File System Access never does. */
+export function rootPath() {
+	return backend && typeof backend.rootPath === 'function' ? backend.rootPath() : null;
+}
+
+/** The Library at an address a tab can open, where the backend serves one. */
+export function libraryURL() {
+	return backend && typeof backend.libraryURL === 'function' ? backend.libraryURL() : null;
 }
 
 /** Must be called from a user gesture. `opts.name` is used by the downloads backend. */
@@ -174,6 +221,15 @@ export function readBlob(parts, name) {
 export function fileSize(parts, name) {
 	if (!backend) return Promise.resolve(null);
 	return backend.fileSize(parts, name);
+}
+
+/**
+ * A URL a media element can stream this file from, or null where the backend
+ * has no such thing and the file has to be read into a blob instead. Says
+ * nothing about whether the file exists.
+ */
+export function mediaURL(parts, name) {
+	return backend && typeof backend.mediaURL === 'function' ? backend.mediaURL(parts, name) : null;
 }
 
 /**

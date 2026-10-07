@@ -119,3 +119,7 @@ export function rootName() {
 	return 'fake';
 }
 export const capabilities = { pick: 'directory', readBack: true, liveListing: true };
+/** Files here are blobs and nothing serves them, as on File System Access. */
+export function mediaURL() {
+	return null;
+}

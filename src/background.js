@@ -57,6 +57,19 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 		showInFolder(msg.path).then(sendResponse);
 		return true;
 	}
+	if (msg.type === 'helper-ensure') {
+		ensureHelper().then(sendResponse);
+		return true;
+	}
+	if (msg.type === 'helper-root') {
+		setHelperRoot(msg.root).then(sendResponse);
+		return true;
+	}
+	if (msg.type === 'helper-stop') {
+		stopHelper();
+		sendResponse({ ok: true });
+		return;
+	}
 
 	// The collector's clock. Its own timers are clamped while its tab is in the
 	// background — which is where we want that tab — and ours are not.
@@ -157,6 +170,7 @@ async function showInFolder(path) {
 	// helper finds this extension's id, and the folder, in the browser's profile.
 	const setup = 'python tools/show_in_folder.py install';
 	if (typeof path !== 'string' || !path) return { ok: false, error: 'no path' };
+	if (await helperChosen()) return showViaHelper(path);
 	try {
 		const res = await ext.runtime.sendNativeMessage(FOLDER_HOST, { path });
 		if (res && res.error === 'no-helper') return { ...res, setup };
@@ -170,6 +184,166 @@ async function showInFolder(path) {
 		return { ok: false, error: /not found|forbidden/i.test(text) ? 'no-helper' : text, detail: text, setup };
 	}
 }
+
+// --------------------------------------------------------------- local helper
+
+/**
+ * tools/helper.py, the experimental alternative to File System Access: a
+ * process outside the browser that owns the archive folder, writes what the
+ * archive page downloads, and serves the folder on 127.0.0.1. Only ever used
+ * once it has been chosen on the archive page, which stores that choice under
+ * BACKEND_KEY — see `init` in src/lib/fs.js.
+ *
+ * It is started here and not by the archive page so that it outlives that
+ * page: the Library's address keeps answering with the page closed. The pipe
+ * to it is what keeps it running, and since Chromium 105 an open native port
+ * is also what keeps this worker running — so in practice the helper is up
+ * for as long as the browser is, and comes back with the worker if Chromium
+ * stops it anyway.
+ */
+const HELPER_HOST = 'com.ttarchive.helper';
+const HELPER_SETUP = 'python tools/helper.py install';
+const BACKEND_KEY = 'backend';
+/** `{ token, root, port }` — the helper keeps nothing; everything it is told is here. */
+const HELPER_KEY = 'helper';
+/** Asked for first, so the Library's address stays the same from one start to the next. */
+const HELPER_PORT = 8737;
+
+/** @type {{ port: chrome.runtime.Port | null, ready: Promise<any> } | null} */
+let helper = null;
+
+async function helperChosen() {
+	return (await ext.storage.local.get(BACKEND_KEY))[BACKEND_KEY] === 'helper';
+}
+
+async function helperConfig() {
+	const config = (await ext.storage.local.get(HELPER_KEY))[HELPER_KEY] || {};
+	if (!config.token) {
+		// Kept, not made fresh each start: it is also the cookie the Library tab
+		// holds, and a new one would lock every open Library out.
+		config.token = crypto.randomUUID();
+		await ext.storage.local.set({ [HELPER_KEY]: config });
+	}
+	return config;
+}
+
+function helperProblem(text) {
+	// Chromium's own wording: "Specified native messaging host not found." when
+	// nothing is registered, "…is forbidden." when it is but not for this id.
+	if (/not found|forbidden/i.test(text)) return { ok: false, error: 'no-helper', detail: text, setup: HELPER_SETUP };
+	return { ok: false, error: text };
+}
+
+/** The helper, started if it isn't: `{ ok, base, token, root, rootOk }`. */
+function ensureHelper() {
+	if (helper) return helper.ready;
+	const state = { port: null, ready: null };
+	state.ready = (async () => {
+		const config = await helperConfig();
+		return new Promise((resolve) => {
+			let port;
+			try {
+				port = ext.runtime.connectNative(HELPER_HOST);
+			} catch (err) {
+				resolve(helperProblem(String((err && err.message) || err)));
+				return;
+			}
+			state.port = port;
+			const timer = setTimeout(() => {
+				resolve({ ok: false, error: 'the helper did not start within 15 seconds' });
+				port.disconnect();
+				if (helper === state) helper = null;
+			}, 15000);
+			port.onMessage.addListener((msg) => {
+				if (!msg) return;
+				clearTimeout(timer);
+				if (msg.type === 'ready') {
+					resolve({
+						ok: true,
+						base: `http://127.0.0.1:${msg.port}`,
+						token: config.token,
+						root: msg.root,
+						rootOk: msg.rootOk,
+						version: msg.version,
+					});
+				} else {
+					resolve({ ok: false, error: msg.error || 'the helper would not start' });
+				}
+			});
+			port.onDisconnect.addListener(() => {
+				clearTimeout(timer);
+				// Read here or Chromium logs it as unchecked.
+				const why = ext.runtime.lastError ? ext.runtime.lastError.message : 'the helper exited';
+				if (helper === state) helper = null;
+				resolve(helperProblem(why || 'the helper exited'));
+			});
+			port.postMessage({ cmd: 'start', token: config.token, root: config.root || null, port: config.port || HELPER_PORT });
+		});
+	})();
+	helper = state;
+	// A start that failed isn't kept: the next ask tries again, and the helper may
+	// have been installed in between.
+	state.ready.then((res) => {
+		if (!res.ok && helper === state) helper = null;
+	});
+	return state.ready;
+}
+
+function stopHelper() {
+	const state = helper;
+	helper = null;
+	if (state && state.port) state.port.disconnect();
+}
+
+/**
+ * Point the helper at another folder, or at none. The helper is asked first,
+ * so a folder it can't use — gone by the time it looks — is never remembered.
+ */
+async function setHelperRoot(root) {
+	const info = await ensureHelper();
+	if (!info.ok) return info;
+	let res;
+	try {
+		const reply = await fetch(`${info.base}/api/root`, {
+			method: 'POST',
+			headers: { 'X-Ttarchive-Token': info.token, 'Content-Type': 'application/json' },
+			body: JSON.stringify({ path: root || null }),
+		});
+		res = await reply.json();
+	} catch (err) {
+		return { ok: false, error: `could not reach the helper (${String((err && err.message) || err)})` };
+	}
+	if (!res || !res.ok) return res || { ok: false, error: 'the helper gave no answer' };
+
+	const config = await helperConfig();
+	config.root = res.root;
+	config.port = Number(new URL(info.base).port);
+	await ext.storage.local.set({ [HELPER_KEY]: config });
+
+	const next = { ...info, root: res.root, rootOk: res.rootOk };
+	if (helper && helper.port) helper.ready = Promise.resolve(next);
+	return next;
+}
+
+/**
+ * Show in folder, by the helper rather than tools/show_in_folder.py — a
+ * process of its own per click, for the reason in helper.py's docstring.
+ */
+async function showViaHelper(path) {
+	const { root } = await helperConfig();
+	if (!root) return { ok: false, error: 'the helper has no archive folder yet — choose one on the archiver’s page' };
+	try {
+		const res = await ext.runtime.sendNativeMessage(HELPER_HOST, { cmd: 'show', root, path });
+		return res || { ok: false, error: 'the helper gave no answer' };
+	} catch (err) {
+		return helperProblem(String((err && err.message) || err));
+	}
+}
+
+// With the helper chosen it runs whenever this worker does; see above.
+helperChosen().then((chosen) => {
+	if (chosen) ensureHelper();
+});
 
 // ---------------------------------------------------------------- from archive
 

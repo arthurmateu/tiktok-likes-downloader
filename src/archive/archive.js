@@ -217,6 +217,8 @@ function scanningMsg(files) {
 
 async function afterFolderReady() {
 	$('folderName').textContent = fs.rootName();
+	$('folderName').title = fs.rootPath() || '';
+	$('openLibrary').classList.toggle('hidden', !fs.libraryURL());
 	$('grantFolder').classList.add('hidden');
 	$('noFolder').classList.add('hidden');
 	$('pickFolder').textContent = 'Change folder…';
@@ -423,6 +425,22 @@ async function writeViewerFile({ quiet = false } = {}) {
 	}
 }
 
+/**
+ * The Library at the local helper's address. viewer.html is written first, so
+ * what opens is this version of it and not whatever the last sync left; the
+ * helper serves it, and every file it plays, straight off the folder.
+ */
+$('openLibrary').addEventListener('click', async () => {
+	$('openLibrary').disabled = true;
+	try {
+		if (app.state) await writeViewerFile({ quiet: true });
+		const url = fs.libraryURL();
+		if (url) await ext.tabs.create({ url });
+	} finally {
+		$('openLibrary').disabled = false;
+	}
+});
+
 $('writeViewer').addEventListener('click', async () => {
 	if (!app.state) {
 		log('Pick a folder first.', 'err');
@@ -590,6 +608,8 @@ function onContentMessage(type, payload) {
 }
 
 function setSyncButtons(running) {
+	// Switching reloads the page, which would end the run mid-flight.
+	$('storage').disabled = running;
 	$('startSync').disabled = running;
 	$('syncMode').disabled = running;
 	$('fetchSongs').disabled = running;
@@ -1200,6 +1220,52 @@ for (const tab of document.querySelectorAll('.tab')) {
 	});
 }
 
+// ---------------------------------------------------------------- storage
+
+/**
+ * Browser storage (File System Access) or the local helper, tools/helper.py.
+ * The choice is stored and read by fs.init at the next load: the backend
+ * can't change under a page that has already read the folder through it.
+ */
+$('storage').addEventListener('change', async () => {
+	const choice = $('storage').value;
+	await fs.chooseBackend(choice);
+	// Leaving the helper: nothing else needs it running.
+	if (choice !== 'helper') await ext.runtime.sendMessage({ type: 'helper-stop' });
+	location.reload();
+});
+
+/** Why the helper couldn't be had, and what to do about it. */
+function showHelperProblem(problem) {
+	$('helperSetup').classList.remove('hidden');
+	$('noFolder').classList.add('hidden');
+	if (problem && problem.error === 'no-helper') {
+		$('helperProblem').textContent = 'The local helper isn’t installed yet — or isn’t registered for this copy of the extension.';
+		if (problem.setup) $('helperCmd').value = problem.setup;
+	} else {
+		$('helperProblem').textContent = `The local helper couldn’t be started: ${(problem && (problem.detail || problem.error)) || 'no answer'}.`;
+	}
+	log(`Local helper: ${(problem && (problem.detail || problem.error)) || 'no answer'}`, 'err');
+}
+
+$('helperCopy').addEventListener('click', async () => {
+	$('helperCmd').select();
+	try {
+		await navigator.clipboard.writeText($('helperCmd').value);
+		$('helperCopy').textContent = 'Copied';
+	} catch (_) {
+		$('helperCopy').textContent = 'Press Ctrl+C';
+	}
+	setTimeout(() => ($('helperCopy').textContent = 'Copy'), 2000);
+});
+
+$('helperRetry').addEventListener('click', () => location.reload());
+
+$('helperLeave').addEventListener('click', async () => {
+	await fs.chooseBackend('browser');
+	location.reload();
+});
+
 // ---------------------------------------------------------------- boot
 
 /**
@@ -1231,7 +1297,13 @@ async function checkHostAccess() {
 }
 
 (async function boot() {
+	await fs.init();
 	wireLibrary(() => app.state);
+
+	if (fs.helperSupported()) {
+		$('storage').value = fs.backendId() === 'helper' ? 'helper' : 'browser';
+		$('storage').classList.remove('hidden');
+	}
 
 	if (!fs.supported()) {
 		$('noFolder').textContent =
@@ -1245,9 +1317,17 @@ async function checkHostAccess() {
 	if (byName) $('pickFolder').textContent = 'Set folder…';
 	if (fs.canScanFolder()) $('scanRow').classList.remove('hidden');
 
-	const { state, label } = await fs.restoreFolder();
+	const { state, label, problem } = await fs.restoreFolder();
 	if (state === 'granted') {
 		await afterFolderReady();
+	} else if (state === 'unavailable') {
+		showHelperProblem(problem);
+	} else if (state === 'missing') {
+		// The helper remembers the folder; it just isn't there. A drive not plugged
+		// in is the usual reason, and choosing another is the other way out.
+		$('folderName').textContent = `${label} (not found)`;
+		$('pickFolder').textContent = 'Change folder…';
+		log(`The archive folder ${label} isn’t there. Plug its drive in and reload, or choose another folder.`, 'err');
 	} else if (label) {
 		$('folderName').textContent = `${label} (access needs re-granting)`;
 		$('grantFolder').classList.remove('hidden');

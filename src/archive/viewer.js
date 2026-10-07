@@ -15,7 +15,7 @@
  * to their metadata and the lightbox says the file isn't readable.
  */
 
-import { LAYOUT, readBlob, hasReadableFiles, showInFolder } from '../lib/fs.js';
+import { LAYOUT, readBlob, fileSize, mediaURL, hasReadableFiles, showInFolder } from '../lib/fs.js';
 import { disk, listingComplete } from '../lib/state.js';
 
 const $ = (id) => document.getElementById(id);
@@ -28,9 +28,28 @@ let observer = null;
 
 // ------------------------------------------------------------------ helpers
 
-async function blobURL(parts, name) {
-	const blob = await readBlob(parts, name);
-	return blob ? URL.createObjectURL(blob) : null;
+/**
+ * What a media element can load a file from, or null if it isn't there.
+ *
+ * A URL straight to the file where the backend serves one — the local helper —
+ * so the element streams it by range the way it would off disk, rather than
+ * waiting for a whole clip to be copied into memory. Otherwise the file itself,
+ * which File System Access hands back disk-backed.
+ */
+async function mediaSource(parts, name) {
+	const url = mediaURL(parts, name);
+	if (url) return (await fileSize(parts, name)) == null ? null : url;
+	return readBlob(parts, name);
+}
+
+/**
+ * A URL for an element's `src`. An object URL that wants revoking when the
+ * element goes, or the helper's own URL, for which revoking is a no-op — so
+ * callers needn't tell the two apart.
+ */
+async function fileURL(parts, name) {
+	const src = await mediaSource(parts, name);
+	return src instanceof Blob ? URL.createObjectURL(src) : src;
 }
 
 /** Shown in place of the media when the backend can't read the folder back. */
@@ -352,22 +371,28 @@ function cacheThumb(id, blob) {
  * Draw one frame out of a video file.
  *
  * Seeks a little way in rather than taking frame 0, which on TikTok is very
- * often black or a fade-in. The source blob is a File handle, so the decoder
- * reads only the bytes it needs and not the whole clip.
+ * often black or a fade-in. The source is a File handle or the helper's URL for
+ * the file, and either way the decoder reads only the bytes it needs and not
+ * the whole clip.
  */
-function frameFrom(blob) {
+function frameFrom(src) {
 	return new Promise((resolve) => {
-		const url = URL.createObjectURL(blob);
+		const owned = src instanceof Blob;
+		const url = owned ? URL.createObjectURL(src) : src;
 		const v = document.createElement('video');
 		v.muted = true;
 		v.preload = 'metadata';
+		// Drawn onto a canvas below, which a frame from another origin would taint
+		// for good. The helper answers this origin's CORS, so asking in CORS mode
+		// gets a frame the canvas can be read back from.
+		if (!owned) v.crossOrigin = 'anonymous';
 
 		let settled = false;
 		const done = (out) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			URL.revokeObjectURL(url);
+			if (owned) URL.revokeObjectURL(url);
 			v.removeAttribute('src');
 			v.load();
 			resolve(out);
@@ -476,7 +501,7 @@ function recordedVideo(id) {
 export async function loadThumb(id) {
 	const photos = disk.photos.get(id) || recordedPhotos(id);
 	if (photos) {
-		return photos.length ? blobURL(LAYOUT.images, photos[0]) : null;
+		return photos.length ? fileURL(LAYOUT.images, photos[0]) : null;
 	}
 
 	const cached = thumbs.get(id);
@@ -486,7 +511,7 @@ export async function loadThumb(id) {
 	if (!name) return null;
 
 	return queueDecode(async () => {
-		const file = await readBlob(LAYOUT.videos, name);
+		const file = await mediaSource(LAYOUT.videos, name);
 		if (!file) return null;
 		const frame = await frameFrom(file);
 		return frame ? URL.createObjectURL(cacheThumb(id, frame)) : null;
@@ -709,7 +734,7 @@ async function mountSong(item, seq) {
 		return;
 	}
 
-	const url = await blobURL(LAYOUT.audio, file);
+	const url = await fileURL(LAYOUT.audio, file);
 	if (seq !== lbSeq) {
 		if (url) URL.revokeObjectURL(url);
 		return;
@@ -1126,7 +1151,7 @@ async function renderStage(item) {
 			sheet.appendChild(head);
 			stage.appendChild(sheet);
 			for (let i = 0; i < names.length; i++) {
-				const url = await blobURL(LAYOUT.images, names[i]);
+				const url = await fileURL(LAYOUT.images, names[i]);
 				if (stale(url)) return;
 				if (!url) continue;
 				openURLs.push(url);
@@ -1150,7 +1175,7 @@ async function renderStage(item) {
 		}
 
 		lbPhoto = Math.min(lbPhoto, names.length - 1);
-		const url = await blobURL(LAYOUT.images, names[lbPhoto]);
+		const url = await fileURL(LAYOUT.images, names[lbPhoto]);
 		if (stale(url)) return;
 		if (!url) {
 			stage.textContent = unreadableNote();
@@ -1161,7 +1186,7 @@ async function renderStage(item) {
 		return;
 	}
 
-	const url = await blobURL(LAYOUT.videos, `${item.id}.mp4`);
+	const url = await fileURL(LAYOUT.videos, `${item.id}.mp4`);
 	if (stale(url)) return;
 	if (!url) {
 		stage.textContent = unreadableNote();
