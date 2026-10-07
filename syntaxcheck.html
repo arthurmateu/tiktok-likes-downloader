@@ -37,7 +37,9 @@
 					onUpdated: { addListener: noop, removeListener: noop },
 				},
 				windows: { update: noop },
-				storage: { local: { get: () => Promise.resolve({}), set: () => Promise.resolve() } },
+				storage: {
+					local: { get: () => Promise.resolve({}), set: () => Promise.resolve(), remove: () => Promise.resolve() },
+				},
 				permissions: {
 					contains: () => Promise.resolve(true),
 					request: () => Promise.resolve(true),
@@ -55,6 +57,16 @@
 				delete window.showDirectoryPicker;
 				window.browser = window.chrome;
 			}
+
+			// `?helper` chooses the local helper, and answers as a browser with no
+			// helper installed does, so that backend and the page's setup notice get
+			// evaluated rather than just parsed.
+			if (new URLSearchParams(location.search).has('helper')) {
+				chrome.runtime.connectNative = noop;
+				chrome.storage.local.get = () => Promise.resolve({ backend: 'helper' });
+				chrome.runtime.sendMessage = () =>
+					Promise.resolve({ ok: false, error: 'no-helper', setup: 'python tools/helper.py install' });
+			}
 		</script>
 
 		<!-- The archive page's own DOM, so archive.js/viewer.js can bind to it. -->
@@ -67,12 +79,13 @@
 				'cFail','cBytes','log','loading','loadingMsg','statPosts','statVideos','statImages','statUnavailable','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta','lbHelp','lbKeys',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
+				'storage','helperSetup','helperProblem','helperCmd','helperCopy','helperRetry','helperLeave','openLibrary',
 			];
-			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput'];
+			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput','helperCmd'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = INPUTS.includes(id) ? 'input'
-					: ['sort','kind'].includes(id) ? 'select' : 'div';
+					: ['sort','kind','storage'].includes(id) ? 'select' : 'div';
 				const el = document.createElement(tag);
 				el.id = id;
 				el.classList.add('hidden');
@@ -96,6 +109,7 @@
 				'./src/lib/ext.js',
 				'./src/lib/backends/fsa.js',
 				'./src/lib/backends/downloads.js',
+				'./src/lib/backends/helper.js',
 				'./src/lib/fs.js',
 				'./src/lib/state.js',
 				'./src/lib/downloader.js',

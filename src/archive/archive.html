@@ -10,6 +10,14 @@
 		<header class="topbar">
 			<h1>TikTok Likes Archiver</h1>
 			<div class="folder">
+				<!--
+					Only where the local helper can run at all (Chromium). Changing it
+					reloads the page, since the storage backend is fixed for the life of one.
+				-->
+				<select id="storage" class="hidden" aria-label="Storage" title="What writes the archive folder">
+					<option value="browser">Browser storage</option>
+					<option value="helper">Local helper (experimental)</option>
+				</select>
 				<span id="folderName" class="folder-name">No folder selected</span>
 				<button id="pickFolder" class="btn">Choose folder…</button>
 				<button id="grantFolder" class="btn hidden">Re-grant access</button>
@@ -31,6 +39,23 @@
 						permissions as optional, so they have to be granted before any download will work.
 					</p>
 					<button id="grantHost" class="btn primary">Grant access to TikTok</button>
+				</div>
+
+				<!-- Only while the local helper is chosen and can't be started. -->
+				<div id="helperSetup" class="notice warn hidden">
+					<p id="helperProblem">The local helper isn't installed yet.</p>
+					<p>
+						It is set up once, by one command. Open a terminal in the extension's own folder — the
+						one with <code>manifest.json</code> in it — and run:
+					</p>
+					<div class="cmd">
+						<input id="helperCmd" type="text" readonly spellcheck="false" value="python tools/helper.py install" />
+						<button id="helperCopy" class="btn">Copy</button>
+					</div>
+					<div class="row">
+						<button id="helperRetry" class="btn primary">Try again</button>
+						<button id="helperLeave" class="btn">Use browser storage instead</button>
+					</div>
 				</div>
 
 				<div id="noFolder" class="notice">
@@ -193,6 +218,10 @@
 						<option value="photo">Photo posts</option>
 					</select>
 					<span id="libCount" class="muted"></span>
+					<!-- Local helper only: the same Library, served off the folder at an address of its own. -->
+					<button id="openLibrary" class="btn hidden" title="This Library at the helper's address — an address you can bookmark, that works with this page closed">
+						Open in a tab ↗
+					</button>
 				</div>
 				<div id="grid" class="grid"></div>
 				<div id="libMore" class="center hidden"><button id="loadMore" class="btn">Load more</button></div>

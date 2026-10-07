@@ -1,3 +1,5 @@
 dist/
 _metadata/
 _looptest*
+tools/helper.log
+__pycache__/

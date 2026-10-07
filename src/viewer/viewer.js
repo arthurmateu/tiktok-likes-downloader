@@ -1592,7 +1592,11 @@
 		if (live) return;
 		if (!$('banner').classList.contains('hidden')) return;
 		const ua = navigator.userAgent;
-		if (/Firefox|Gecko\//.test(ua) && !/Chrome|Chromium|Edg/.test(ua)) showBanner('gecko');
+		// Served by the local helper, the bridge needs no permission to run here, so
+		// its silence isn't something a setting fixes and the file-URL steps would
+		// be the wrong advice.
+		if (/^https?:$/.test(location.protocol)) showBanner('plain');
+		else if (/Firefox|Gecko\//.test(ua) && !/Chrome|Chromium|Edg/.test(ua)) showBanner('gecko');
 		else if (/Chrome|Chromium|Edg/.test(ua)) showBanner('chromium');
 		else showBanner('plain');
 		setSub();
