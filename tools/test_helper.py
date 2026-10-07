@@ -6,13 +6,19 @@ then over HTTP on the port it says it got.
 
     python tools/test_helper.py
 
-Nothing here opens Explorer or a dialog — `show` is only asked for the cases
-that refuse before getting that far — and nothing is written outside a
+Nothing here opens Explorer or a dialog, and nothing reads the real browser
+profiles: every helper is started with TTARCHIVE_TEST_NO_WINDOWS and with
+%LOCALAPPDATA% pointed at a temporary folder, where a test that needs the
+browser's record of a picked folder writes one. Nothing is written outside a
 temporary folder, except the helper's own helper.log beside it.
 """
 
+import atexit
+import base64
+import hashlib
 import http.client
 import json
+import os
 import shutil
 import struct
 import subprocess
@@ -50,6 +56,26 @@ def stop(proc):
     return code
 
 
+# Where the helpers started here look for browser profiles: nowhere real.
+FAKE_APPDATA = Path(tempfile.mkdtemp(prefix="ttarchive-appdata-"))
+atexit.register(shutil.rmtree, FAKE_APPDATA, True)
+
+
+def remember_pick(folder, origin=ORIGIN, profile="Default"):
+    """Write the record Chromium keeps of a folder its picker chose for `origin`."""
+    prefs = FAKE_APPDATA / "Chromium" / "User Data" / profile / "Preferences"
+    prefs.parent.mkdir(parents=True, exist_ok=True)
+    data = json.loads(prefs.read_text()) if prefs.exists() else {}
+    last = data.setdefault("profile", {}).setdefault("content_settings", {}).setdefault("exceptions", {}).setdefault(
+        "file_system_last_picked_directory", {})
+    last[f"{origin}/,*"] = {"setting": {"custom-id-ttarchive-root": {"path": str(folder)}}}
+    prefs.write_text(json.dumps(data))
+
+
+def forget_picks():
+    shutil.rmtree(FAKE_APPDATA / "Chromium", ignore_errors=True)
+
+
 def host(*messages):
     """Start the helper the way the browser does and hand it `messages`."""
     proc = subprocess.Popen(
@@ -57,6 +83,7 @@ def host(*messages):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         cwd=HERE,
+        env={**os.environ, "LOCALAPPDATA": str(FAKE_APPDATA), "TTARCHIVE_TEST_NO_WINDOWS": "1"},
     )
     for msg in messages:
         send(proc, msg)
@@ -335,11 +362,13 @@ class Lifecycle(unittest.TestCase):
                 for proc in (first, second):
                     stop(proc)
 
-    def test_show_refuses_before_opening_anything(self):
+    def test_show_refuses_what_it_should(self):
+        forget_picks()
         with tempfile.TemporaryDirectory() as root:
             cases = [
                 ({"cmd": "show", "root": root, "path": "../escape.mp4"}, "bad path"),
                 ({"cmd": "show", "root": root, "path": "videos/nope.mp4"}, "not-found"),
+                # No folder given and none on record.
                 ({"cmd": "show", "root": None, "path": "videos/1.mp4"}, None),
                 ({"cmd": "frobnicate"}, None),
             ]
@@ -350,6 +379,93 @@ class Lifecycle(unittest.TestCase):
                 self.assertFalse(res["ok"], msg)
                 if error:
                     self.assertEqual(res["error"], error, msg)
+
+
+class BrowserRecord(unittest.TestCase):
+    """What the helper does with Chromium's record of the folder its picker chose."""
+
+    def setUp(self):
+        forget_picks()
+        self.dir = Path(tempfile.mkdtemp(prefix="ttarchive-record-"))
+
+    def tearDown(self):
+        forget_picks()
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def archive(self, name, with_state=True):
+        folder = self.dir / name
+        (folder / "videos").mkdir(parents=True)
+        (folder / "videos" / "42.mp4").write_bytes(b"x")
+        if with_state:
+            (folder / "archive.json").write_text("{}")
+        return folder
+
+    def start(self):
+        proc = host({"cmd": "start", "token": TOKEN, "root": None, "port": 0})
+        try:
+            return receive(proc)
+        finally:
+            stop(proc)
+
+    def test_takes_over_the_folder_the_picker_chose(self):
+        folder = self.archive("likes")
+        remember_pick(folder)
+        ready = self.start()
+        self.assertEqual((ready["root"], ready["rootOk"], ready["adopted"]), (str(folder.resolve()), True, True))
+
+    def test_finds_it_under_an_id_from_before_the_fixed_one(self):
+        folder = self.archive("likes")
+        remember_pick(folder, origin="chrome-extension://iochhlhhapnhlfbkcocbjnkkkgomdibl")
+        self.assertEqual(self.start()["root"], str(folder.resolve()))
+
+    def test_prefers_a_folder_that_holds_an_archive(self):
+        bare = self.archive("bare", with_state=False)
+        real = self.archive("real")
+        remember_pick(bare)
+        remember_pick(real, origin="chrome-extension://someotheridsomeotheridsomeother", profile="Profile 1")
+        self.assertEqual(self.start()["root"], str(real.resolve()))
+
+    def test_starts_without_a_folder_when_there_is_no_record(self):
+        ready = self.start()
+        self.assertEqual((ready["root"], ready["rootOk"], ready["adopted"]), (None, False, False))
+
+    def test_a_folder_it_was_given_wins(self):
+        remember_pick(self.archive("recorded"))
+        given = self.archive("given")
+        proc = host({"cmd": "start", "token": TOKEN, "root": str(given), "port": 0})
+        try:
+            ready = receive(proc)
+        finally:
+            stop(proc)
+        self.assertEqual((ready["root"], ready["adopted"]), (str(given.resolve()), False))
+
+    def test_show_finds_the_file_in_the_recorded_folder(self):
+        folder = self.archive("likes")
+        remember_pick(folder)
+        proc = host({"cmd": "show", "root": None, "path": "videos/42.mp4"})
+        res = receive(proc)
+        stop(proc)
+        self.assertEqual(res, {"ok": True, "path": str((folder / "videos" / "42.mp4").resolve())})
+
+    def test_pick_starts_from_the_recorded_folder(self):
+        # TTARCHIVE_TEST_NO_WINDOWS answers "cancel" when no answer is named,
+        # without opening anything.
+        remember_pick(self.archive("likes"))
+        proc = host({"cmd": "pick", "initial": None})
+        res = receive(proc)
+        stop(proc)
+        self.assertEqual(res, {"ok": False, "error": "cancelled"})
+
+
+class FixedId(unittest.TestCase):
+    def test_the_id_comes_from_the_manifest_key(self):
+        sys.path.insert(0, str(HERE))
+        import helper
+
+        key = json.loads((HERE.parent / "manifest.json").read_text(encoding="utf-8"))["key"]
+        digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+        self.assertEqual(helper.extension_id(), "".join(chr(97 + int(c, 16)) for c in digest))
+        self.assertEqual(len(helper.extension_id()), 32)
 
 
 if __name__ == "__main__":

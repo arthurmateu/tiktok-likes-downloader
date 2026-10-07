@@ -41,7 +41,7 @@ export function rootLabel() {
 export async function pick() {
 	const handle = await globalThis.showDirectoryPicker({
 		// Chromium files the picked folder's path under this id, which is how
-		// tools/show_in_folder.py finds the archive. Renaming it breaks that.
+		// tools/helper.py finds the archive. Renaming it breaks that.
 		id: 'ttarchive-root',
 		mode: 'readwrite',
 		startIn: 'videos',
@@ -202,8 +202,8 @@ export async function fileSize(parts, name) {
 
 /**
  * File System Access never says where a handle is on disk, so Explorer is opened
- * by a native helper that reads the path from the browser's own profile — see
- * tools/show_in_folder.py. The background is what talks to it.
+ * by the native helper, which reads the path from the browser's own profile —
+ * see tools/helper.py. The background is what talks to it.
  */
 export async function showInFolder(parts, name) {
 	return ext.runtime.sendMessage({ type: 'show-in-folder', path: [...parts, name].join('/') });

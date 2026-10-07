@@ -1,31 +1,29 @@
 #!/usr/bin/env python3
 """
-The local helper: the archive folder, owned by a process outside the browser.
+The archive's local helper: everything the extension needs from outside the
+browser, as one native-messaging host. Windows only.
 
-Experimental, and only used once it is chosen on the archive page. With it on,
-the extension still does everything that needs TikTok — reading the likes list
-and downloading the media, both in your own logged-in session — but no longer
-writes through File System Access. It hands each file to this instead, over
-HTTP on 127.0.0.1, and this writes it with an ordinary path. That gets three
-things the browser won't give an extension:
-
-  - no folder permission to grant again every browser session;
-  - the folder served at a real address, so the Library opens in a tab at
-    http://127.0.0.1:8737/ and streams media by range instead of reading each
-    file into memory first;
-  - Explorer opened on a file by its real path, without reading the browser's
-    profile to find out where the archive is.
-
-    python tools/helper.py install      # once
+    python tools/helper.py install      # once, from Windows Terminal
     python tools/helper.py uninstall
 
-Chromium starts it over native messaging, and what it does depends on the
-first message:
+It is optional. Without it the extension writes through File System Access and
+everything but Show in folder works. Once it is installed the extension uses it
+on its own — there is nothing to switch on:
+
+  - it owns the archive folder. The extension still reads the likes list and
+    downloads every file in your own TikTok session, then hands each file to
+    this over HTTP on 127.0.0.1, which writes it with an ordinary path: no
+    folder permission to grant again every browser session.
+  - it serves the folder, so the Library opens in a tab at
+    http://127.0.0.1:8737/ and streams media by range.
+  - it opens Explorer on an archived file — Show in folder.
+
+Chromium starts it, and what it does depends on the first message:
 
   start {token, root, port}   the extension's background holds this pipe open,
                               and this serves HTTP until the browser closes it
   pick  {initial}             opens a folder dialog and answers with the choice
-  show  {root, path}          selects a file in Explorer
+  show  {path, root}          selects a file in Explorer
 
 pick and show are processes of their own, started by a click, rather than
 requests to the running server: Windows lets a process take the foreground only
@@ -33,10 +31,20 @@ when the foreground process has just started it, so a dialog or an Explorer
 window opened by a server that has been running for an hour opens behind the
 browser.
 
-Windows only, like show_in_folder.py, whose profile lookups and Explorer call
-this reuses — `install` copies both into %LOCALAPPDATA%\\ttarchive-helper.
+Where the archive is, when the extension hasn't said: the folder the browser's
+own picker last chose for it. Chromium records that, path and all, in the
+profile's Preferences, so an archive written through File System Access is
+taken over without anyone pointing at it again.
+
+`install` registers this file where it is — nothing is copied, so a `git pull`
+is all an update takes — for Chrome, Chromium, Edge and Brave, under HKCU. The
+extension's id comes from the `key` in manifest.json and is the same on every
+machine and at every path, so it doesn't matter whether the extension has been
+loaded yet.
 """
 
+import base64
+import hashlib
 import hmac
 import http.cookies
 import http.server
@@ -44,28 +52,40 @@ import json
 import os
 import re
 import shutil
+import struct
+import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 from email.utils import formatdate
-from pathlib import Path
-
-from show_in_folder import (
-    BROWSERS,
-    local_appdata,
-    picked_folders,
-    read_json,
-    read_message,
-    refuse_if_redirected,
-    resolve,
-    select_in_explorer,
-    send_message,
-    unpacked_ids,
-)
+from pathlib import Path, PurePosixPath
 
 HOST = "com.ttarchive.helper"
-VERSION = 1
+VERSION = 2
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Where `install` writes the host manifest and the .bat Chromium runs. Generated,
+# and gitignored: both name this machine's Python and this checkout's path.
+NATIVE = REPO / "tools" / "native-host"
+
+# What earlier versions installed, which `install` and `uninstall` clear away: a
+# separate Show in folder host, and copies of both helpers in %LOCALAPPDATA%.
+LEGACY_HOSTS = ("com.ttarchive.show_in_folder",)
+LEGACY_DIRS = ("ttarchive-show-in-folder", "ttarchive-helper")
+
+# Each browser reads only its own registry key, and keeps its own profiles.
+BROWSERS = {
+    r"Software\Google\Chrome\NativeMessagingHosts": r"Google\Chrome\User Data",
+    r"Software\Chromium\NativeMessagingHosts": r"Chromium\User Data",
+    r"Software\Microsoft\Edge\NativeMessagingHosts": r"Microsoft\Edge\User Data",
+    r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts": r"BraveSoftware\Brave-Browser\User Data",
+}
+
+# The id src/lib/backends/fsa.js gives its folder picker, which is what Chromium
+# files the picked folder under.
+PICKER_ID = "ttarchive-root"
 
 TOKEN_HEADER = "X-Ttarchive-Token"
 COOKIE = "ttarchive"
@@ -97,15 +117,13 @@ TYPES = {
 LOG = Path(__file__).with_name("helper.log")
 
 
-def install_dir() -> Path:
-    return local_appdata() / "ttarchive-helper"
-
-
 def log(line: str) -> None:
     """
-    Failures, beside the helper. stdout is the native-messaging pipe — anything
-    else written to it is a corrupt message to the browser — and stderr goes
-    nowhere anyone reads.
+    What the helper did, beside it: every start, pick and show, and every
+    failure. stdout is the native-messaging pipe — anything else written to it
+    is a corrupt message to the browser — and stderr goes nowhere anyone reads.
+    When a button seems to do nothing, whether a line appeared here says
+    whether the browser got this far.
     """
     try:
         if LOG.exists() and LOG.stat().st_size > 256_000:
@@ -114,6 +132,146 @@ def log(line: str) -> None:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
     except OSError:
         pass
+
+
+def local_appdata() -> Path:
+    return Path(os.environ["LOCALAPPDATA"])
+
+
+def read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def extension_id() -> str:
+    """The id the `key` in manifest.json gives the extension, wherever it is loaded from."""
+    key = read_json(REPO / "manifest.json").get("key")
+    if not key:
+        raise SystemExit("manifest.json has no key, so the extension has no fixed id to register.")
+    digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
+    return "".join(chr(ord("a") + int(c, 16)) for c in digest)
+
+
+# ------------------------------------------------------------- the browser's record
+
+
+def profiles():
+    for data in BROWSERS.values():
+        base = local_appdata() / data
+        if base.is_dir():
+            yield from (prefs.parent for prefs in base.glob("*/Preferences"))
+
+
+def picked_folders(ext_id: str | None = None) -> list[Path]:
+    """
+    Folders the browser's own picker chose for the extension, most likely first:
+    the last one picked under the picker's id, then every folder the extension
+    holds a grant on. A list, since more than one profile can have it.
+
+    With no `ext_id`, any extension's record under the same picker id — which is
+    how an archive chosen before the extension had a fixed id is still found.
+    """
+    found = []
+
+    def add(path):
+        if path and Path(path) not in found:
+            found.append(Path(path))
+
+    for profile in profiles():
+        exceptions = read_json(profile / "Preferences").get("profile", {}).get("content_settings", {}).get("exceptions", {})
+        last = exceptions.get("file_system_last_picked_directory", {})
+        chosen = exceptions.get("file_system_access_chooser_data", {})
+        if ext_id:
+            origins = [f"chrome-extension://{ext_id}/,*"]
+        else:
+            origins = [o for o, e in last.items() if f"custom-id-{PICKER_ID}" in e.get("setting", {})]
+        for origin in origins:
+            add(last.get(origin, {}).get("setting", {}).get(f"custom-id-{PICKER_ID}", {}).get("path"))
+            for entry in chosen.get(origin, {}).get("setting", {}).get("chosen-objects", []):
+                if entry.get("is-directory"):
+                    add(entry.get("path"))
+    return found
+
+
+def remembered_folders(origin: str) -> list[Path]:
+    """
+    The archive the browser's picker chose, for this extension's id and then for
+    any, that is still there — those holding an archive.json first.
+    """
+    ext_id = origin.split("/")[2] if origin.startswith("chrome-extension://") else None
+    candidates = [p for p in picked_folders(ext_id) + picked_folders() if p.is_dir()]
+    seen = []
+    for p in sorted(candidates, key=lambda p: not (p / "archive.json").is_file()):
+        if p not in seen:
+            seen.append(p)
+    return seen
+
+
+# ------------------------------------------------------------------ the pipe
+
+
+def read_message():
+    head = sys.stdin.buffer.read(4)
+    if len(head) < 4:
+        return None
+    (size,) = struct.unpack("<I", head)
+    return json.loads(sys.stdin.buffer.read(size).decode("utf-8"))
+
+
+def send_message(payload) -> None:
+    body = json.dumps(payload).encode("utf-8")
+    sys.stdout.buffer.write(struct.pack("<I", len(body)) + body)
+    sys.stdout.buffer.flush()
+
+
+def resolve(root: Path, rel) -> Path | None:
+    """
+    The file an archive-relative path names, or None if it names anything outside
+    the archive. Only the extension can reach this helper, but a path out of a
+    message is still not something to write to, serve, or hand Explorer unchecked.
+    """
+    if not isinstance(rel, str) or not rel or "\\" in rel or ":" in rel:
+        return None
+    parts = PurePosixPath(rel).parts
+    if not parts or parts[0] == "/" or any(p in ("", ".", "..") for p in parts):
+        return None
+    path = (root / Path(*parts)).resolve()
+    return path if path.is_relative_to(root.resolve()) else None
+
+
+def select_in_explorer(path: Path) -> None:
+    # Set by automated end-to-end runs, which drive a browser nobody is looking at
+    # and must not open windows on the desktop of whoever is using the machine.
+    # The request is still answered, and logged.
+    if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
+        return
+
+    import ctypes
+    from ctypes import wintypes
+
+    shell32 = ctypes.windll.shell32
+    shell32.ILCreateFromPathW.argtypes = [wintypes.LPCWSTR]
+    shell32.ILCreateFromPathW.restype = ctypes.c_void_p
+    shell32.ILFree.argtypes = [ctypes.c_void_p]
+    shell32.SHOpenFolderAndSelectItems.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_void_p, wintypes.DWORD]
+
+    # The browser launched us from a click, so we may take the foreground — and
+    # can pass that on. Without this Explorer opens behind the browser window.
+    ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+    ctypes.windll.ole32.CoInitialize(None)
+
+    # What the browser's own "Show in folder" calls: it reuses an Explorer window
+    # already open on the folder, where `explorer /select` opens a new one each time.
+    pidl = shell32.ILCreateFromPathW(str(path))
+    try:
+        ok = pidl and shell32.SHOpenFolderAndSelectItems(pidl, 0, None, 0) == 0
+    finally:
+        if pidl:
+            shell32.ILFree(pidl)
+    if not ok:
+        subprocess.Popen(["explorer", f"/select,{path}"])
 
 
 # ------------------------------------------------------------------ the folder
@@ -556,7 +714,14 @@ def run(msg: dict, origin: str) -> None:
     if not isinstance(token, str) or len(token) < 16:
         send_message({"type": "error", "error": "the extension sent no token"})
         return
-    app = Helper(token, msg.get("root"), origin)
+    root, adopted = msg.get("root"), False
+    if not root:
+        # Nothing chosen yet: take over the archive the browser's picker has been
+        # writing, so switching to the helper never means pointing at it again.
+        found = remembered_folders(origin)
+        if found:
+            root, adopted = str(found[0]), True
+    app = Helper(token, root, origin)
     try:
         server = bind(int(msg.get("port") or 0), app)
     except OSError as err:
@@ -564,8 +729,8 @@ def run(msg: dict, origin: str) -> None:
         return
     threading.Thread(target=server.serve_forever, daemon=True).start()
     port = server.server_address[1]
-    log(f"serving {app.folder.describe()['root']} on 127.0.0.1:{port} for {origin}")
-    send_message({"type": "ready", "version": VERSION, "port": port, **app.folder.describe()})
+    log(f"serving {app.folder.describe()['root']}{' (taken over from the browser picker)' if adopted else ''} on 127.0.0.1:{port} for {origin}")
+    send_message({"type": "ready", "version": VERSION, "port": port, "adopted": adopted, **app.folder.describe()})
 
     # Nothing more is expected down the pipe. The extension holds it open for as
     # long as it wants this running and closes it when it doesn't — or the browser
@@ -580,8 +745,8 @@ def run(msg: dict, origin: str) -> None:
 
 
 def ask_folder(initial: str) -> str | None:
-    # The same switch as in show_in_folder.select_in_explorer: an automated run
-    # names the folder to answer with, or "cancel", and no dialog opens.
+    # The same switch as in select_in_explorer: an automated run names the folder
+    # to answer with, or "cancel", and no dialog opens.
     if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
         chosen = os.environ.get("TTARCHIVE_TEST_PICK", "cancel")
         return None if chosen == "cancel" else chosen
@@ -612,25 +777,32 @@ def ask_folder(initial: str) -> str | None:
 def pick(msg: dict, origin: str) -> dict:
     initial = msg.get("initial")
     if not (isinstance(initial, str) and Path(initial).is_dir()):
-        # The first time round, the folder the browser's own picker last chose for
-        # this extension — the archive it has been writing into until now.
-        found = [p for p in picked_folders(origin.split("/")[2]) if p.is_dir()]
+        found = remembered_folders(origin)
         initial = str(found[0]) if found else str(Path.home() / "Videos")
     chosen = ask_folder(initial)
     return {"ok": True, "root": chosen} if chosen else {"ok": False, "error": "cancelled"}
 
 
-def show(msg: dict) -> dict:
+def show(msg: dict, origin: str) -> dict:
+    """
+    In the folder the helper writes, when the extension names it; otherwise in
+    the one the browser's picker chose, which is where File System Access wrote
+    and which it never tells the extension.
+    """
     root = msg.get("root")
-    if not (isinstance(root, str) and Path(root).is_dir()):
-        return {"ok": False, "error": "the helper has no archive folder — choose one on the archiver's page"}
-    path = resolve(Path(root), msg.get("path"))
-    if path is None:
-        return {"ok": False, "error": "bad path"}
-    if not path.is_file():
-        return {"ok": False, "error": "not-found", "path": str(path)}
-    select_in_explorer(path)
-    return {"ok": True, "path": str(path)}
+    roots = [Path(root)] if isinstance(root, str) and Path(root).is_dir() else remembered_folders(origin)
+    if not roots:
+        return {"ok": False, "error": "no archive folder on record — choose one on the archiver's page"}
+    tried = None
+    for folder in roots:
+        path = resolve(folder, msg.get("path"))
+        if path is None:
+            return {"ok": False, "error": "bad path"}
+        if path.is_file():
+            select_in_explorer(path)
+            return {"ok": True, "path": str(path)}
+        tried = tried or path
+    return {"ok": False, "error": "not-found", "path": str(tried)}
 
 
 def serve(origin: str) -> None:
@@ -651,13 +823,11 @@ def serve(origin: str) -> None:
         if cmd == "pick":
             res = pick(msg, origin)
         elif cmd == "show":
-            res = show(msg)
+            res = show(msg, origin)
         else:
             res = {"ok": False, "error": f"unknown command {cmd}"}
     except Exception as err:  # an answer, rather than a host that just died
         res = {"ok": False, "error": str(err)}
-    # Every click, as the helper saw it: when a button seems to do nothing, whether
-    # a line appeared here says whether the browser got this far.
     log(f"{cmd} {json.dumps(msg.get('path') or msg.get('initial'))} -> {json.dumps(res)}")
     send_message(res)
 
@@ -665,63 +835,112 @@ def serve(origin: str) -> None:
 # ----------------------------------------------------------------- installing
 
 
-def install(ids: list[str]) -> None:
+def redirected_into() -> str | None:
+    """
+    The app package this process is running inside the private copy of, if any.
+
+    A terminal opened inside a packaged desktop app (the Claude desktop app is
+    one) runs with that app's view of the user's files and registry: what it
+    writes to %LOCALAPPDATA% and HKCU\\Software lands in the package's own copy,
+    which nothing started from outside the package can see. An install run there
+    reports success, and every browser started from the Start menu or the
+    taskbar answers "Specified native messaging host not found." — which is how
+    Show in folder spent a day and a half failing with everything looking right.
+
+    A file written to %LOCALAPPDATA% gives it away on resolving: a redirected one
+    resolves to %LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\....
+    """
+    probe = local_appdata() / f"ttarchive-probe-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+        real = probe.resolve()
+    except OSError:
+        return None
+    finally:
+        probe.unlink(missing_ok=True)
+    try:
+        rel = real.relative_to(local_appdata() / "Packages")
+    except ValueError:
+        return None
+    return rel.parts[0] if len(rel.parts) > 2 and rel.parts[1].lower() == "localcache" else None
+
+
+def clear_legacy() -> None:
     import winreg
 
-    dest = install_dir()
-    manifest_path = dest / f"{HOST}.json"
+    for host in LEGACY_HOSTS:
+        for key in BROWSERS:
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{key}\\{host}")
+            except FileNotFoundError:
+                pass
+    for name in LEGACY_DIRS:
+        shutil.rmtree(local_appdata() / name, ignore_errors=True)
 
-    # Ids accumulate, as in show_in_folder.py: the same extension loaded from two
-    # folders is two ids, and re-running this for one must not lock the other out.
-    origins = read_json(manifest_path).get("allowed_origins", [])
-    for ext_id in ids + unpacked_ids():
-        origin = f"chrome-extension://{ext_id}/"
-        if origin not in origins:
-            origins.append(origin)
-    if not origins:
-        raise SystemExit(
-            "Couldn't find the extension in any Chrome, Chromium, Edge or Brave profile.\n"
-            "Load it unpacked from this folder first, or pass --id <id>."
-        )
 
-    dest.mkdir(parents=True, exist_ok=True)
-    here = Path(__file__).resolve().parent
-    shutil.copy2(here / "helper.py", dest / "helper.py")
-    shutil.copy2(here / "show_in_folder.py", dest / "show_in_folder.py")
-    (dest / "helper.bat").write_text(
-        f'@echo off\n"{sys.executable}" "%~dp0helper.py" %*\n', encoding="utf-8", newline="\r\n"
+def refuse_if_redirected(command: str) -> None:
+    """
+    Checked before anything is written or removed. Uninstalling from inside a
+    package is worse than installing there: registry deletions become markers
+    in its private copy that hide the real entries from that app for good,
+    while file deletions go through to the real files.
+    """
+    package = redirected_into()
+    if not package:
+        return
+    # ASCII: a Windows console prints anything else as mojibake.
+    raise SystemExit(
+        f"Nothing done: this terminal runs inside the app package {package}, and Windows\n"
+        f"keeps what it changes in your registry private to that app - your browser\n"
+        f"would never see it.\n\n"
+        f"Run it from Windows Terminal, or any terminal opened from the Start menu:\n\n"
+        f"    python tools\\helper.py {command}\n"
     )
+
+
+def install() -> None:
+    import winreg
+
+    refuse_if_redirected("install")
+    ext_id = extension_id()
+    NATIVE.mkdir(parents=True, exist_ok=True)
+    bat = NATIVE / "helper.bat"
+    # Chromium on Windows can only launch an executable or a batch file, and this
+    # Python is the one known to work.
+    bat.write_text(f'@echo off\n"{sys.executable}" "{Path(__file__).resolve()}" %*\n', encoding="utf-8", newline="\r\n")
+    manifest_path = NATIVE / f"{HOST}.json"
     manifest = {
         "name": HOST,
-        "description": "Writes and serves the archive folder for TikTok Likes Archiver",
-        "path": str(dest / "helper.bat"),
+        "description": "The archive's local helper for TikTok Likes Archiver",
+        "path": str(bat),
         "type": "stdio",
-        "allowed_origins": origins,
+        "allowed_origins": [f"chrome-extension://{ext_id}/"],
     }
     manifest_path.write_text(json.dumps(manifest, indent="\t") + "\n", encoding="utf-8")
 
     for key in BROWSERS:
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}") as reg:
             winreg.SetValueEx(reg, "", 0, winreg.REG_SZ, str(manifest_path))
+    clear_legacy()
 
-    refuse_if_redirected(manifest_path, "python tools/helper.py install")
-    print(f"Installed in {dest}")
-    for origin in origins:
-        print(f"  extension {origin.split('/')[2]}")
-    # ASCII: a Windows console prints anything else as mojibake.
-    print("Choose 'Local helper' under Storage on the archiver's page. No browser restart needed.")
+    print(f"Installed: {Path(__file__).resolve()}")
+    print(f"  for extension {ext_id}, in Chrome, Chromium, Edge and Brave")
+    print(f"  with {sys.executable}")
+    print("The extension picks it up on its own; no browser restart needed.")
 
 
 def uninstall() -> None:
     import winreg
 
+    refuse_if_redirected("uninstall")
     for key in BROWSERS:
         try:
             winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}")
         except FileNotFoundError:
             pass
-    shutil.rmtree(install_dir(), ignore_errors=True)
-    print("Uninstalled.")
+    clear_legacy()
+    shutil.rmtree(NATIVE, ignore_errors=True)
+    print("Uninstalled. The extension goes back to writing through the browser.")
 
 
 def main(argv: list[str]) -> None:
@@ -735,21 +954,12 @@ def main(argv: list[str]) -> None:
 
     if sys.platform != "win32":
         raise SystemExit("The helper is Windows only for now.")
-
-    cmd, rest = argv[0], argv[1:]
-    if cmd == "uninstall":
+    if argv == ["install"]:
+        install()
+    elif argv == ["uninstall"]:
         uninstall()
-        return
-    if cmd != "install":
-        raise SystemExit(f"unknown command: {cmd}")
-
-    ids = []
-    while rest:
-        flag = rest.pop(0)
-        if flag != "--id" or not rest:
-            raise SystemExit("usage: helper.py install [--id <extension id>]...")
-        ids.append(rest.pop(0).strip())
-    install(ids)
+    else:
+        raise SystemExit("usage: python tools/helper.py install | uninstall")
 
 
 if __name__ == "__main__":

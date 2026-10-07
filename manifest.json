@@ -4,6 +4,7 @@
 	"version": "1.0.1",
 	"description": "Archive your liked TikToks — videos and photo posts — into a folder you choose. No limits, no purchases.",
 	"minimum_chrome_version": "111",
+	"key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwfm2M86m0wBinaQm/3z+/rVeBl1fLvgElxSjluBoauEqHKp5+2XYE0Ss3v2+QBj/ldv5998hAn/KvpviqDKl7DsKzcM33u3fRSxLSt6Y78ZG+GBWxEvPUYMoaFDbi2iU21Yf61HkVdNGW0qmFlM/AnNvSdn8ARJL0+wvaYaqdxhjILd3yj6xESshYaOuHZpLxnu2cdLE9O2BtUUMQxBoRy4U9CT41ORnpE6iwkuWsHHvokCASPMF8TQ9oqfairMiKLMf00ANsV89YQktTJO+9nEWHaNjITj65/HtfjA8rD0Qw0ux/q+QX0WiW4XVogSexP95OAH626enmlllQq2GnQIDAQAB",
 	"permissions": ["storage", "unlimitedStorage", "tabs", "scripting", "declarativeNetRequest", "nativeMessaging"],
 	"host_permissions": [
 		"*://*.tiktok.com/*",

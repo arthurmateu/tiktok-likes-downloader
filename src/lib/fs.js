@@ -8,12 +8,11 @@
  * over. Both are behind this one interface, so state.js, downloader.js and
  * viewer.js never learn which browser they're on.
  *
- * The backend is chosen by feature detection, not by user agent — except for
- * the local helper, which is a third way to do the same four things on
- * Chromium and is only used once the user has chosen it. See `init`.
+ * The backend is chosen by feature detection, not by user agent. The local
+ * helper is a third way to do the same four things on Chromium, and is used
+ * whenever it is installed — see `init`.
  */
 
-import { ext } from './ext.js';
 import * as fsa from './backends/fsa.js';
 import * as downloads from './backends/downloads.js';
 import * as helper from './backends/helper.js';
@@ -68,37 +67,24 @@ export function audioOwner(name) {
 
 let backend = fsa.supported() ? fsa : downloads.supported() ? downloads : null;
 
-/** Where the choice of the local helper is kept. The background reads it too. */
-const BACKEND_KEY = 'backend';
-
 /**
- * Swap in the local helper if the user chose it. The archive page calls this
- * once, before anything touches the folder; anything that never does — the dev
- * harnesses — keeps the backend feature detection picked.
+ * The local helper if it is installed, and what feature detection picked if it
+ * isn't: asked once, by the archive page, before anything touches the folder.
+ * Anything that never asks — the dev harnesses — keeps the detected backend.
+ *
+ * Resolves to null, or to why the helper wasn't used when it looked like it
+ * should have been: installed but unable to start, or a background too old to
+ * know about it. Not being installed is not a problem, and isn't reported.
  */
 export async function init() {
-	if (!helper.supported()) return;
-	let chosen = null;
-	try {
-		chosen = (await ext.storage.local.get(BACKEND_KEY))[BACKEND_KEY];
-	} catch (_) {
-		return;
-	}
-	if (chosen === 'helper') {
+	if (!helper.supported()) return null;
+	const res = await helper.probe();
+	if (res.ok) {
 		backend = helper;
 		capabilities = helper.capabilities;
+		return null;
 	}
-}
-
-/** Whether this browser can use the local helper at all. */
-export function helperSupported() {
-	return helper.supported();
-}
-
-/** Takes effect on the next load of the page — the backend is fixed for the life of one. */
-export async function chooseBackend(id) {
-	if (id === 'helper') await ext.storage.local.set({ [BACKEND_KEY]: 'helper' });
-	else await ext.storage.local.remove(BACKEND_KEY);
+	return res.error === 'no-helper' ? null : res;
 }
 
 export function supported() {

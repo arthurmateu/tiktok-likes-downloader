@@ -613,8 +613,6 @@ function onContentMessage(type, payload) {
 }
 
 function setSyncButtons(running) {
-	// Switching reloads the page, which would end the run mid-flight.
-	$('storage').disabled = running;
 	$('startSync').disabled = running;
 	$('syncMode').disabled = running;
 	$('fetchSongs').disabled = running;
@@ -1225,42 +1223,26 @@ for (const tab of document.querySelectorAll('.tab')) {
 	});
 }
 
-// ---------------------------------------------------------------- storage
+// ---------------------------------------------------------------- local helper
 
 /**
- * Browser storage (File System Access) or the local helper, tools/helper.py.
- * The choice is stored and read by fs.init at the next load: the backend
- * can't change under a page that has already read the folder through it.
+ * Why the local helper couldn't be used when it looked like it should have
+ * been — never that it isn't installed, which is normal. Said at the top of the
+ * Sync tab; the page carries on with browser storage meanwhile, so nothing here
+ * stands in the way of a sync.
  */
-$('storage').addEventListener('change', async () => {
-	const choice = $('storage').value;
-	await fs.chooseBackend(choice);
-	// Leaving the helper: nothing else needs it running.
-	if (choice !== 'helper') await ext.runtime.sendMessage({ type: 'helper-stop' });
-	location.reload();
-});
-
-/** Why the helper couldn't be had, and what to do about it. */
 function showHelperProblem(problem) {
 	const error = problem && problem.error;
 	$('helperSetup').classList.remove('hidden');
-	$('noFolder').classList.add('hidden');
-	// Nothing to choose a folder with until this is sorted, and a picker that
-	// fails on click only adds a second error under the first.
-	$('pickFolder').classList.add('hidden');
-	$('helperInstall').classList.toggle('hidden', error !== 'no-helper');
 	$('helperReload').classList.toggle('hidden', error !== 'stale-worker');
 	$('helperRetry').classList.toggle('hidden', error === 'stale-worker');
-	if (error === 'no-helper') {
-		$('helperProblem').textContent = 'The local helper isn’t installed yet — or isn’t registered for this copy of the extension.';
-		if (problem.setup) $('helperCmd').value = problem.setup;
-	} else if (error === 'stale-worker') {
+	if (error === 'stale-worker') {
 		// Covers a worker that never started as well as an old one: the cure is the
 		// same, and the wording shouldn't claim to know which.
 		$('helperProblem').textContent =
-			'The extension’s background isn’t running this version yet. Chromium keeps an unpacked extension’s old background — through browser restarts too — until the extension is reloaded.';
+			'The extension’s background isn’t running this version yet: Chromium keeps an unpacked extension’s old background — through browser restarts too — until the extension is reloaded. Browser storage is used until then.';
 	} else {
-		$('helperProblem').textContent = `The local helper couldn’t be started: ${(problem && (problem.detail || error)) || 'no answer'}.`;
+		$('helperProblem').textContent = `The local helper is installed but couldn’t be started: ${(problem && (problem.detail || error)) || 'no answer'}. Browser storage is used until it can.`;
 	}
 	log(`Local helper: ${error === 'stale-worker' ? 'the extension needs reloading' : (problem && (problem.detail || error)) || 'no answer'}`, 'err');
 }
@@ -1271,23 +1253,7 @@ $('helperReload').addEventListener('click', async () => {
 	ext.runtime.reload();
 });
 
-$('helperCopy').addEventListener('click', async () => {
-	$('helperCmd').select();
-	try {
-		await navigator.clipboard.writeText($('helperCmd').value);
-		$('helperCopy').textContent = 'Copied';
-	} catch (_) {
-		$('helperCopy').textContent = 'Press Ctrl+C';
-	}
-	setTimeout(() => ($('helperCopy').textContent = 'Copy'), 2000);
-});
-
 $('helperRetry').addEventListener('click', () => location.reload());
-
-$('helperLeave').addEventListener('click', async () => {
-	await fs.chooseBackend('browser');
-	location.reload();
-});
 
 // ---------------------------------------------------------------- boot
 
@@ -1320,13 +1286,10 @@ async function checkHostAccess() {
 }
 
 (async function boot() {
-	await fs.init();
+	// The local helper when it is installed, browser storage when it isn't.
+	const helperProblem = await fs.init();
+	if (helperProblem) showHelperProblem(helperProblem);
 	wireLibrary(() => app.state);
-
-	if (fs.helperSupported()) {
-		$('storage').value = fs.backendId() === 'helper' ? 'helper' : 'browser';
-		$('storage').classList.remove('hidden');
-	}
 
 	if (!fs.supported()) {
 		$('noFolder').textContent =

@@ -58,14 +58,24 @@
 				window.browser = window.chrome;
 			}
 
-			// `?helper` chooses the local helper, and answers as a browser with no
-			// helper installed does, so that backend and the page's setup notice get
-			// evaluated rather than just parsed.
-			if (new URLSearchParams(location.search).has('helper')) {
-				chrome.runtime.connectNative = noop;
-				chrome.storage.local.get = () => Promise.resolve({ backend: 'helper' });
+			// `?helper` answers as a browser with the local helper installed does, so
+			// that backend is the one picked and evaluated rather than just parsed;
+			// `?helper=broken` as one whose helper is installed but won't start, so the
+			// page's notice for it is.
+			const helperMode = new URLSearchParams(location.search).get('helper');
+			if (helperMode !== null) {
+				chrome.runtime.connectNative = () => ({
+					onMessage: { addListener: noop },
+					onDisconnect: { addListener: noop },
+					postMessage: noop,
+					disconnect: noop,
+				});
 				chrome.runtime.sendMessage = () =>
-					Promise.resolve({ ok: false, error: 'no-helper', setup: 'python tools/helper.py install' });
+					Promise.resolve(
+						helperMode === 'broken'
+							? { ok: false, error: 'the helper exited' }
+							: { ok: true, base: 'http://127.0.0.1:9', token: 'syntaxcheck', root: 'C:\archive', rootOk: true }
+					);
 			}
 		</script>
 
@@ -79,13 +89,13 @@
 				'cFail','cBytes','log','loading','loadingMsg','statPosts','statVideos','statImages','statUnavailable','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta','lbHelp','lbKeys',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
-				'storage','helperSetup','helperProblem','helperCmd','helperCopy','helperRetry','helperLeave','helperInstall','helperReload','openLibrary',
+				'helperSetup','helperProblem','helperRetry','helperReload','openLibrary',
 			];
-			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput','helperCmd'];
+			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = INPUTS.includes(id) ? 'input'
-					: ['sort','kind','storage'].includes(id) ? 'select' : 'div';
+					: ['sort','kind'].includes(id) ? 'select' : 'div';
 				const el = document.createElement(tag);
 				el.id = id;
 				el.classList.add('hidden');
