@@ -336,11 +336,16 @@ $('pickFolder').addEventListener('click', async () => {
 		$('dlFolderName').select();
 		return;
 	}
+	// One picker at a time: a second click while the first is open is only ever
+	// refused, by the browser ("File picker already active") or the helper alike.
+	$('pickFolder').disabled = true;
 	try {
 		await fs.pickFolder();
 		await afterFolderReady();
 	} catch (err) {
 		if (err && err.name !== 'AbortError') log(`Folder selection failed: ${err.message}`, 'err');
+	} finally {
+		$('pickFolder').disabled = false;
 	}
 });
 
@@ -1237,16 +1242,34 @@ $('storage').addEventListener('change', async () => {
 
 /** Why the helper couldn't be had, and what to do about it. */
 function showHelperProblem(problem) {
+	const error = problem && problem.error;
 	$('helperSetup').classList.remove('hidden');
 	$('noFolder').classList.add('hidden');
-	if (problem && problem.error === 'no-helper') {
+	// Nothing to choose a folder with until this is sorted, and a picker that
+	// fails on click only adds a second error under the first.
+	$('pickFolder').classList.add('hidden');
+	$('helperInstall').classList.toggle('hidden', error !== 'no-helper');
+	$('helperReload').classList.toggle('hidden', error !== 'stale-worker');
+	$('helperRetry').classList.toggle('hidden', error === 'stale-worker');
+	if (error === 'no-helper') {
 		$('helperProblem').textContent = 'The local helper isn’t installed yet — or isn’t registered for this copy of the extension.';
 		if (problem.setup) $('helperCmd').value = problem.setup;
+	} else if (error === 'stale-worker') {
+		// Covers a worker that never started as well as an old one: the cure is the
+		// same, and the wording shouldn't claim to know which.
+		$('helperProblem').textContent =
+			'The extension’s background isn’t running this version yet. Chromium keeps an unpacked extension’s old background — through browser restarts too — until the extension is reloaded.';
 	} else {
-		$('helperProblem').textContent = `The local helper couldn’t be started: ${(problem && (problem.detail || problem.error)) || 'no answer'}.`;
+		$('helperProblem').textContent = `The local helper couldn’t be started: ${(problem && (problem.detail || error)) || 'no answer'}.`;
 	}
-	log(`Local helper: ${(problem && (problem.detail || problem.error)) || 'no answer'}`, 'err');
+	log(`Local helper: ${error === 'stale-worker' ? 'the extension needs reloading' : (problem && (problem.detail || error)) || 'no answer'}`, 'err');
 }
+
+$('helperReload').addEventListener('click', async () => {
+	// The reload closes this page; the new background opens it again on the way up.
+	await ext.storage.local.set({ reopenArchive: true });
+	ext.runtime.reload();
+});
 
 $('helperCopy').addEventListener('click', async () => {
 	$('helperCmd').select();

@@ -151,6 +151,12 @@ def resolve(root: Path, rel) -> Path | None:
 
 
 def select_in_explorer(path: Path) -> None:
+    # Set by automated end-to-end runs, which drive a browser nobody is looking at
+    # and must not open windows on the desktop of whoever is using the machine.
+    # The request is still answered, and recorded in last-call.json / helper.log.
+    if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
+        return
+
     import ctypes
     from ctypes import wintypes
 
