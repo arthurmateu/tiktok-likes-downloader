@@ -56,14 +56,21 @@
 		const d = ev.data;
 		if (!d || typeof d !== 'object') return;
 		if (d.__ttarchive === 'bridge') {
+			// Anything asked before the content script was listening went nowhere —
+			// the opening probe always is, since this page's script runs first. Left
+			// alone it times out, and the connect() below is turned away meanwhile
+			// because that probe is still in flight: a page that loads quickly, as one
+			// served by the local helper does, never went live at all. Asked again,
+			// it is answered now.
+			for (const { message } of pending.values()) window.postMessage(message, '*');
 			connect();
 			return;
 		}
 		if (d.__ttarchive !== 'res') return;
-		const resolve = pending.get(d.rid);
-		if (resolve) {
+		const waiting = pending.get(d.rid);
+		if (waiting) {
 			pending.delete(d.rid);
-			resolve(d.payload);
+			waiting.resolve(d.payload);
 		}
 	});
 
@@ -71,8 +78,9 @@
 	function call(cmd, args, timeout) {
 		const rid = ++reqId;
 		return new Promise((resolve) => {
-			pending.set(rid, resolve);
-			window.postMessage({ __ttarchive: 'req', rid, cmd, args: args || {} }, '*');
+			const message = { __ttarchive: 'req', rid, cmd, args: args || {} };
+			pending.set(rid, { resolve, message });
+			window.postMessage(message, '*');
 			setTimeout(() => {
 				if (pending.delete(rid)) resolve(null);
 			}, timeout || 10000);
