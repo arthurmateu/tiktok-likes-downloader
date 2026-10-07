@@ -201,8 +201,8 @@ export async function fileSize(parts, name) {
 }
 
 /**
- * File System Access never says where a handle is on disk, so Explorer is opened
- * by the native helper, which reads the path from the browser's own profile —
+ * File System Access never says where a handle is on disk, so the file manager
+ * is opened by the native helper, which reads the path from the browser's own profile —
  * see tools/helper.py. The background is what talks to it.
  */
 export async function showInFolder(parts, name) {

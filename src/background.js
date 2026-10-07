@@ -152,9 +152,9 @@ async function handleViewerRequest(msg) {
  * tools/helper.py: everything the extension needs from outside the browser, as
  * one native-messaging host. Optional, and used whenever it is installed —
  * nothing to choose. Then it owns the archive folder (writes what the archive
- * page downloads, serves the folder on 127.0.0.1); either way it is what opens
- * Explorer for Show in folder, which no extension API can do on a file the
- * browser didn't download.
+ * page downloads, serves the folder on 127.0.0.1); either way it is what shows
+ * a file in the system's file manager, which no extension API can do for a file
+ * the browser didn't download.
  *
  * Started here and not by the archive page so that it outlives that page: the
  * Library's address keeps answering with the page closed. The pipe to it is
@@ -166,7 +166,11 @@ async function handleViewerRequest(msg) {
  * `downloads.show` instead.
  */
 const HELPER_HOST = 'com.ttarchive.helper';
-const HELPER_SETUP = 'python tools/helper.py install';
+/** The command that installs the helper, as this system spells it; shown when it is missing. */
+let helperSetup = 'python3 tools/helper.py install';
+ext.runtime.getPlatformInfo().then((info) => {
+	if (info.os === 'win') helperSetup = 'python tools\\helper.py install';
+});
 /** `{ token, root, port }` — the helper keeps nothing; everything it is told is here. */
 const HELPER_KEY = 'helper';
 /** Asked for first, so the Library's address stays the same from one start to the next. */
@@ -191,7 +195,7 @@ async function helperConfig() {
 function helperProblem(text) {
 	// Chromium's own wording: "Specified native messaging host not found." when
 	// nothing is registered, "…is forbidden." when it is but not for this id.
-	if (/not found|forbidden/i.test(text)) return { ok: false, error: 'no-helper', detail: text, setup: HELPER_SETUP };
+	if (/not found|forbidden/i.test(text)) return { ok: false, error: 'no-helper', detail: text, setup: helperSetup };
 	return { ok: false, error: text };
 }
 

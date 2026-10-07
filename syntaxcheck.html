@@ -27,6 +27,7 @@
 					onInstalled: { addListener: noop },
 					getManifest: () => ({ host_permissions: ['*://*.tiktok.com/*'] }),
 					getURL: (p) => p,
+					getPlatformInfo: () => Promise.resolve({ os: 'win' }),
 				},
 				tabs: {
 					query: () => Promise.resolve([]),
