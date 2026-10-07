@@ -44,15 +44,20 @@
 				<!-- Only while the local helper is chosen and can't be started. -->
 				<div id="helperSetup" class="notice warn hidden">
 					<p id="helperProblem">The local helper isn't installed yet.</p>
-					<p>
-						It is set up once, by one command. Open a terminal in the extension's own folder — the
-						one with <code>manifest.json</code> in it — and run:
-					</p>
-					<div class="cmd">
-						<input id="helperCmd" type="text" readonly spellcheck="false" value="python tools/helper.py install" />
-						<button id="helperCopy" class="btn">Copy</button>
+					<!-- The install instructions, for when the helper is what's missing. -->
+					<div id="helperInstall">
+						<p>
+							It is set up once, by one command. Open a terminal in the extension's own folder — the
+							one with <code>manifest.json</code> in it — and run:
+						</p>
+						<div class="cmd">
+							<input id="helperCmd" type="text" readonly spellcheck="false" value="python tools/helper.py install" />
+							<button id="helperCopy" class="btn">Copy</button>
+						</div>
 					</div>
 					<div class="row">
+						<!-- For a background older than this page; it reopens the page afterwards. -->
+						<button id="helperReload" class="btn primary hidden">Reload the extension</button>
 						<button id="helperRetry" class="btn primary">Try again</button>
 						<button id="helperLeave" class="btn">Use browser storage instead</button>
 					</div>

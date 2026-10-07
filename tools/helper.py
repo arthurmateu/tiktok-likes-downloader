@@ -579,6 +579,12 @@ def run(msg: dict, origin: str) -> None:
 
 
 def ask_folder(initial: str) -> str | None:
+    # The same switch as in show_in_folder.select_in_explorer: an automated run
+    # names the folder to answer with, or "cancel", and no dialog opens.
+    if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
+        chosen = os.environ.get("TTARCHIVE_TEST_PICK", "cancel")
+        return None if chosen == "cancel" else chosen
+
     import ctypes
     import tkinter
     from tkinter import filedialog
@@ -648,8 +654,10 @@ def serve(origin: str) -> None:
         else:
             res = {"ok": False, "error": f"unknown command {cmd}"}
     except Exception as err:  # an answer, rather than a host that just died
-        log(f"{cmd}: {err!r}")
         res = {"ok": False, "error": str(err)}
+    # Every click, as the helper saw it: when a button seems to do nothing, whether
+    # a line appeared here says whether the browser got this far.
+    log(f"{cmd} {json.dumps(msg.get('path') or msg.get('initial'))} -> {json.dumps(res)}")
     send_message(res)
 
 

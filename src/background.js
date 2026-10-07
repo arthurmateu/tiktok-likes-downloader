@@ -170,7 +170,14 @@ async function showInFolder(path) {
 	// helper finds this extension's id, and the folder, in the browser's profile.
 	const setup = 'python tools/show_in_folder.py install';
 	if (typeof path !== 'string' || !path) return { ok: false, error: 'no path' };
-	if (await helperChosen()) return showViaHelper(path);
+	if (await helperChosen()) {
+		const res = await showViaHelper(path);
+		// The local helper's answers about the file itself stand. One that says the
+		// helper couldn't be asked — not installed, no folder chosen in it yet —
+		// falls through to the helper below, which finds the folder the browser's
+		// own picker chose and is very likely the same one.
+		if (res.ok || res.error === 'not-found' || res.error === 'bad path') return res;
+	}
 	try {
 		const res = await ext.runtime.sendNativeMessage(FOLDER_HOST, { path });
 		if (res && res.error === 'no-helper') return { ...res, setup };
@@ -343,6 +350,15 @@ async function showViaHelper(path) {
 // With the helper chosen it runs whenever this worker does; see above.
 helperChosen().then((chosen) => {
 	if (chosen) ensureHelper();
+});
+
+// The archive page reloads the extension when it finds a worker older than
+// itself, which closes the page; this is the new worker putting it back.
+const REOPEN_KEY = 'reopenArchive';
+ext.storage.local.get(REOPEN_KEY).then((stored) => {
+	if (!stored[REOPEN_KEY]) return;
+	ext.storage.local.remove(REOPEN_KEY);
+	openArchive();
 });
 
 // ---------------------------------------------------------------- from archive

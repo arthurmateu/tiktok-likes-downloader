@@ -44,11 +44,23 @@ export function supported() {
 /**
  * The helper, running. Throws with the background's answer on `err.helper`
  * when it can't be — `error: 'no-helper'` with a `setup` command when it isn't
- * installed.
+ * installed, `'stale-worker'` when the background predates the helper or
+ * isn't running at all.
  */
 async function connect({ fresh = false } = {}) {
 	if (conn && !fresh) return conn;
-	const res = await ext.runtime.sendMessage({ type: 'helper-ensure' });
+	let res;
+	try {
+		res = await ext.runtime.sendMessage({ type: 'helper-ensure' });
+	} catch (err) {
+		// No worker to receive it at all — one that failed to start, or died
+		// holding the request. Reloading the extension is the cure for that too.
+		res = { ok: false, error: 'stale-worker', detail: String((err && err.message) || err) };
+	}
+	// Received, and nobody answered: a worker from before this backend existed.
+	// Chromium keeps an unpacked extension's worker through changes to its files,
+	// and through browser restarts, until the extension is reloaded.
+	if (res === undefined) res = { ok: false, error: 'stale-worker' };
 	if (!res || !res.ok) {
 		const err = new Error((res && (res.detail || res.error)) || 'the extension worker did not answer');
 		err.helper = res || { ok: false, error: 'no answer' };
