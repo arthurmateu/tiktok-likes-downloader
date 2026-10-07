@@ -151,7 +151,7 @@ async function useRoot(path) {
 
 /**
  * Opens a folder dialog, from a helper process of its own started by this
- * click — Windows lets that one come to the front, where the long-running
+ * click — the system lets that one come to the front, where the long-running
  * server's dialog would open behind the browser. Rejects with an AbortError
  * when the dialog is cancelled, as the File System Access picker does.
  */

@@ -2,25 +2,31 @@
 End-to-end run of the extension with the local helper, clicked through the way
 a person would, against the helper as it is really installed.
 
-    python tools/e2e/helper_flow.py
+    python3 tools/e2e/helper_flow.py
 
-Needs `python tools/helper.py install` to have been run — from Windows Terminal,
-like any install — and nothing else: the extension is loaded fresh into a
-throwaway profile, which is what a newly cloned checkout looks like to Chromium.
+Needs the helper installed (`python3 tools/helper.py install`), a Chromium-family
+browser, and an archive the extension's folder picker has chosen before — the
+test copies a few of its posts to work on. The extension is loaded fresh into a
+throwaway profile, which is what a newly cloned checkout looks like to the
+browser.
 
-The browser is started outside whatever app this script runs in, through WMI,
-and headless. Outside, because a terminal inside a packaged app (the Claude
-desktop app's) sees that app's private copy of the registry, and a browser it
-starts inherits the same view, so everything would pass for a browser the user
-doesn't have. Headless, so nothing appears on screen while the machine is in use.
-TTARCHIVE_TEST_NO_WINDOWS keeps the helper from opening the folder dialog or
-Explorer — the dialog is answered with TTARCHIVE_TEST_PICK — and what it was
-asked lands in tools/helper.log, which is what the checks read.
+The browser is found among the usual install locations, Chromium first since
+branded Chrome ignores --load-extension; TTARCHIVE_TEST_BROWSER names one
+outright. It runs headless, so nothing appears on screen while the machine is in
+use. TTARCHIVE_TEST_NO_WINDOWS keeps the helper from opening the folder dialog
+or a file manager — the dialog is answered with TTARCHIVE_TEST_PICK — and what
+it was asked lands in tools/helper.log, which is what the checks read.
 
-The helper takes over the real archive to begin with, as it would for you; that
-part only reads. Everything that writes is pointed at a scratch archive built
-from a few of the real one's posts. Both the profile and the scratch archive are
-deleted afterwards.
+On Windows the browser, and the registry lookup, go through a process the WMI
+service starts. A terminal inside a packaged desktop app sees that app's private
+copy of the registry, and a browser it starts inherits the same view, so
+everything would pass for a browser nobody else has; WMI's processes are
+outside any package.
+
+The helper takes over the real archive to begin with, as it would for anyone;
+that part only reads. Everything that writes is pointed at a scratch archive
+built from a few of the real one's posts. Both the profile and the scratch
+archive are deleted afterwards.
 """
 
 import json
@@ -42,13 +48,13 @@ REPO = Path(__file__).resolve().parent.parent.parent
 SCRATCH = Path(tempfile.gettempdir()) / "ttarchive-e2e"
 PROFILE = SCRATCH / "profile"
 ARCHIVE = SCRATCH / "archive"
-CHROME = r"C:\Program Files\Chromium\Application\chrome.exe"
 PORT = 9333
 EXT = helper.extension_id()
 ARCHIVE_URL = f"chrome-extension://{EXT}/src/archive/archive.html"
 HELPER_LOG = REPO / "tools" / "helper.log"
 
 results = []
+browser_proc = None
 
 
 def check(name, ok, detail=""):
@@ -56,11 +62,45 @@ def check(name, ok, detail=""):
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  — {detail}" if detail else ""), flush=True)
 
 
-# ------------------------------------------------------------ outside the app
+# ----------------------------------------------------------------- the browser
+
+
+def find_browser() -> tuple[str, str] | None:
+    """(which of helper.BROWSERS, its executable): TTARCHIVE_TEST_BROWSER, or the first installed."""
+    named = os.environ.get("TTARCHIVE_TEST_BROWSER")
+    if named:
+        lowered = named.lower()
+        kind = next((b for b in ("Edge", "Brave", "Chromium") if b.lower() in lowered), "Chrome")
+        return kind, named
+    if helper.WINDOWS:
+        roots = [os.environ.get(v) for v in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA")]
+        places = [
+            ("Chromium", r"Chromium\Application\chrome.exe"),
+            ("Chrome", r"Google\Chrome\Application\chrome.exe"),
+            ("Edge", r"Microsoft\Edge\Application\msedge.exe"),
+            ("Brave", r"BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ]
+        for kind, rel in places:
+            for root in filter(None, roots):
+                if (Path(root) / rel).is_file():
+                    return kind, str(Path(root) / rel)
+    elif helper.MACOS:
+        for kind, app in (("Chromium", "Chromium"), ("Chrome", "Google Chrome"), ("Edge", "Microsoft Edge"),
+                          ("Brave", "Brave Browser")):
+            exe = Path("/Applications") / f"{app}.app" / "Contents" / "MacOS" / app
+            if exe.is_file():
+                return kind, str(exe)
+    else:
+        for kind, names in (("Chromium", ("chromium", "chromium-browser")), ("Chrome", ("google-chrome", "google-chrome-stable")),
+                            ("Edge", ("microsoft-edge",)), ("Brave", ("brave-browser", "brave"))):
+            for name in names:
+                if shutil.which(name):
+                    return kind, shutil.which(name)
+    return None
 
 
 def outside(command: str) -> None:
-    """Run `command` from a process the WMI service starts: outside any app package."""
+    """Windows: run `command` from a process the WMI service starts, outside any app package."""
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{command}'}} | Out-Null"],
@@ -68,14 +108,14 @@ def outside(command: str) -> None:
     )
 
 
-def registered_manifest() -> dict:
-    """
-    The helper's host manifest, found the way a browser started from the taskbar
-    finds it: the registry as seen from outside, then the file it names. The file
-    can be read from here — it is in the checkout, which no package redirects.
-    """
+def registered_manifest(kind: str) -> dict:
+    """The helper's host manifest, found where `kind` of browser looks for it."""
+    if not helper.WINDOWS:
+        return helper.read_json(helper.data_dir(kind) / "NativeMessagingHosts" / f"{helper.HOST}.json")
+    # The registry as a browser started from the Start menu sees it, then the file
+    # it names, which is in the checkout and so redirected by no package.
     out = SCRATCH / "registration.txt"
-    key = rf"HKCU\Software\Chromium\NativeMessagingHosts\{helper.HOST}"
+    key = rf"HKCU\{helper.BROWSERS[kind][0][0]}\NativeMessagingHosts\{helper.HOST}"
     outside(f'cmd.exe /c "reg query {key} /ve > "{out}" 2>&1"')
     for _ in range(40):
         time.sleep(0.25)
@@ -89,21 +129,24 @@ def registered_manifest() -> dict:
     return {}
 
 
-def launch_outside() -> None:
-    env = f"set TTARCHIVE_TEST_NO_WINDOWS=1&& set TTARCHIVE_TEST_PICK={ARCHIVE}&& "
-    args = (
-        f'"{CHROME}" --headless --user-data-dir="{PROFILE}" --remote-debugging-port={PORT} --no-first-run '
-        f'--no-default-browser-check --window-size=1280,900 --load-extension="{REPO}" '
-        f"--disable-features=DisableLoadExtensionCommandLineSwitch about:blank"
-    )
-    outside(f'cmd.exe /c "{env}{args}"')
+def launch(exe: str) -> None:
+    global browser_proc
+    args = [exe, "--headless", f"--user-data-dir={PROFILE}", f"--remote-debugging-port={PORT}", "--no-first-run",
+            "--no-default-browser-check", "--window-size=1280,900", f"--load-extension={REPO}",
+            "--disable-features=DisableLoadExtensionCommandLineSwitch", "about:blank"]
+    if helper.WINDOWS:
+        quoted = " ".join(f'"{a}"' if " " in a else a for a in args)
+        outside(f'cmd.exe /c "set TTARCHIVE_TEST_NO_WINDOWS=1&& set TTARCHIVE_TEST_PICK={ARCHIVE}&& {quoted}"')
+    else:
+        env = {**os.environ, "TTARCHIVE_TEST_NO_WINDOWS": "1", "TTARCHIVE_TEST_PICK": str(ARCHIVE)}
+        browser_proc = subprocess.Popen(args, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     for _ in range(60):
         try:
             urllib.request.urlopen(f"http://127.0.0.1:{PORT}/json/version", timeout=1)
             return
         except OSError:
             time.sleep(0.5)
-    raise SystemExit("Chromium did not come up")
+    raise SystemExit("the browser did not come up")
 
 
 def stop_browser() -> None:
@@ -111,14 +154,17 @@ def stop_browser() -> None:
         CDP(PORT).call("Browser.close")
     except Exception:
         pass
-    # Anything left of it, by the profile it was started on.
     time.sleep(2)
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         f"Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='python.exe'\" | "
-         f"Where-Object {{ $_.CommandLine -like '*{SCRATCH.name}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"],
-        capture_output=True,
-    )
+    if browser_proc:
+        browser_proc.kill()
+    elif helper.WINDOWS:
+        # Anything left of it, by the profile it was started on.
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{SCRATCH.name}*' }} | "
+             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
+            capture_output=True,
+        )
     time.sleep(1)
 
 
@@ -208,19 +254,24 @@ def main():
     shutil.rmtree(SCRATCH, ignore_errors=True)
     SCRATCH.mkdir(parents=True)
     try:
-        manifest = registered_manifest()
+        found = find_browser()
+        if not found:
+            check("a Chromium-family browser to run", False, "none found; name one with TTARCHIVE_TEST_BROWSER")
+            return
+        kind, exe = found
+        print(f"using {kind}: {exe}", flush=True)
+        manifest = registered_manifest(kind)
         ok = f"chrome-extension://{EXT}/" in manifest.get("allowed_origins", []) and Path(manifest.get("path", "")).is_file()
-        check("the helper is registered, for this extension's fixed id, where a browser started from the taskbar looks",
-              ok, "" if ok else "run `python tools\\helper.py install` from Windows Terminal")
+        check(f"the helper is registered with {kind}, for this extension's fixed id", ok,
+              "" if ok else "run `python3 tools/helper.py install` first")
         if not ok:
             return
-        real = helper.remembered_folders(f"chrome-extension://{EXT}/")
-        real = next((p for p in real if (p / "archive.json").is_file()), None)
+        real = next((p for p in helper.remembered_folders(f"chrome-extension://{EXT}/") if (p / "archive.json").is_file()), None)
         if not real:
-            check("there is an archive on record to take over", False)
+            check("an archive the extension's picker has chosen, to copy posts from", False)
             return
         vids, photos = build_archive(real)
-        launch_outside()
+        launch(exe)
         try:
             run(real, vids, photos)
         finally:

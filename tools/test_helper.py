@@ -6,11 +6,15 @@ then over HTTP on the port it says it got.
 
     python tools/test_helper.py
 
-Nothing here opens Explorer or a dialog, and nothing reads the real browser
-profiles: every helper is started with TTARCHIVE_TEST_NO_WINDOWS and with
-%LOCALAPPDATA% pointed at a temporary folder, where a test that needs the
-browser's record of a picked folder writes one. Nothing is written outside a
-temporary folder, except the helper's own helper.log beside it.
+Runs on Windows, macOS and Linux. Nothing here opens a file manager or a
+dialog, and nothing reads or writes the real browser profiles: every helper is
+started with TTARCHIVE_TEST_NO_WINDOWS, and with the folder browsers keep their
+profiles in (%LOCALAPPDATA%, or $HOME and $XDG_CONFIG_HOME) pointed at a
+temporary one, where a test that needs the browser's record of a picked folder
+writes one. Installing is only tested outside Windows — inside, it would be the
+real registry — and on a copy of the helper, so a real install is left alone.
+Nothing is written outside a temporary folder, except the helper's own
+helper.log beside it.
 """
 
 import atexit
@@ -30,6 +34,20 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+
+# Where the helpers started here look for browser profiles: nowhere real. Set
+# before helper is imported, so its own lookups — data_dir() — see it too.
+FAKE_HOME = Path(tempfile.mkdtemp(prefix="ttarchive-home-"))
+atexit.register(shutil.rmtree, FAKE_HOME, True)
+if sys.platform == "win32":
+    os.environ["LOCALAPPDATA"] = str(FAKE_HOME)
+else:
+    os.environ["HOME"] = str(FAKE_HOME)
+    os.environ["XDG_CONFIG_HOME"] = str(FAKE_HOME / ".config")
+
+import helper  # noqa: E402
+
 ORIGIN = "chrome-extension://abcdefghijklmnopabcdefghijklmnop"
 TOKEN = "0123456789abcdef-test-token"
 
@@ -56,14 +74,9 @@ def stop(proc):
     return code
 
 
-# Where the helpers started here look for browser profiles: nowhere real.
-FAKE_APPDATA = Path(tempfile.mkdtemp(prefix="ttarchive-appdata-"))
-atexit.register(shutil.rmtree, FAKE_APPDATA, True)
-
-
 def remember_pick(folder, origin=ORIGIN, profile="Default"):
     """Write the record Chromium keeps of a folder its picker chose for `origin`."""
-    prefs = FAKE_APPDATA / "Chromium" / "User Data" / profile / "Preferences"
+    prefs = helper.data_dir("Chromium") / profile / "Preferences"
     prefs.parent.mkdir(parents=True, exist_ok=True)
     data = json.loads(prefs.read_text()) if prefs.exists() else {}
     last = data.setdefault("profile", {}).setdefault("content_settings", {}).setdefault("exceptions", {}).setdefault(
@@ -73,7 +86,8 @@ def remember_pick(folder, origin=ORIGIN, profile="Default"):
 
 
 def forget_picks():
-    shutil.rmtree(FAKE_APPDATA / "Chromium", ignore_errors=True)
+    for browser in helper.BROWSERS:
+        shutil.rmtree(helper.data_dir(browser), ignore_errors=True)
 
 
 def host(*messages):
@@ -83,7 +97,7 @@ def host(*messages):
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         cwd=HERE,
-        env={**os.environ, "LOCALAPPDATA": str(FAKE_APPDATA), "TTARCHIVE_TEST_NO_WINDOWS": "1"},
+        env={**os.environ, "TTARCHIVE_TEST_NO_WINDOWS": "1"},
     )
     for msg in messages:
         send(proc, msg)
@@ -415,7 +429,7 @@ class BrowserRecord(unittest.TestCase):
 
     def test_finds_it_under_an_id_from_before_the_fixed_one(self):
         folder = self.archive("likes")
-        remember_pick(folder, origin="chrome-extension://iochhlhhapnhlfbkcocbjnkkkgomdibl")
+        remember_pick(folder, origin="chrome-extension://" + "b" * 32)
         self.assertEqual(self.start()["root"], str(folder.resolve()))
 
     def test_prefers_a_folder_that_holds_an_archive(self):
@@ -459,13 +473,99 @@ class BrowserRecord(unittest.TestCase):
 
 class FixedId(unittest.TestCase):
     def test_the_id_comes_from_the_manifest_key(self):
-        sys.path.insert(0, str(HERE))
-        import helper
-
         key = json.loads((HERE.parent / "manifest.json").read_text(encoding="utf-8"))["key"]
         digest = hashlib.sha256(base64.b64decode(key)).hexdigest()[:32]
         self.assertEqual(helper.extension_id(), "".join(chr(97 + int(c, 16)) for c in digest))
         self.assertEqual(len(helper.extension_id()), 32)
+
+
+class Desktop(unittest.TestCase):
+    """What the helper asks the system for, with the system replaced: nothing opens."""
+
+    def setUp(self):
+        self.calls = []
+        self.real_run, self.real_popen = subprocess.run, subprocess.Popen
+        self.code, self.out = 0, ""
+
+        def run(command, **_):
+            self.calls.append(command)
+            return subprocess.CompletedProcess(command, self.code, stdout=self.out, stderr="")
+
+        subprocess.run = run
+        subprocess.Popen = lambda command, **_: self.calls.append(command)
+
+    def tearDown(self):
+        subprocess.run, subprocess.Popen = self.real_run, self.real_popen
+
+    def test_freedesktop_asks_the_file_manager_to_select_the_file(self):
+        target = (FAKE_HOME / "a b" / "42.mp4").resolve()
+        helper.reveal_freedesktop(target)
+        self.assertEqual(self.calls[0][0], "gdbus")
+        self.assertIn(f"['{target.as_uri()}']", self.calls[0], "a space in the path must arrive URI-encoded")
+        self.assertEqual(len(self.calls), 1, "it succeeded, so nothing else was tried")
+
+    def test_freedesktop_falls_back_to_opening_the_folder(self):
+        self.code = 1
+        target = (FAKE_HOME / "42.mp4").resolve()
+        helper.reveal_freedesktop(target)
+        self.assertEqual([c[0] for c in self.calls], ["gdbus", "dbus-send", "xdg-open"])
+        self.assertEqual(self.calls[-1][1], str(target.parent))
+
+    def test_macos_dialog_quotes_the_folder(self):
+        self.out = "/Users/x/Movies/Tik Tok/\n"
+        chosen = helper.ask_folder_macos('/Users/x/Movies/a "quoted" folder')
+        script = " ".join(self.calls[0])
+        self.assertIn('POSIX file "/Users/x/Movies/a \\"quoted\\" folder"', script)
+        self.assertEqual(chosen, "/Users/x/Movies/Tik Tok")
+
+    def test_macos_dialog_cancelled(self):
+        self.code, self.out = 1, ""
+        self.assertIsNone(helper.ask_folder_macos("/Users/x"))
+
+
+@unittest.skipIf(sys.platform == "win32", "on Windows installing is the real registry")
+class Install(unittest.TestCase):
+    """install and uninstall, outside Windows, on a copy of the helper and in the fake home."""
+
+    def setUp(self):
+        forget_picks()
+        self.copy = Path(tempfile.mkdtemp(prefix="ttarchive-checkout-"))
+        (self.copy / "tools").mkdir()
+        shutil.copy2(HERE / "helper.py", self.copy / "tools" / "helper.py")
+        shutil.copy2(HERE.parent / "manifest.json", self.copy / "manifest.json")
+        helper.data_dir("Chromium").mkdir(parents=True)
+
+    def tearDown(self):
+        forget_picks()
+        shutil.rmtree(self.copy, ignore_errors=True)
+
+    def helper(self, command):
+        return subprocess.run([sys.executable, str(self.copy / "tools" / "helper.py"), command],
+                              capture_output=True, text=True, env=os.environ)
+
+    def test_registers_with_the_browsers_that_are_here(self):
+        res = self.helper("install")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        manifest = json.loads((helper.data_dir("Chromium") / "NativeMessagingHosts" / f"{helper.HOST}.json").read_text())
+        self.assertEqual(manifest["allowed_origins"], [f"chrome-extension://{helper.extension_id()}/"])
+        launcher = Path(manifest["path"])
+        self.assertEqual(launcher.parent, (self.copy / "tools" / "native-host").resolve())
+        self.assertTrue(os.access(launcher, os.X_OK), "the browser can't run a launcher that isn't executable")
+        self.assertIn(sys.executable, launcher.read_text())
+        self.assertFalse(helper.data_dir("Chrome").exists(), "a browser that isn't here got a folder made for it")
+
+    def test_refuses_with_no_browser_to_register_with(self):
+        forget_picks()
+        res = self.helper("install")
+        self.assertNotEqual(res.returncode, 0)
+        self.assertIn("Start the browser once", res.stderr)
+
+    def test_uninstall_takes_it_all_back(self):
+        self.helper("install")
+        res = self.helper("uninstall")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertFalse((helper.data_dir("Chromium") / "NativeMessagingHosts" / f"{helper.HOST}.json").exists())
+        self.assertFalse((self.copy / "tools" / "native-host").exists())
 
 
 if __name__ == "__main__":

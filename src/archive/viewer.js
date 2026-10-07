@@ -1433,11 +1433,11 @@ function folderNote(res) {
 	const error = res?.error || 'no answer';
 	if (error === 'no-helper') {
 		note.append(
-			el('p', null, 'Opening Explorer takes a small helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
+			el('p', null, 'Showing a file in its folder takes the local helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
 			commandRow(res.setup),
 			el('p', null, 'then press the button again.')
 		);
-		if (res.detail) note.appendChild(el('p', null, `Chromium said: ${res.detail}`));
+		if (res.detail) note.appendChild(el('p', null, `The browser said: ${res.detail}`));
 	} else if (error === 'not-found') {
 		note.append(el('p', null, `Not on disk at ${res.path}.`));
 	} else if (error === 'not-downloaded') {

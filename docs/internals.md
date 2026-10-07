@@ -1,0 +1,312 @@
+# Internals
+
+How the archiver works, why it is built the way it is, and how it is tested. For installing and using it, see the [README](../README.md).
+
+## Folder layout
+
+```
+<your folder>/
+  videos/<videoId>.mp4       one file per video
+  images/<postId>.jpg        a single-image post
+  images/<postId>_01.jpg     a gallery, one file per image, numbered in order
+  audio/<postId>.mp3         the song a photo post plays over its images
+  archive.json               every liked item, downloaded or not
+  viewer.html                the Library, as a file you can double-click
+```
+
+Nothing hidden, nothing nested. Filenames are the TikTok item ID, so writing the same item twice is a no-op, and the **directory listing** — not any database — decides what still needs downloading. Delete a file and the next sync re-fetches it; corrupt `archive.json` and nothing re-downloads.
+
+Only photo posts get an `audio/` file, and only where TikTok gave one: a video's soundtrack is already inside its own mp4, so fetching the track again would be a second request per item for a copy of something the folder has. The Library plays it beside the images. A song that can't be fetched is not a failed item — the pictures are the post — but it is written down rather than passed over in silence: the item gets a `noAudio` saying whether TikTok named no link to the track or the download itself was refused, and a **Full sync** is what tries again.
+
+There are no cover files. A cover is a thumbnail of something you already have, so the Library decodes a frame out of the video instead (a little way in, since TikTok's first frame is usually black) and caches it in memory. Photo posts use their own first image.
+
+### archive.json
+
+Every item that has ever appeared in your likes, whether or not the media could be fetched. Each carries a `status`:
+
+| | |
+| --- | --- |
+| `saved` | the media is on disk |
+| `pending` | in your likes, not downloaded yet |
+| `unavailable` | download attempted and failed — expired URL, 403, captcha |
+| `gone` | was in your likes once and isn't now: deleted, privated, or unliked |
+
+`gone` is the point of the file. That media is unrecoverable and always was — but the id, author, caption, date and stats are a few hundred bytes each, and they are the only thing that survives the post. A completed sync is what promotes an item to `gone`; a run you stop early never does, because a short list proves nothing, and neither does a run that stopped as soon as it caught up.
+
+`gone` is also the one thing a sync can get *wrong*, so it is guarded. TikTok sometimes ends the list early — `hasMore: false`, no error, nothing to distinguish it from having reached the end — and a run that believes it would write off everything below the cut. What gives it away is where the missing likes are: unliking is scattered through the order, because you unlike a post for what it is, not for when you liked it, while a truncation takes the tail and nothing else. So a completed run that fails to return the deepest 60 likes on record *in one block* is treated as cut short: nothing is marked `gone`, `fullSyncAt` is left alone, and the log says so. See [Where a sync stops](#where-a-sync-stops).
+
+An item may also carry `noAudio`, which is a note rather than a status: the pictures of that photo post are on disk and it is `saved`, but the song over them could not be had, and the value says why. It is cleared the moment a run does come back with the track.
+
+The file also carries `fullSyncAt`, the last time a run did reach the end of the list. It is what lets the next sync stop early — see [Where a sync stops](#where-a-sync-stops) — and `0` on an archive where no run ever has. Beside it, `listLength` records how many likes that run actually read, which is what the next one is compared against and what the log reports back to you.
+
+It's indented JSON at the top level of the folder, so `jq` and a text editor are both fine on it.
+
+### When you liked something
+
+Nothing in TikTok's response says when you liked a post. The only thing that carries that information is the order the likes list comes back in — most recently liked first — so that order is what gets kept, as `likeOrder`: an array of ids, newest like at index 0. Each item's `likeRank` is its index into it, derived from the array on every load so the two can't disagree.
+
+A sync you stop early has only seen the top of the list. Its ids are merged in by anchor rather than appended: an id this run didn't reach keeps its place immediately after whichever id it used to follow, so a partial run corrects the newest likes and leaves the rest of the order alone. An item that has been unliked keeps the position it held, between the two likes it sat between.
+
+An archive last synced before any of this existed has no `likeOrder` at all, and one rebuilt from myfaveTT by `tools/script.py` never gets one — there is nothing in those databases to derive it from. Those items sort last, by post date, which is what the Library did for everything before. One full sync fills it in.
+
+### viewer.html
+
+The archive page lives at a `chrome-extension://` or `moz-extension://` URL, which is not an address anyone wants to keep to hand. So the same Library is written into the folder itself, rewritten after every sync and on demand with **Write viewer.html**. Double-click it and the archive browses itself — search, sort, playback, per-item metadata — with no extension involved. Copy the folder to another machine or a drive and it still opens.
+
+It is one self-contained file because it has to be. A `file://` document gets a unique opaque origin, so it can neither `fetch('archive.json')` nor load a module script from beside itself; the CSS, the JS and a slimmed copy of the metadata are inlined instead. Media is the exception and stays on relative paths — `<img>` and `<video>` load siblings off `file://` without complaint, which is what makes the whole thing work. A 6k-item archive comes out around 3 MB.
+
+It opens in the order you liked things, most recent first — **Recently liked**, with **First liked** for the other end. The two date options sort by when the post was made instead, which is a different question and often a very different order.
+
+Opening an item gives you a feed rather than a single clip. The wheel, ↑ ↓ (or `j`/`k`, PageUp/PageDown) and the two round buttons step through whatever the search and sort currently list, skipping anything not on disk; space plays and pauses, `m` mutes for the rest of the session, Esc closes and leaves the grid scrolled to where you got to. A photo post shows one image at a time the way TikTok's own slideshow does — ← → or the dots page through it, and `g` opens the whole post out at once. The same feed is in the extension's own Library tab; the two are kept in step by hand.
+
+Two consequences worth knowing:
+
+- **Thumbnails are `<video>` elements seeked to 0.5 s**, not decoded frames. The archive page uses `canvas.toBlob`, which throws here: a `file://` video taints the canvas.
+- **It is a snapshot.** The metadata is as current as the last sync. The media is always current, since that is read off the folder.
+
+On Chromium it can also talk back to the extension, which makes it a front-end rather than an export. Turn on **Allow access to file URLs** on the extension's card in `chrome://extensions` and the page reads live metadata instead of its snapshot, and can start a sync itself. That permission covers every local file you open, so the content script bails unless the document carries a `<meta name="ttarchive-viewer">` whose token matches one the extension issued and keeps to itself — another local page can't drive the archiver by copying the tag.
+
+Firefox does not run extensions on `file://` pages at all, and rejects `file:///*` match patterns outright, so there is no counterpart in `manifest.firefox.json`. There the page stays a snapshot, says so in a banner, and offers the archive page's URL to copy.
+
+### Show in folder
+
+An opened post has a **Show in folder** button at the bottom right of its panel. It shows the file in the system's file manager — selected, where the file manager can — the video, or for a photo post the image on screen — so it can be dragged into a chat or copied somewhere.
+
+On Chromium that is the [local helper](#local-helper)'s job; pressing the button without it shows the command that installs it. Chromium's own downloads page can show a file because Chromium wrote it and kept the path; `downloads.show` gives an extension the same, but only for downloads, and no extension API opens a file manager on an arbitrary file. So the helper does it from outside the browser. When it owns the folder it knows where everything is; when the browser does, it reads the folder out of the profile's `Preferences`, where Chromium records the folder an extension's picker chose, path and all. It will only ever select a file inside the archive.
+
+`viewer.html` has the same button whenever the extension is attached to it, even with the archive page closed.
+
+Firefox needs no helper: it downloaded every file itself, so `downloads.show` knows where each one is. A file that only came in by **Scan an existing folder…**, or whose download history has been cleared, has nothing to point at, and the button says so.
+
+## Local helper
+
+[`tools/helper.py`](../tools/helper.py): everything the extension needs from outside the browser, as one small process. Optional, for Chrome, Chromium, Edge and Brave on Windows, macOS and Linux, and used on its own once installed — there is no setting. The extension still does everything that needs TikTok: the list is read and every file is downloaded in the user's own logged-in session. What the helper adds:
+
+- **The folder.** Instead of writing through File System Access, the extension hands each file to the helper, which writes it with an ordinary path — so there is no folder permission to grant again every browser session. The first time, it takes over the archive the browser's picker last chose; **Change folder…** opens the system's own folder dialog (osascript on macOS, zenity or kdialog on Linux, Tk otherwise).
+- **The Library at a real address.** The helper serves the folder on `http://127.0.0.1:8737/`, so **Library → Open in a tab** opens the folder's `viewer.html` there — live, connected to the extension, no *Allow access to file URLs* — at an address that can be bookmarked. The extension's own Library streams from the same address by range, rather than reading each file into memory first.
+- **Show in folder**, above: Explorer on Windows, Finder on macOS, and on Linux whatever file manager answers the freedesktop `FileManager1` D-Bus interface, else the folder through `xdg-open`.
+
+`install` writes a launcher naming this machine's Python and this checkout's path into `tools/native-host/` (gitignored), and registers the host `com.ttarchive.helper` for it: under `HKCU` for all four browsers on Windows, and as a manifest in the `NativeMessagingHosts` folder of each browser that has a profile on macOS and Linux. Nothing is copied anywhere, so updating the checkout updates the helper; reinstall only after moving the checkout or changing Python. `uninstall` takes it back out, and the extension goes back to writing through the browser — same folder, same layout. On Windows both also clear away what earlier versions installed (a separate `com.ttarchive.show_in_folder` host and copies under `%LOCALAPPDATA%`).
+
+On Windows a terminal opened inside a packaged desktop app has its writes to `%LOCALAPPDATA%` and `HKCU\Software` redirected into that app's private copy, which a browser started from the taskbar never sees; an install there would report success and the browser would say *Specified native messaging host not found.* Both commands check for this first and refuse. Snap and Flatpak browsers on Linux don't read native-messaging hosts from the usual folders, and aren't supported.
+
+How it fits together:
+
+- **The background starts it and holds it.** `src/background.js` opens a native-messaging port to the helper, which serves HTTP until that port closes. An open native port is also what keeps an MV3 worker alive, so the helper is up for as long as the browser is, and the Library's address keeps answering with the archive page closed. If the worker is stopped anyway, the next request from the archive page brings both back — a write that fails because the helper went away is retried once on the new one.
+- **Bytes go over HTTP, not native messaging.** `src/lib/backends/helper.js` is a third backend behind `src/lib/fs.js`, beside File System Access and the downloads API: `PUT` to write (to a `.ttarchive-part` file, renamed into place once whole), `GET`/`HEAD` with ranges to read, `/api/list` for the directory listing that still decides what needs downloading. The archive page asks for the helper once as it loads and uses it if it answers; installed but unable to start, the page says why and carries on with File System Access. Nothing above `fs.js` knows which backend ran.
+- **Dialogs and the file manager are processes of their own.** The folder dialog and **Show in folder** start a fresh helper per click with `sendNativeMessage` rather than asking the running server, because a process the browser has just started from a click may bring a window to the front, where on Windows a server that has been up for an hour may not.
+- **Only the extension gets in.** Every request needs a token the extension generates and keeps; writes take it only as a header, which a page on another site can't send here without a CORS preflight the helper answers for the extension's origin alone. Opening the Library turns the token into an `HttpOnly`, `SameSite=Lax` cookie, so the page's own media requests are let in and another site's `<img>` pointed at this address is not. Requests naming any host other than `127.0.0.1` or `localhost` are refused, which is what stops DNS rebinding.
+
+What it doesn't change: anything about TikTok, the folder layout, `archive.json`, or `viewer.html` opened by double-click. Firefox keeps its downloads backend.
+
+## Converting an existing archive
+
+[`tools/script.py`](../tools/script.py) turns a myfaveTT folder — or an older version of this one, which used `data/Likes/` — into the layout above. Copy it into the folder and run it:
+
+```bash
+python script.py
+```
+
+It moves media rather than copying it, so it's instant even at hundreds of GB, and it writes `archive.json` from myfaveTT's own gzipped databases: every id they recorded, including the ones TikTok had already deleted. Nothing is downloaded and nothing is deleted — myfaveTT's `data/.appdata/` and its cover thumbnails are left where they are, and the script prints their size so you can decide about them yourself.
+
+| | |
+| --- | --- |
+| `--dry-run` | print the plan and touch nothing |
+| `--copy` | copy instead of moving, so the myfaveTT archive keeps working |
+| `--root PATH` | operate on a folder other than the script's own |
+
+Safe to re-run: it only moves files whose destination doesn't already exist, and rebuilds `archive.json` from whatever it finds.
+
+## Firefox
+
+Gecko has no File System Access API, so there is no handle to write through and none of the above works as written. It does have three things that, together, cover it:
+
+- `downloads.download()` writes anywhere **inside** the browser's download folder and accepts a relative subpath — so the layout above survives verbatim. (The flat layout helps here: there is no longer a leading-dot directory for Firefox's filename sanitiser to object to.)
+- `downloads.search()` returns each download's absolute path plus an `exists` flag. That keeps the load-bearing property intact: what needs downloading is still decided by what is on disk, not by a database we maintain.
+- `<input type="file" webkitdirectory>` hands back every `File` in a folder the user points at, which is how an existing archive gets read at all.
+
+`src/lib/fs.js` is now a façade over two backends and picks one by feature detection. Nothing above it — `state.js`, `downloader.js`, `viewer.js` — knows which browser it's on.
+
+Four things are honestly worse than on Chromium, and the archive page says so where it matters:
+
+| | Chromium | Firefox |
+| --- | --- | --- |
+| Where the archive can live | any folder | only under the download folder; move it in `about:preferences` |
+| What "already downloaded" means | a live directory listing | download history, plus any folder you've scanned |
+| Reading files back (Library playback, thumbnails, `archive.json`) | always | only after **Scan an existing folder…** |
+| `viewer.html` in the folder | can read live state and start a sync | a snapshot; the extension can't attach to a local file |
+
+That last row is a platform limit with no workaround, not a gap in the port. Gecko has never run extensions on `file://` URLs — `externally_connectable` doesn't cover the scheme either, and content-initiated navigation to `moz-extension:` is blocked — so a page in your archive folder has no way to reach the extension. It still browses the archive perfectly well; it just can't sync, and it explains that rather than failing quietly.
+
+Clearing your download history costs bandwidth, never data: the next sync re-downloads over the top of files that are already there (`conflictAction: 'overwrite'`), and identical filenames mean the result is the same archive. `archive.json` is additionally mirrored into IndexedDB, because a download folder is write-only from inside the extension and the metadata has to survive to the next run.
+
+Every file also appears in Firefox's download panel. There's no API to suppress that.
+
+**Not verified end-to-end.** Firefox's port is written and unit-tested (`src/dev/backends.html`) but hasn't been run against a live TikTok session. The specific thing to watch is cookies: the README's finding that media URLs are bound to the session that obtained them depends on `credentials: 'include'` actually sending TikTok's cookies, and Firefox partitions cookies more aggressively than Chromium does. If downloads 403 on Firefox while the same account works on Edge, that's the first thing to check.
+
+## How the list is obtained
+
+TikTok's `/api/favorite/item_list/` requires `X-Bogus` / `_signature` / `msToken`, computed by an obfuscated bundle that rotates regularly. Reimplementing that signer means breaking every few weeks.
+
+Instead, `src/content/hook.js` runs in the page's MAIN world and wraps `fetch` and `XMLHttpRequest`. TikTok's own code makes its own correctly-signed request; we read the response and keep the URL that produced it.
+
+From there a sync pages the list one of two ways:
+
+**Background paging (default).** `hook.js` replays that captured URL with the next `cursor` and a fresh `msToken`, using the page's own `fetch` so cookies, `Origin` and `Referer` are whatever TikTok expects. Nothing is scrolled, so the tab can sit in the background and you keep your browser. If the bundle still exposes its signer (`window.byted_acrawler`) the replay is re-signed; if it doesn't, the plain replay is tried anyway and the response decides.
+
+**Scrolling (fallback).** The original path: scroll the page and let TikTok's own code request the next page. Slower, and it needs the tab visible — a hidden tab's rendering is suspended, so the scroll never triggers anything. Used automatically whenever paging is refused, since that's a signing change and this path has nothing to break.
+
+Both feed the same normalizer, so nothing downstream knows which one ran. A run that falls back partway just re-walks the list from the top; already-downloaded items are skipped on disk.
+
+The hook sees every item list a TikTok page loads, not just the likes: a profile's Videos grid, the creator shelf beside a post. So a harvest only reports responses from the endpoint it is reading (`favorite` for likes), and the archive page only accepts them from the tab it opened for the sync. Before both checks existed, scrolling a creator's profile during a sync put their whole grid into the archive as likes: 48 posts in one run, downloaded and slotted into the like order in the creator's own post order.
+
+### Where a sync stops
+
+The list is newest-first, so everything liked since the last sync is above everything already archived. **Sync likes** reads down it until it has passed 32 items in a row that an earlier run had already finished with — a page or two — and stops there. A daily sync is then two or three requests instead of two hundred, which is worth more than the time it saves: [every request is attributable to the account](#being-refused), and the cheapest way not to be rate-limited is not to ask.
+
+The content script still reports the whole list it walks; the archive page is what decides it has seen enough, because the decision needs the directory listing and only the archive page has it. "Already finished with" is deliberately stricter than "we have a record of it": an item counts only if its media is on disk, or was fetched and refused (`unavailable`), or had already dropped out of the list (`gone`). Anything still `pending` keeps the run going, so the retry that a second sync exists for cannot be stopped short of the thing it is retrying. The count has to be consecutive, and one unrecognised id resets it — a post you re-liked in among the new ones can't end a run early. The reason it isn't simply "stop at the newest like we already hold" is the other half of that: the order is by when you liked something, not by what it is, so a post re-liked today sits at the top of the list already archived, with the week's new likes underneath it. The slack is there to step over that, and is sized for nothing more.
+
+Two things need the end of the list, and they are what **Full sync** is for: noticing what you have unliked, since `gone` is only ever set by a run that reached the end, and retrying failures deeper than an incremental run goes. It is also what the *first* run on any archive does whichever mode is picked — until one run has read the list to the end there is no "already synced up to" to look for, and a folder converted by `tools/script.py` is exactly that case.
+
+### When the end isn't the end
+
+TikTok does not always serve the whole list, and does not say when it hasn't. The reply that ends a run early is the same one that ends it correctly: `hasMore: false`, status 0, no error. On the archive this was found in, a clean **Full sync** stopped 303 likes above where the previous tool had reached, reported success, and wrote off the one item below the cut that had no file on disk to protect it — every other one survived because `markGone` skips anything already downloaded, which is luck rather than design.
+
+So a completed run now has to look plausible before it is believed. The test is *where* the missing likes are rather than how many: unliking is scattered through the order, a truncation takes the deep end and nothing else. A run that fails to return the last 60 likes on record as one unbroken block is treated as cut short — nothing is marked `gone`, `fullSyncAt` and `listLength` keep their old values, and the log says plainly that the list was truncated. Items already `gone` are stepped over rather than counted, or a deletion at the bottom of the list would make every run after it look truncated for good.
+
+The blind spot is the first run: an archive whose *earliest* sync was already truncated has no record of the part it never saw, so nothing can know it is missing. That is what happened here — the wall was there before this tool ever ran, which is why the count is worth reading in the log even when nothing is flagged.
+
+### Fetch missing songs
+
+A truncated run leaves damage no later sync can repair, and the songs are where it shows. A photo post whose pictures are on disk is *settled* — [Where a sync stops](#where-a-sync-stops) excludes the song from that test deliberately — so **Sync likes** steps over it forever, and **Full sync** only reaches it if TikTok serves the list that far. On the archive this was built against, the run that first collected songs stopped 64 likes short of the end, on a build that predated the truncation guard above and so stamped `fullSyncAt` anyway. Seventeen photo posts at the bottom of the list were left holding pictures fetched before songs existed, with nothing on the record to say so, and no run afterwards could get back to them.
+
+**Fetch missing songs** does not use the list. It walks `archive.json` for photo posts with images on disk and no file in `audio/`, opens each one's own page in the background tab, and takes the item struct from the page itself — no request to sign, no cursor, no dependence on how deep the list is served. A video page server-renders that struct into its state blob; a photo page does not, and instead fetches `/api/item/detail/` for itself once it is up, signed by its own bundle. `hook.js` keeps those responses as they land, and the collector reads whichever of the two holds the post asked for. That also answers the other half of the problem: a track `item_list` names but sends no `playUrl` for is routinely linked on the post's own page, so posts already written off as `noAudio` are retried rather than skipped.
+
+It costs a page load per post, which is why it is a button and not part of a sync. The archive page drives each load itself in short asks to the worker — point the tab at the post, ping it until the content script reports the post's URL, then ask for the record every half second until the page has it — and every one of those asks is answered in the same tick by whoever it reaches. Chromium stops the extension worker on its own schedule and a request still in flight when it does is lost, so nothing here gives it one to hold. The first few posts of a pass log their step timings. (A pass in which every post fails as "the extension worker restarted mid-request" thirty seconds apart is not the worker: it once meant a request whose extras overwrote its own id, so the reply could not be matched — see `ask` in `archive.js`.) Posts are opened newest-liked first, **Stop** ends it between posts, and it leaves the tab back on your profile so the next sync can reuse it. Anything still songless afterwards is recorded under `noAudio` with which of the two reasons it was.
+
+One detail worth knowing if you touch this: Chrome clamps a hidden tab's timers to 1/s, and to 1/min once it has been hidden a while, which would throttle the paging loop to a crawl. The delay between pages is therefore taken from the service worker's clock (`{type: 'sleep'}` in `src/background.js`), which isn't clamped, raced against the local timer in case the worker has been shut down.
+
+## Being refused
+
+Every request a sync makes carries your own logged-in session and TikTok's own signing. That is what makes the archive possible, and it is also why being rate-limited here is attributable to the **account** and not just the IP. The rule the code follows, in `src/lib/throttle.js`, is that a refusal has to make the extension quieter — never louder.
+
+It did the opposite before this existed. `fetchFirst` treated any non-2xx as "this mirror is stale, try the next one", and TikTok hands out four to six mirrors per asset; they resolve to the same edge fleet, so one 429 became five more immediate requests into a limit already hit, times four parallel downloads. The list pager, separately, had a flat 400 ms between pages and no notion of a refusal at all.
+
+Two outcomes now, deliberately different:
+
+| | | |
+| --- | --- | --- |
+| **Pause** | 429, 502/503/504 | Everything parks — downloads *and* the pager — for 20 s, doubling per consecutive refusal to a 10-minute ceiling, jittered. A `Retry-After` wins whenever it asks for longer. Twenty clean requests walk the back-off down again. Four parallel downloads meeting one limit count as one event, not four. |
+| **Halt** | a captcha or challenge page | No interval fixes this; it needs a human in the tab. The run stops, says so, and asks you to clear the check and press Sync again. |
+
+The halt case is the one worth being careful about. A challenge and a *signing* failure both look like "the replay didn't work", but they want opposite responses: a signing failure should fall back to scrolling, because scrolling has nothing to do with signing, whereas falling back to scrolling during a challenge would go on making the same requests from the same session while TikTok is objecting. `hook.js` therefore reports a status code and a `challenged` flag rather than one opaque error string, and only the former reroutes.
+
+Nothing a halt touches is marked `unavailable`. That status is a claim about the media — that it was fetched and could not be had — and a stopped run has no business making it; a run that resumed tomorrow would skip everything the halt caught. Parked items are simply left `pending` and picked up by the next sync.
+
+The two halves keep each other informed. Downloads run on the archive page and the list is paged in the content script, so a refusal met by one is news the other cannot otherwise get; it travels over the background relay and each side adopts the longer pause. A challenge met while downloading stops the pager, and vice versa.
+
+The paging delay is now 800–2500 ms, randomised. The old fixed 400 ms was its own tell — nothing human requests a page on a metronome three hundred times — and this is both slower and irregular. There is also a 1200-page ceiling on a single run as a backstop, far past any real likes list.
+
+`src/dev/throttle.html` and the last two sections of `src/dev/paging.html` are where this is checked.
+
+## Architecture
+
+| File | Role |
+| --- | --- |
+| `src/content/hook.js` | MAIN world. Wraps `fetch`/XHR, forwards `item_list` responses over `postMessage`, replays the captured request by cursor on demand, and reads a single post out of the page's own state blob. |
+| `src/content/collector.js` | ISOLATED world. Pages the list (background paging, else auto-scroll), normalizes items, relays to the service worker, and answers for the one post a page is showing. |
+| `src/background.js` | Relay between content scripts and the archive page; manages the TikTok tab, drives it post by post for the song pass, lends the foreground when a step needs it, and serves the collector's unthrottled clock. Service worker on Chromium, event page on Gecko, so it stays import-free. |
+| `src/archive/archive.js` | Owns the storage backend, the sync run, the song pass, and all disk I/O. |
+| `src/archive/viewer.js` | Offline library browser — search, sort, thumbnails, playback from disk. |
+| `src/archive/standalone.js` | Generates the folder's own `viewer.html`, inlining `src/viewer/`. |
+| `src/viewer/` | Template, CSS and runtime for that generated page. Never loaded as files by the extension — only read and inlined. |
+| `src/content/viewer-bridge.js` | Chromium only. Relays a generated `viewer.html`'s requests to the background. |
+| `src/lib/fs.js` | Storage façade: folder layout, backend selection by feature detection. |
+| `src/lib/backends/fsa.js` | Chromium backend — File System Access, write retries. |
+| `src/lib/backends/downloads.js` | Gecko backend — downloads API, history-derived listing, folder snapshot. |
+| `src/lib/backends/helper.js` | Chromium backend when the local helper is installed — the folder over HTTP to `tools/helper.py`. See [Local helper](#local-helper). |
+| `src/lib/ext.js` | `browser ?? chrome`, so every call site can `await`. |
+| `src/lib/state.js` | Disk scan + `archive.json` load/save/merge, item status, and how far down the list a sync still has to read. |
+| `src/lib/downloader.js` | Bounded-concurrency fetch/write queue, media URL selection. |
+| `src/lib/throttle.js` | Back-off and halt state — what happens when TikTok refuses. Shared by the queue and, restated inline, by the collector. |
+| `tools/script.py` | One-off converter from a myfaveTT (or older ttarchive) folder. |
+| `tools/helper.py` | The local helper: writes and serves the archive folder on 127.0.0.1, opens the folder dialog and the file manager (Show in folder). Its own installer. |
+
+All fetching happens on the extension page rather than in a content script: since Chrome 85 content-script requests obey the page's CORS policy, while extension pages get host-permission-based access.
+
+## Verified behaviour
+
+Checked on 2026-08-02 by loading this extension into Edge with `--load-extension` and downloading from the extension's own origin — the same conditions a real sync runs under. All of it is Chromium; see [Firefox](#firefox) for what has and hasn't been checked there.
+
+| Case | Result |
+| --- | --- |
+| Video — `tiktok.com/@soupy_cos/video/7669190146864074006` | 1,219,617 bytes, exactly the `video.size` TikTok declares; h264 576×1024, 7.34 s, 220 frames |
+| Single photo post — `@abc.es/photo/7668973530595314966` | 1 image, 1080×1350 JPEG, 171 KB |
+| Gallery photo post — `@mcslobby/photo/7666435596851711254` | all 9 images, in order, up to 1440×2148, 74–196 KB each |
+
+**No watermarks.** `video.playAddr` and `video.downloadAddr` are two different encodes of the same clip. Frames extracted from both show the bouncing "TikTok / @author" watermark burned into `downloadAddr` and a clean image in `playAddr`. The extension selects from `bitrateInfo` (progressive gears only, highest resolution first, bitrate breaking ties) then `playAddr`, and **never** falls back to `downloadAddr` — see the comment in `src/content/collector.js`. Photo-post images carry no watermark at any resolution.
+
+**Progressive gears only — `Format: 'dash'` is video-only.** A `bitrateInfo` gear whose `Format` is `dash` is one representation of the adaptive ladder: picture with no sound track, served from a `media-video-hvc1/` path, its audio held separately in `bitrateAudioInfo` and named by `VideoExtra.audio_file_id`. The file it returns is a complete, playable mp4, so nothing downstream can tell it apart — the archive just gets a silent copy. Selection skips these gears **before** ranking. A missing `Format` is never treated as dash: payloads older than the adaptive ladder don't carry the field and are all progressive. `playAddr` is itself the progressive gear, so the fallback at the end of the list is always muxed.
+
+**Highest resolution, not highest bitrate.** Ranking the `bitrateInfo` gears by bitrate — what this did until 2026-08-02 — picks the h264 540/720 rung over the h265 1080 one whenever HEVC's efficiency puts the latter lower in bits per second. Read off a live feed, 16 of 29 videos had a higher-resolution gear than the bitrate winner. Selection sorts on `PlayAddr.Width × Height` first, bitrate breaking ties.
+
+Resolution-first ranking on its own walked straight into the dash gears, because the dash ladder is where the 1080 rungs usually are — that shipped on 2026-08-02 and cost four silent files before the `Format` check was added. `7669983946771336462` is the worked example: gears are `normal_720_0` (mp4, 720×1280, 28,296,121 B) and `adapt_lowest_1080_1` (dash, 1080×1920, 15,450,455 B), and the silent file in the archive was 15,450,455 bytes to the byte. Reading the first 256 KB of each confirms it — the dash `moov` carries a `vide` handler and no `soun`/`mp4a`, the mp4 one carries both.
+
+**The download is checked for sound, not just for being an mp4.** Gear selection reads fields TikTok owns and can rename, so it can't be the only thing standing between the archive and a silent file — and nothing else noticed: a video-only stream has the right magic bytes, the right content type, and plays. `fetchFirst` now takes a `prefer` predicate, and video downloads pass `hasAudioTrack`, which walks the top-level boxes to `moov` and looks for an `hdlr` declaring `soun`. Unlike `expect`, `prefer` is a preference: a candidate that fails it is held while the rest get a turn and handed back if none does better, so a post whose audio really is missing everywhere still archives rather than failing. Misses are capped at two, because each one costs a whole media download. A file that can't be parsed counts as passing — "cannot tell" is not grounds for discarding a download.
+
+So the 1080 rung is only taken when it exists as a progressive gear. Where it doesn't, the download lands on `normal_720_0` and gives up the resolution rather than the sound; recovering both would mean fetching the dash video and its `bitrateAudioInfo` track and muxing them, which needs a muxer the extension doesn't have. The practical cost of the ranking is that many files land as h265/hvc1 rather than h264 — fine in Chromium and in the Library viewer, but older players and Firefox before 134 may not decode them.
+
+**Photo `urlList` entries are mirrors, not sizes.** Each image's `urlList` holds the same `~tplv-photomode-image.jpeg` asset on two CDN hosts (`p16-…`, `p19-…`), with no resize suffix, so taking the first one that answers cannot silently downgrade an image. Covers are never fetched at all.
+
+Two things this testing established that shape the code:
+
+- **Media URLs are bound to the browser session that obtained them.** A URL harvested in one browser profile returns HTTP 403 in another, even seconds later with identical headers. This is fine for normal use — the extension harvests and downloads in the same profile — but it is why `fetchFirst` sends `credentials: 'include'`, and why a URL you copy out of the log won't work in curl or another browser.
+- **A challenged request returns HTTP 200 with TikTok's captcha page.** Before this was caught, a 33 KB HTML page was written to disk as an `.mp4` and counted as a successful download. `fetchFirst` checks magic bytes (`ftyp` for video, JPEG/PNG/WebP/GIF/HEIC for images) and rejects anything that isn't really media. A body that is *not* media but also isn't HTML is a stale mirror, and the next mirror gets a turn; a body that looks like a challenge page stops the whole run instead — see [Being refused](#being-refused).
+
+Not yet verified end-to-end: the Liked-tab harvest in either mode, which needs a logged-in account. Background paging in particular rests on an untested assumption — that TikTok accepts a captured `item_list` URL with the cursor swapped. If it doesn't, the run says so in the log and falls back to scrolling, so the failure mode is the old behaviour rather than a broken sync.
+
+## Known limits
+
+- **Deleted / privated items can't be recovered, and most of them can't even be named.** They never appear in the list responses. A myfaveTT database counts them in `numDisappeared` — but that is all it keeps: a number. The ids are not in `db_likes.js`, `db_videos.js` or anywhere else in `data/.appdata`, so there is nothing for `tools/script.py` to carry over, and `archive.json` has no record of those posts. Only items that were still in the likes list when something read it can ever become `gone`.
+- **A photo post's song is sometimes not downloadable.** The pictures are the post and they still archive; the track is a bonus that TikTok does not always serve — licensed music often comes back with no `playUrl` at all, and an old post's sound goes away with the upload it was taken from. Those posts record `noAudio` in `archive.json` saying which of the two it was, and the Library says so under the title instead of showing an empty player. **Fetch missing songs** re-attempts every one of them off the posts' own pages, which is a different source from the list and often has the link the list didn't — see [Fetch missing songs](#fetch-missing-songs). A **Full sync** re-attempts them from the list; **Sync likes** does not, since a post whose pictures are on disk is one an earlier run finished with.
+- **Media URLs are signed and expire.** Downloads run concurrently with the list read to stay ahead of it, but on a very large first run some may still time out. They're logged as failures; run **Sync likes** again and only the missing files are retried — for ones deeper in the list than an incremental run reaches, **Full sync**.
+- **No `total` from TikTok.** The progress bar is seeded from your previous item count, so it's an estimate until the run ends.
+- Bookmarks, Following, and audio extraction are not implemented. The plumbing is there (`collector.js` already recognises the bookmarks tab) if you want them later.
+
+## Development
+
+`syntaxcheck.html` loads every module against a stub `chrome` API to catch parse and top-level errors without installing the extension:
+
+```bash
+python -m http.server 8777
+```
+
+Then open `http://127.0.0.1:8777/syntaxcheck.html`. Add `?gecko` to make it stub `browser.*` and hide `showDirectoryPicker`, so the Firefox backend is the one that gets selected and evaluated. It is dev-only and not referenced by the extension.
+
+`src/dev/backends.html` unit-tests the Gecko backend against a faked download history and a faked directory pick — path arithmetic, the history/snapshot union, filename sanitising, the `archive.json` mirror. Serve the repo as above and open `http://127.0.0.1:8777/src/dev/backends.html`; it prints pass/fail and needs no browser extension loaded.
+
+`src/dev/paging.html` runs `hook.js` and `collector.js` against a fake `item_list` endpoint — the only way to exercise the list harvest without a logged-in account. It covers what breaks quietly: that background paging replays the captured URL by cursor rather than making the page scroll, that each replay picks up the current `msToken` and is re-signed for its own cursor, that a refused replay falls back to scrolling and still returns the same list, and that a second sync in the same tab reports the whole list again instead of only what changed. Its last two sections cover the opposite case — that a captcha and a 429 *don't* fall back to scrolling, that a rate-limited page is retried at the same cursor with a growing wait rather than skipped, and that the halt reaches the download side. Back-off is measured against the wall clock, so those tests speed `Date.now` up rather than shortening the intervals in the code. Open `http://127.0.0.1:8777/src/dev/paging.html`.
+
+`src/dev/throttle.html` unit-tests `src/lib/throttle.js` and `fetchFirst` against a scripted `fetch`. The behaviour it covers is almost entirely about requests *not* made — that a 429 stops the round instead of walking the remaining mirrors, that four parallel downloads meeting one limit back off once rather than four times, that a challenge page throws before trying anything else and under any content type, that a halted or stopped item is never marked `unavailable`, and that an ordinary 404 still walks the mirror list exactly as it used to. Open `http://127.0.0.1:8777/src/dev/throttle.html`.
+
+`src/dev/thumbs.html` tests the Library against a folder that exists only in memory: an import map swaps `src/dev/fake-fs.js` in for `src/lib/fs.js`, so `state.js` and `viewer.js` run exactly as shipped. It matters most for video thumbnails, which are now decoded frames rather than files — the sample clip inlined in the page is black for its first 0.2 s and colour bars after, so "we took frame 0" fails as a real assertion rather than a flaky one. Open `http://127.0.0.1:8777/src/dev/thumbs.html`.
+
+`src/dev/likeorder.html` covers the like order — the merge in `state.js` and the sort in the Library, against a folder that exists only in memory. The merge is the part worth testing: a run that ends early sees only the top of the list, and folding that prefix into the order already on record has to correct the newest likes without quietly reshuffling everything below them. It also checks the fallback, since an archive that hasn't been synced since this existed has no order at all and has to keep sorting by post date. Open `http://127.0.0.1:8777/src/dev/likeorder.html`.
+
+`src/dev/incremental.html` covers where an incremental sync is allowed to stop — `isSettled` and `settledStreak` in `state.js`, against a seeded in-memory folder. Both mistakes here are silent: too loose and a sync stops above likes it never archived, too strict and every run walks the whole list again, which is the thing this exists to end. So it checks the cases that decide it — a `pending` item holding the run open where an `unavailable` or `gone` one doesn't, a part-downloaded gallery counting as unfinished, one unknown id resetting the count mid-page, and the count surviving being handed a page at a time. Open `http://127.0.0.1:8777/src/dev/incremental.html`.
+
+`src/dev/songs.html` covers what happens when a photo post's song can't be had, which is a failure that goes out of its way to look like nothing. The pictures are the post and they are already on disk, so the item stays `saved`, the run stays green, and the only trace is a post that plays no music — which is how 58 posts in a 794-post archive ended up with no track and no explanation. It stubs `fetch` and runs `downloader.js` and `state.js` as shipped against an in-memory folder, and asserts the record that gets written rather than the download: a refused track is written off on the item without making the post `unavailable` or the run report a failure, a note is cleared the moment the track does turn up, and a payload naming a song with no link in it is caught by `noteAbsentSongLink` — the case the downloader never sees, because `missingParts` asks only for audio it has a URL for, so the queue skips the item outright. Its last section covers the worklist the song pass walks — which posts count as songless, and that a post already written off is retried rather than skipped, since the note records what the *list* said and the pass asks somewhere else. Open `http://127.0.0.1:8777/src/dev/songs.html`.
+
+`src/dev/postdetail.html` runs `hook.js` and `collector.js` against a faked post page, which is how the song pass gets a track the list wouldn't give up — see [Fetch missing songs](#fetch-missing-songs). Both failures here are silent ones. The archive page navigates the tab and asks as soon as the page answers pings, but the record arrives a beat after that — a photo page has to fetch it, and an SPA navigation replaces the state blob late — so reading once returns the *previous* post, and filing one post's song under another's id produces an ordinary-looking archive with the wrong music in it. The id is therefore checked and a mismatch refused by name, for the archive page to ask again, which is asserted by swapping the blob between asks and by landing the fetched record between them. Every answer is immediate, and there is a check that it stays so. The photo case gets its own section: a blob with nothing about the post, the record in a detail fetch instead, and later fetches for the posts recommended alongside not hiding it. The other half is the reverse direction: a detail response goes through the same `handle()` as a page of the list but is not one, and adopting it would end a harvest on the spot and put a post nobody scrolled past into the run's like order. Open `http://127.0.0.1:8777/src/dev/postdetail.html`; two of its cases wait out a real timeout, so it takes about half a minute.
+
+`src/dev/syncmode.html` drives the split **Sync likes ▾** button, which is the one control on the archive page whose state lives in three places at once — the button's label, the tick in the menu, and the flag the click reads — and nothing notices when those disagree. It fetches `archive.html` and mounts the real markup rather than a copy, so an id renamed there fails here instead of quietly testing something that no longer ships, then imports `archive.js` against the same stub `chrome` API `syntaxcheck.html` uses. Open `http://127.0.0.1:8777/src/dev/syncmode.html`.
+
+`src/dev/viewer.html` builds a `viewer.html` from sample state and checks the inlining, which is the part that goes wrong once and silently in someone's folder. A caption is arbitrary text from TikTok, and the fixture's caption carries the three sequences that break a naive generator: `</script>`, which ends the element it sits in; `$&`, which `String.replace` reads out of a *replacement*; and U+2028, a line terminator to a JavaScript parser but not to JSON. The result is rendered into a `blob:` iframe, whose origin is opaque like a `file://` document's. Open `http://127.0.0.1:8777/src/dev/viewer.html`.
+
+`src/dev/selftest.html` answers what a stubbed API can't, by running inside the loaded extension: whether a credentialed fetch from `moz-extension://` carries TikTok's cookies, whether a root-level `archive.json` lands where it was asked to, whether `conflictAction: 'overwrite'` really overwrites instead of uniquifying to `probe(1).txt`, whether `downloads.search` returns paths in the shape `refresh()` parses, and whether the `world: "MAIN"` hook actually installed. Build with `python tools/build.py firefox --dev`, then open the archive page and replace `src/archive/archive.html` in the URL with `src/dev/selftest.html`. It writes only into `<Downloads>/ttarchive-selftest/`, saves and restores the stored folder setting around the run, and has a button to delete everything it wrote.
+
+`tools/test_helper.py` runs `tools/helper.py` the way a browser does — a child process started with an extension origin, spoken to over a length-prefixed pipe — and then over HTTP: writes landing whole and never half-listed, ranges, the token being required everywhere and accepted only as a header for writes, paths that try to leave the folder, other hosts and other origins being refused, the port falling back when it's taken, and the process going away when the pipe closes. It also covers what the helper makes of the browser's record of a picked folder, with `Preferences` files written into a fake home so the real profiles are never read; the file-manager and folder-dialog calls with the system replaced; and, outside Windows, `install` and `uninstall` on a copy of the helper. `python3 tools/test_helper.py`, on any of the three systems; nothing it does opens a window. `syntaxcheck.html?helper` evaluates the archive page as it is with the helper installed, `?helper=broken` with it installed and failing to start.
+
+`tools/e2e/helper_flow.py` runs the extension against the helper as it is really installed: it loads the extension fresh into a throwaway profile — which is what a new checkout looks like to the browser — in a headless Chromium-family browser it finds in the usual places (`TTARCHIVE_TEST_BROWSER` names one; branded Chrome ignores `--load-extension`, so Chromium is tried first). It checks the helper is registered for the fixed id, then clicks through: the helper taking over the archive the browser's picker chose (read only), the folder dialog, the scan, playback, **Show in folder** from the Library, with and without a folder of the helper's own, and from the tab at the helper's address. `TTARCHIVE_TEST_NO_WINDOWS` tells the helper to answer without opening the dialog or a file manager, and `TTARCHIVE_TEST_PICK` is the folder the dialog answers with; writes go to a scratch archive copied from a few real posts. On Windows the browser is started through WMI, outside any packaged app whose private copy of the registry the calling terminal might see. `python3 tools/e2e/helper_flow.py`, with the helper installed.
+
+`src/dev/verify.html` downloads a list of media URLs from the extension's own origin and POSTs the bytes to a local receiver, so the results can be inspected with ffmpeg. It reads its target list from `http://127.0.0.1:8899/targets.json` and needs a CORS-enabled receiver on that port (plain `python -m http.server` will not do — no `Access-Control-Allow-Origin`). To run it, load the extension with a real TikTok tab open in the same profile, then navigate to the page. Also dev-only.

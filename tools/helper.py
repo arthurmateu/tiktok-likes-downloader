@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 The archive's local helper: everything the extension needs from outside the
-browser, as one native-messaging host. Windows only.
+browser, as one native-messaging host for Chrome, Chromium, Edge and Brave, on
+Windows, macOS and Linux.
 
-    python tools/helper.py install      # once, from Windows Terminal
-    python tools/helper.py uninstall
+    python3 tools/helper.py install      # once
+    python3 tools/helper.py uninstall
 
 It is optional. Without it the extension writes through File System Access and
 everything but Show in folder works. Once it is installed the extension uses it
@@ -16,31 +17,29 @@ on its own — there is nothing to switch on:
     folder permission to grant again every browser session.
   - it serves the folder, so the Library opens in a tab at
     http://127.0.0.1:8737/ and streams media by range.
-  - it opens Explorer on an archived file — Show in folder.
+  - it shows an archived file in the system's file manager — Show in folder.
 
-Chromium starts it, and what it does depends on the first message:
+The browser starts it, and what it does depends on the first message:
 
   start {token, root, port}   the extension's background holds this pipe open,
                               and this serves HTTP until the browser closes it
   pick  {initial}             opens a folder dialog and answers with the choice
-  show  {path, root}          selects a file in Explorer
+  show  {path, root}          shows a file in the file manager
 
 pick and show are processes of their own, started by a click, rather than
-requests to the running server: Windows lets a process take the foreground only
-when the foreground process has just started it, so a dialog or an Explorer
-window opened by a server that has been running for an hour opens behind the
-browser.
+requests to the running server: a process the browser has just started from
+a click may bring a window to the front, which on Windows a server that has
+been running for an hour may not — its dialog would open behind the browser.
 
 Where the archive is, when the extension hasn't said: the folder the browser's
 own picker last chose for it. Chromium records that, path and all, in the
 profile's Preferences, so an archive written through File System Access is
 taken over without anyone pointing at it again.
 
-`install` registers this file where it is — nothing is copied, so a `git pull`
-is all an update takes — for Chrome, Chromium, Edge and Brave, under HKCU. The
-extension's id comes from the `key` in manifest.json and is the same on every
-machine and at every path, so it doesn't matter whether the extension has been
-loaded yet.
+`install` registers this file where it is — nothing is copied, so updating the
+checkout updates the helper. The extension's id comes from the `key` in
+manifest.json and is the same everywhere, so it doesn't matter whether the
+extension has been loaded yet.
 """
 
 import base64
@@ -64,24 +63,37 @@ from pathlib import Path, PurePosixPath
 HOST = "com.ttarchive.helper"
 VERSION = 2
 
+WINDOWS = sys.platform == "win32"
+MACOS = sys.platform == "darwin"
+
 REPO = Path(__file__).resolve().parent.parent
 
-# Where `install` writes the host manifest and the .bat Chromium runs. Generated,
-# and gitignored: both name this machine's Python and this checkout's path.
+# What `install` writes for the browser to start: a launcher naming this
+# machine's Python and this checkout's path, so generated, and gitignored.
 NATIVE = REPO / "tools" / "native-host"
 
-# What earlier versions installed, which `install` and `uninstall` clear away: a
-# separate Show in folder host, and copies of both helpers in %LOCALAPPDATA%.
+# The browsers it is registered for, and where each keeps its profiles:
+# (Windows registry key, Windows data dir under %LOCALAPPDATA%), and the data
+# dir under ~/Library/Application Support on macOS and $XDG_CONFIG_HOME
+# (~/.config) on Linux. A browser reads native-messaging hosts from its own
+# registry key on Windows and from NativeMessagingHosts/ in its data dir
+# elsewhere.
+BROWSERS = {
+    "Chrome": ((r"Software\Google\Chrome", r"Google\Chrome\User Data"), "Google/Chrome", "google-chrome"),
+    "Chromium": ((r"Software\Chromium", r"Chromium\User Data"), "Chromium", "chromium"),
+    "Edge": ((r"Software\Microsoft\Edge", r"Microsoft\Edge\User Data"), "Microsoft Edge", "microsoft-edge"),
+    "Brave": (
+        (r"Software\BraveSoftware\Brave-Browser", r"BraveSoftware\Brave-Browser\User Data"),
+        "BraveSoftware/Brave-Browser",
+        "BraveSoftware/Brave-Browser",
+    ),
+}
+
+# What earlier, Windows-only versions installed, which `install` and
+# `uninstall` clear away: a separate Show in folder host, and copies of both
+# helpers in %LOCALAPPDATA%.
 LEGACY_HOSTS = ("com.ttarchive.show_in_folder",)
 LEGACY_DIRS = ("ttarchive-show-in-folder", "ttarchive-helper")
-
-# Each browser reads only its own registry key, and keeps its own profiles.
-BROWSERS = {
-    r"Software\Google\Chrome\NativeMessagingHosts": r"Google\Chrome\User Data",
-    r"Software\Chromium\NativeMessagingHosts": r"Chromium\User Data",
-    r"Software\Microsoft\Edge\NativeMessagingHosts": r"Microsoft\Edge\User Data",
-    r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts": r"BraveSoftware\Brave-Browser\User Data",
-}
 
 # The id src/lib/backends/fsa.js gives its folder picker, which is what Chromium
 # files the picked folder under.
@@ -134,10 +146,6 @@ def log(line: str) -> None:
         pass
 
 
-def local_appdata() -> Path:
-    return Path(os.environ["LOCALAPPDATA"])
-
-
 def read_json(path: Path) -> dict:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -154,12 +162,22 @@ def extension_id() -> str:
     return "".join(chr(ord("a") + int(c, 16)) for c in digest)
 
 
+def data_dir(browser: str) -> Path:
+    """Where `browser` keeps its profiles on this system."""
+    windows, macos, linux = BROWSERS[browser]
+    if WINDOWS:
+        return Path(os.environ["LOCALAPPDATA"]) / windows[1]
+    if MACOS:
+        return Path.home() / "Library" / "Application Support" / macos
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / linux
+
+
 # ------------------------------------------------------------- the browser's record
 
 
 def profiles():
-    for data in BROWSERS.values():
-        base = local_appdata() / data
+    for browser in BROWSERS:
+        base = data_dir(browser)
         if base.is_dir():
             yield from (prefs.parent for prefs in base.glob("*/Preferences"))
 
@@ -230,7 +248,7 @@ def resolve(root: Path, rel) -> Path | None:
     """
     The file an archive-relative path names, or None if it names anything outside
     the archive. Only the extension can reach this helper, but a path out of a
-    message is still not something to write to, serve, or hand Explorer unchecked.
+    message is still not something to write to, serve, or show unchecked.
     """
     if not isinstance(rel, str) or not rel or "\\" in rel or ":" in rel:
         return None
@@ -241,13 +259,25 @@ def resolve(root: Path, rel) -> Path | None:
     return path if path.is_relative_to(root.resolve()) else None
 
 
-def select_in_explorer(path: Path) -> None:
+# ---------------------------------------------------------------- the desktop
+
+
+def reveal(path: Path) -> None:
+    """Show `path` in the system's file manager, selected where the system can."""
     # Set by automated end-to-end runs, which drive a browser nobody is looking at
     # and must not open windows on the desktop of whoever is using the machine.
     # The request is still answered, and logged.
     if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
         return
+    if WINDOWS:
+        reveal_windows(path)
+    elif MACOS:
+        subprocess.run(["open", "-R", str(path)], check=False)
+    else:
+        reveal_freedesktop(path)
 
+
+def reveal_windows(path: Path) -> None:
     import ctypes
     from ctypes import wintypes
 
@@ -272,6 +302,29 @@ def select_in_explorer(path: Path) -> None:
             shell32.ILFree(pidl)
     if not ok:
         subprocess.Popen(["explorer", f"/select,{path}"])
+
+
+def reveal_freedesktop(path: Path) -> None:
+    """
+    The freedesktop.org file-manager interface selects the file, in every file
+    manager that implements it (GNOME Files, Dolphin, Nemo, Caja, Thunar…) —
+    asked through whichever D-Bus client is installed. Failing all of them, the
+    folder opens with nothing selected.
+    """
+    uri = path.as_uri()
+    attempts = [
+        ["gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1", "--object-path",
+         "/org/freedesktop/FileManager1", "--method", "org.freedesktop.FileManager1.ShowItems", f"['{uri}']", ""],
+        ["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.FileManager1", "/org/freedesktop/FileManager1",
+         "org.freedesktop.FileManager1.ShowItems", f"array:string:{uri}", "string:"],
+    ]
+    for command in attempts:
+        try:
+            if subprocess.run(command, capture_output=True, timeout=5).returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    subprocess.Popen(["xdg-open", str(path.parent)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 # ------------------------------------------------------------------ the folder
@@ -686,7 +739,8 @@ class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
     # Python's HTTP servers set SO_REUSEADDR, which on Windows lets a second
     # process bind a port that is already taken and share its requests.
-    allow_reuse_address = False
+    # Elsewhere it only lets a restarted helper have its port straight back.
+    allow_reuse_address = not WINDOWS
     allow_reuse_port = False
 
 
@@ -743,42 +797,81 @@ def run(msg: dict, origin: str) -> None:
 
 # ------------------------------------------------------------- one-shot asks
 
+TITLE = "Choose the TikTok archive folder"
+
 
 def ask_folder(initial: str) -> str | None:
-    # The same switch as in select_in_explorer: an automated run names the folder
-    # to answer with, or "cancel", and no dialog opens.
+    """The system's own folder dialog where there is one to ask for; Tk's otherwise."""
+    # The same switch as in reveal(): an automated run names the folder to
+    # answer with, or "cancel", and no dialog opens.
     if os.environ.get("TTARCHIVE_TEST_NO_WINDOWS"):
         chosen = os.environ.get("TTARCHIVE_TEST_PICK", "cancel")
         return None if chosen == "cancel" else chosen
+    if MACOS:
+        return ask_folder_macos(initial)
+    if not WINDOWS:
+        for command in (
+            ["zenity", "--file-selection", "--directory", f"--title={TITLE}", f"--filename={initial}/"],
+            ["kdialog", "--getexistingdirectory", initial, "--title", TITLE],
+        ):
+            if shutil.which(command[0]):
+                out = subprocess.run(command, capture_output=True, text=True)
+                chosen = out.stdout.strip()
+                return chosen if out.returncode == 0 and chosen else None
+    return ask_folder_tk(initial)
 
-    import ctypes
-    import tkinter
-    from tkinter import filedialog
 
+def ask_folder_macos(initial: str) -> str | None:
+    quoted = initial.replace("\\", "\\\\").replace('"', '\\"')
+    out = subprocess.run(
+        ["osascript", "-e", "tell current application", "-e", "activate", "-e",
+         f'POSIX path of (choose folder with prompt "{TITLE}" default location (POSIX file "{quoted}"))',
+         "-e", "end tell"],
+        capture_output=True, text=True,
+    )
+    chosen = out.stdout.strip()
+    # Cancelling is an error as far as AppleScript is concerned, with nothing on stdout.
+    return chosen.rstrip("/") or "/" if out.returncode == 0 and chosen else None
+
+
+def ask_folder_tk(initial: str) -> str | None:
     try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # or the dialog is drawn blurred
-    except (AttributeError, OSError):
-        pass
-    # The browser started this from a click, so it may take the foreground, and
-    # pass that on to the dialog it opens.
-    ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
+        import tkinter
+        from tkinter import filedialog
+    except ImportError:
+        raise RuntimeError(
+            "no folder dialog to open: install zenity, kdialog or Python's tkinter (python3-tk)"
+        ) from None
+    if WINDOWS:
+        import ctypes
+
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # or the dialog is drawn blurred
+        except (AttributeError, OSError):
+            pass
+        # The browser started this from a click, so it may take the foreground, and
+        # pass that on to the dialog it opens.
+        ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
     tk = tkinter.Tk()
     tk.withdraw()
     tk.attributes("-topmost", True)
     try:
-        chosen = filedialog.askdirectory(
-            parent=tk, initialdir=initial, mustexist=True, title="Choose the TikTok archive folder"
-        )
+        chosen = filedialog.askdirectory(parent=tk, initialdir=initial, mustexist=True, title=TITLE)
     finally:
         tk.destroy()
     return str(Path(chosen)) if chosen else None
+
+
+def default_folder() -> Path:
+    videos = Path.home() / ("Movies" if MACOS else "Videos")
+    return videos if videos.is_dir() else Path.home()
 
 
 def pick(msg: dict, origin: str) -> dict:
     initial = msg.get("initial")
     if not (isinstance(initial, str) and Path(initial).is_dir()):
         found = remembered_folders(origin)
-        initial = str(found[0]) if found else str(Path.home() / "Videos")
+        initial = str(found[0] if found else default_folder())
     chosen = ask_folder(initial)
     return {"ok": True, "root": chosen} if chosen else {"ok": False, "error": "cancelled"}
 
@@ -799,14 +892,14 @@ def show(msg: dict, origin: str) -> dict:
         if path is None:
             return {"ok": False, "error": "bad path"}
         if path.is_file():
-            select_in_explorer(path)
+            reveal(path)
             return {"ok": True, "path": str(path)}
         tried = tried or path
     return {"ok": False, "error": "not-found", "path": str(tried)}
 
 
 def serve(origin: str) -> None:
-    if sys.platform == "win32":
+    if WINDOWS:
         import msvcrt
 
         # The length prefix is binary, and a text-mode stdout turns a 0x0A in it into two bytes.
@@ -837,20 +930,23 @@ def serve(origin: str) -> None:
 
 def redirected_into() -> str | None:
     """
-    The app package this process is running inside the private copy of, if any.
+    On Windows, the app package this process runs inside the private copy of,
+    if any.
 
-    A terminal opened inside a packaged desktop app (the Claude desktop app is
-    one) runs with that app's view of the user's files and registry: what it
-    writes to %LOCALAPPDATA% and HKCU\\Software lands in the package's own copy,
-    which nothing started from outside the package can see. An install run there
-    reports success, and every browser started from the Start menu or the
-    taskbar answers "Specified native messaging host not found." — which is how
-    Show in folder spent a day and a half failing with everything looking right.
+    A terminal opened inside a packaged desktop app runs with that app's view of
+    the user's files and registry: what it writes to %LOCALAPPDATA% and
+    HKCU\\Software lands in the package's own copy, which nothing started from
+    outside the package can see. An install run there would report success,
+    and a browser started from the Start menu would answer "Specified native
+    messaging host not found."
 
     A file written to %LOCALAPPDATA% gives it away on resolving: a redirected one
     resolves to %LOCALAPPDATA%\\Packages\\<package>\\LocalCache\\....
     """
-    probe = local_appdata() / f"ttarchive-probe-{os.getpid()}"
+    if not WINDOWS:
+        return None
+    local = Path(os.environ["LOCALAPPDATA"])
+    probe = local / f"ttarchive-probe-{os.getpid()}"
     try:
         probe.write_bytes(b"")
         real = probe.resolve()
@@ -859,23 +955,10 @@ def redirected_into() -> str | None:
     finally:
         probe.unlink(missing_ok=True)
     try:
-        rel = real.relative_to(local_appdata() / "Packages")
+        rel = real.relative_to(local / "Packages")
     except ValueError:
         return None
     return rel.parts[0] if len(rel.parts) > 2 and rel.parts[1].lower() == "localcache" else None
-
-
-def clear_legacy() -> None:
-    import winreg
-
-    for host in LEGACY_HOSTS:
-        for key in BROWSERS:
-            try:
-                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{key}\\{host}")
-            except FileNotFoundError:
-                pass
-    for name in LEGACY_DIRS:
-        shutil.rmtree(local_appdata() / name, ignore_errors=True)
 
 
 def refuse_if_redirected(command: str) -> None:
@@ -893,73 +976,122 @@ def refuse_if_redirected(command: str) -> None:
         f"Nothing done: this terminal runs inside the app package {package}, and Windows\n"
         f"keeps what it changes in your registry private to that app - your browser\n"
         f"would never see it.\n\n"
-        f"Run it from Windows Terminal, or any terminal opened from the Start menu:\n\n"
+        f"Run it from a terminal opened from the Start menu instead:\n\n"
         f"    python tools\\helper.py {command}\n"
     )
 
 
-def install() -> None:
-    import winreg
-
-    refuse_if_redirected("install")
-    ext_id = extension_id()
+def write_launcher() -> Path:
+    """What the browser runs: this Python, on this file, wherever they both are."""
     NATIVE.mkdir(parents=True, exist_ok=True)
-    bat = NATIVE / "helper.bat"
-    # Chromium on Windows can only launch an executable or a batch file, and this
-    # Python is the one known to work.
-    bat.write_text(f'@echo off\n"{sys.executable}" "{Path(__file__).resolve()}" %*\n', encoding="utf-8", newline="\r\n")
-    manifest_path = NATIVE / f"{HOST}.json"
-    manifest = {
+    here = Path(__file__).resolve()
+    if WINDOWS:
+        # Chromium on Windows can only launch an executable or a batch file.
+        launcher = NATIVE / "helper.bat"
+        launcher.write_text(f'@echo off\n"{sys.executable}" "{here}" %*\n', encoding="utf-8", newline="\r\n")
+    else:
+        launcher = NATIVE / "helper"
+        launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{here}" "$@"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    return launcher
+
+
+def host_manifest(launcher: Path) -> dict:
+    return {
         "name": HOST,
         "description": "The archive's local helper for TikTok Likes Archiver",
-        "path": str(bat),
+        "path": str(launcher),
         "type": "stdio",
-        "allowed_origins": [f"chrome-extension://{ext_id}/"],
+        "allowed_origins": [f"chrome-extension://{extension_id()}/"],
     }
-    manifest_path.write_text(json.dumps(manifest, indent="\t") + "\n", encoding="utf-8")
 
-    for key in BROWSERS:
-        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}") as reg:
-            winreg.SetValueEx(reg, "", 0, winreg.REG_SZ, str(manifest_path))
-    clear_legacy()
+
+def manifest_paths() -> dict[str, Path]:
+    """Where each browser reads the host's manifest from, outside Windows."""
+    return {browser: data_dir(browser) / "NativeMessagingHosts" / f"{HOST}.json" for browser in BROWSERS}
+
+
+def install() -> None:
+    refuse_if_redirected("install")
+    manifest = host_manifest(write_launcher())
+    text = json.dumps(manifest, indent="\t") + "\n"
+
+    if WINDOWS:
+        import winreg
+
+        path = NATIVE / f"{HOST}.json"
+        path.write_text(text, encoding="utf-8")
+        for windows, _, _ in BROWSERS.values():
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, f"{windows[0]}\\NativeMessagingHosts\\{HOST}") as reg:
+                winreg.SetValueEx(reg, "", 0, winreg.REG_SZ, str(path))
+        registered = list(BROWSERS)
+        clear_legacy()
+    else:
+        # Only for browsers that are here: writing into the data dir of one that
+        # isn't would leave a folder behind for nothing.
+        registered = []
+        for browser, path in manifest_paths().items():
+            if data_dir(browser).is_dir():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(text, encoding="utf-8")
+                registered.append(browser)
+        if not registered:
+            raise SystemExit(
+                "Found no Chrome, Chromium, Edge or Brave profile to register with.\n"
+                "Start the browser once, then run this again."
+            )
 
     print(f"Installed: {Path(__file__).resolve()}")
-    print(f"  for extension {ext_id}, in Chrome, Chromium, Edge and Brave")
+    print(f"  for extension {manifest['allowed_origins'][0].split('/')[2]}, in {', '.join(registered)}")
     print(f"  with {sys.executable}")
     print("The extension picks it up on its own; no browser restart needed.")
 
 
 def uninstall() -> None:
-    import winreg
-
     refuse_if_redirected("uninstall")
-    for key in BROWSERS:
-        try:
-            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{key}\\{HOST}")
-        except FileNotFoundError:
-            pass
-    clear_legacy()
+    if WINDOWS:
+        import winreg
+
+        for windows, _, _ in BROWSERS.values():
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{windows[0]}\\NativeMessagingHosts\\{HOST}")
+            except FileNotFoundError:
+                pass
+        clear_legacy()
+    else:
+        for path in manifest_paths().values():
+            path.unlink(missing_ok=True)
     shutil.rmtree(NATIVE, ignore_errors=True)
     print("Uninstalled. The extension goes back to writing through the browser.")
+
+
+def clear_legacy() -> None:
+    import winreg
+
+    for host in LEGACY_HOSTS:
+        for windows, _, _ in BROWSERS.values():
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, f"{windows[0]}\\NativeMessagingHosts\\{host}")
+            except FileNotFoundError:
+                pass
+    for name in LEGACY_DIRS:
+        shutil.rmtree(Path(os.environ["LOCALAPPDATA"]) / name, ignore_errors=True)
 
 
 def main(argv: list[str]) -> None:
     if not argv:
         print(__doc__.strip())
         return
-    # Chromium starts a host with the caller's origin as the first argument.
+    # The browser starts a host with the caller's origin as the first argument.
     if argv[0].startswith("chrome-extension://"):
         serve(argv[0])
         return
-
-    if sys.platform != "win32":
-        raise SystemExit("The helper is Windows only for now.")
     if argv == ["install"]:
         install()
     elif argv == ["uninstall"]:
         uninstall()
     else:
-        raise SystemExit("usage: python tools/helper.py install | uninstall")
+        raise SystemExit("usage: python3 tools/helper.py install | uninstall")
 
 
 if __name__ == "__main__":

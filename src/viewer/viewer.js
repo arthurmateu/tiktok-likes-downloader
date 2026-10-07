@@ -1277,7 +1277,7 @@
 		link.title = 'Open this post on TikTok';
 		link.appendChild(icon('link'));
 		idRow.appendChild(link);
-		// Only with the extension attached: a page on its own can't open Explorer.
+		// Only with the extension attached: a page on its own can't open a file manager.
 		if (bridged && folderPath(item)) idRow.appendChild(folderButton(item));
 		out.push(idRow);
 
@@ -1325,7 +1325,7 @@
 		const error = (res && res.error) || 'the extension did not answer';
 		if (error === 'no-helper') {
 			note.append(
-				el('p', null, 'Opening Explorer takes a small helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
+				el('p', null, 'Showing a file in its folder takes the local helper, set up once. Open a terminal in the extension’s own folder — the one with manifest.json in it — and run:'),
 				copyRow(res.setup, 'cmd'),
 				el('p', null, 'then press the button again.')
 			);
