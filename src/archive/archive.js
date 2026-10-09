@@ -26,8 +26,9 @@ import {
 	STATUS,
 } from '../lib/state.js';
 import { DownloadQueue } from '../lib/downloader.js';
+import { linksIn, RateLimited, saveReply } from '../lib/replies.js';
 import { renderLibrary, refreshPresence, wireLibrary } from './viewer.js';
-import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
+import { writeViewer, slimItems, slimReplies, VIEWER_FILE } from './standalone.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -51,6 +52,8 @@ const app = {
 	songs: { running: false, stop: false, uniqueId: '' },
 	/** Counts syncs, so anything still waiting on an earlier one can tell it is over. */
 	run: 0,
+	/** Comment links being saved — see saveReplies. Separate from a sync, and fine alongside one. */
+	savingReplies: false,
 };
 
 // ---------------------------------------------------------------- background
@@ -186,6 +189,7 @@ function setBusy(busy) {
 	$('syncBody').classList.toggle('busy', busy);
 	$('rescan').disabled = busy;
 	$('writeViewer').disabled = busy;
+	$('saveReplies').disabled = busy || app.savingReplies;
 	if (busy) {
 		$('startSync').disabled = true;
 		$('syncMode').disabled = true;
@@ -295,7 +299,8 @@ function summarise(verb, counts) {
 		`${verb} ${posts.toLocaleString()} liked posts on disk — ` +
 		`${counts.videos.toLocaleString()} videos, ` +
 		`${counts.photoSets.toLocaleString()} photo posts made of ${counts.images.toLocaleString()} images` +
-		`${counts.songs ? `, ${counts.songs.toLocaleString()} songs` : ''}.`
+		`${counts.songs ? `, ${counts.songs.toLocaleString()} songs` : ''}` +
+		`${counts.replies ? `, and ${counts.replies.toLocaleString()} saved replies` : ''}.`
 	);
 }
 
@@ -480,7 +485,7 @@ function onViewerRequest({ rid, cmd }) {
 			respond({ ok: false, error: 'no folder open' });
 			return;
 		}
-		respond({ ok: true, items: slimItems(app.state) });
+		respond({ ok: true, items: slimItems(app.state), replies: slimReplies(app.state) });
 		return;
 	}
 
@@ -1150,6 +1155,84 @@ $('fetchSongs').addEventListener('click', () => {
 	});
 });
 
+// ------------------------------------------------------------- saved replies
+//
+// The sticker or photo out of a comment, by the comment's share link — see
+// src/lib/replies.js. One link at a time and a pause between them, like the
+// song pass: there is no hurry, and no list to keep up with.
+
+/** Between links. One lookup and a file or two each. */
+const REPLY_PAUSE_MS = 1200;
+
+async function saveReplies() {
+	if (!app.state) {
+		log('Pick a folder first.', 'err');
+		return;
+	}
+	const links = linksIn($('replyLinks').value);
+	if (!links.length) {
+		log('Paste a comment link first: on TikTok, long-press the comment, then Share and Copy link.', 'err');
+		return;
+	}
+
+	app.savingReplies = true;
+	$('saveReplies').disabled = true;
+	log(links.length === 1 ? 'Saving 1 reply…' : `Saving ${links.length} replies…`);
+	let saved = 0;
+	let had = 0;
+	/** Whatever didn't make it goes back in the box, so trying again is one click. */
+	const left = [];
+
+	for (let n = 0; n < links.length; n++) {
+		const link = links[n];
+		if (n) await pause(REPLY_PAUSE_MS);
+		try {
+			const res = await saveReply(app.state, link);
+			if (res.status === 'have') {
+				had++;
+				log(`= ${res.id} is already in replies/.`);
+				continue;
+			}
+			saved++;
+			const { reply, files, notes, bytes } = res;
+			const who = reply.author.uniqueId ? `@${reply.author.uniqueId}` : 'someone';
+			const said = reply.text ? `: ${reply.text}` : '';
+			const names = files.map((f) => f.split('/').pop()).join(', ');
+			log(`+ ${names} — ${[...notes, fmtBytes(bytes)].join(', ')} — ${who}${said}`, 'ok');
+			saveState(app.state);
+		} catch (err) {
+			left.push(link);
+			log(`✗ ${link}: ${(err && err.message) || err}`, 'err');
+			if (err instanceof RateLimited) {
+				left.push(...links.slice(n + 1));
+				break;
+			}
+		}
+	}
+
+	$('replyLinks').value = left.join('\n');
+	const parts = [`${saved} saved`];
+	if (had) parts.push(`${had} already there`);
+	if (left.length) parts.push(`${left.length} left in the box to try again`);
+	log(`Replies: ${parts.join(', ')}.`, left.length ? 'err' : 'ok');
+
+	if (saved) {
+		await saveState(app.state, { immediate: true });
+		renderLibrary(app.state);
+		await writeViewerFile({ quiet: true });
+	}
+	app.savingReplies = false;
+	$('saveReplies').disabled = $('syncBody').classList.contains('busy');
+}
+
+$('saveReplies').addEventListener('click', () => {
+	saveReplies().catch((err) => {
+		log(`Could not save replies: ${(err && err.message) || err}`, 'err');
+		app.savingReplies = false;
+		$('saveReplies').disabled = false;
+	});
+});
+
 // ---------------------------------------------------------------- sync mode
 //
 // One button with a dropdown rather than two: which sync you want is a choice
@@ -1326,7 +1409,7 @@ async function checkHostAccess() {
 window.addEventListener('beforeunload', (e) => {
 	// The song pass spends most of its time between downloads, waiting on a page
 	// load, so an idle queue says nothing about whether it is still running.
-	if (app.syncing || app.songs.running || (app.queue && app.queue.pending > 0)) {
+	if (app.syncing || app.songs.running || app.savingReplies || (app.queue && app.queue.pending > 0)) {
 		e.preventDefault();
 		e.returnValue = '';
 	}

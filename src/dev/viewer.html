@@ -121,6 +121,31 @@
 						likeRank: 2,
 					},
 				},
+				// Saved replies: one left on a post in the archive, one on a post that
+				// isn't. A comment is as arbitrary as a caption, so it gets the same text.
+				replies: {
+					901: {
+						id: '901',
+						post: '444',
+						author: { id: '5', uniqueId: 'fan', nickname: 'Fan' },
+						text: NASTY,
+						createTime: 1700000400,
+						diggCount: 3,
+						kind: 'sticker',
+						files: ['replies/901.gif'],
+						savedAt: 1700000500000,
+					},
+					902: {
+						id: '902',
+						post: '999',
+						author: { id: '6', uniqueId: 'elsewhere', nickname: 'Elsewhere' },
+						text: 'a photo reply',
+						createTime: 1700000300,
+						kind: 'photo',
+						files: ['replies/902.jpg'],
+						savedAt: 1700000400000,
+					},
+				},
 			};
 
 			const out = document.getElementById('out');
@@ -323,6 +348,41 @@
 				// near-misses beside it, which is half of why anyone clicks one.
 				const tagged = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
 				check('and the grid holds everything tagged like it', String(tagged) === '222,333', String(tagged));
+
+				// Saved replies: in the blob, in the grid under their own kind, and
+				// linked both ways with the posts they were left on.
+				const reply = payload.replies && payload.replies.find((r) => r.id === '901');
+				check('the replies came along', !!payload.replies && payload.replies.length === 2);
+				check('a reply’s text survived intact', !!reply && reply.text === NASTY, reply && JSON.stringify(reply.text));
+				check('with its post and its files', !!reply && reply.post === '444' && reply.files[0] === 'replies/901.gif');
+				check('the page says how many there are', page.getElementById('sub').textContent.includes('2 saved replies'),
+					page.getElementById('sub').textContent);
+				page.getElementById('search').value = '';
+				page.getElementById('kind').value = 'replies';
+				page.getElementById('kind').dispatchEvent(new Event('change'));
+				const replyTiles = [...page.querySelectorAll('.tile')];
+				check('"Saved replies" lists the replies, most recently saved first',
+					replyTiles.map((el) => el.dataset.id).join() === '901,902', replyTiles.map((el) => el.dataset.id).join());
+				check('each tile is its sticker or photo, by relative path',
+					(replyTiles[0].querySelector('img') || {}).getAttribute?.('src') === 'replies/901.gif');
+				replyTiles[0].click();
+				check('a reply opens on the stage', (page.querySelector('#lbStage img') || {}).getAttribute?.('src') === 'replies/901.gif');
+				const from = page.querySelector('#lbMeta .lb-from button.post');
+				check('and offers the post it was left on', !!from && from.textContent.includes('pictures kept'));
+				from.click();
+				check('which opens that post', page.getElementById('kind').value === 'all' &&
+					!page.getElementById('lightbox').classList.contains('hidden') &&
+					page.querySelector('#lbMeta .lb-desc')?.textContent === 'pictures kept, song not');
+				const thumb = page.querySelector('#lbMeta .lb-replies .thumb img');
+				check('and the post shows the reply saved off it', !!thumb && thumb.getAttribute('src') === 'replies/901.gif');
+				check('under its song', slot('lb-replies') === slot('lb-song') + 1, String([slot('lb-song'), slot('lb-replies')]));
+				thumb.closest('button').click();
+				check('which opens the reply again', page.getElementById('kind').value === 'replies' &&
+					page.getElementById('lbCount').textContent.startsWith('1 /'));
+				page.getElementById('lbNext').click();
+				const away = page.querySelector('#lbMeta .lb-from a.post');
+				check('a reply on a post not in the archive links to it on TikTok', !!away && /\/video\/999$/.test(away.href), away && away.href);
+				page.querySelector('#lbClose').click();
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}

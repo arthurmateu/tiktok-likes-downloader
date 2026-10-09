@@ -106,8 +106,22 @@ function icon(name) {
 }
 
 function present(item) {
+	if (item.type === 'reply') return disk.replies.has(item.id);
 	if (item.type === 'photo') return disk.photos.has(item.id);
 	return disk.videos.has(item.id);
+}
+
+/**
+ * Whether an entry is pictures rather than a clip: a photo post, or a saved
+ * reply — a sticker or a photo out of a comment. Both page through their images
+ * the same way, from different folders.
+ */
+function stills(item) {
+	return item?.type === 'photo' || item?.type === 'reply';
+}
+
+function stillsDir(item) {
+	return item.type === 'reply' ? LAYOUT.replies : LAYOUT.images;
 }
 
 // ------------------------------------------------------------------ filtering
@@ -132,6 +146,31 @@ function byLikeOrder(dir) {
 	};
 }
 
+/**
+ * The saved replies, as entries the grid and the feed can hold beside posts.
+ * Copies, marked `type: 'reply'` — the records in archive.json don't need to
+ * say what they are, being under `replies` already.
+ */
+function replyEntries(state) {
+	return Object.values(state?.replies || {}).map((r) => ({ ...r, type: 'reply' }));
+}
+
+/**
+ * The same sorts, for replies. There is no like order to a reply — TikTok keeps
+ * no list of the comments you've liked — so "liked" means when it was saved,
+ * which is usually the same afternoon. Nothing counts plays of a comment.
+ *
+ * Kept in step with the same table in src/viewer/viewer.js by hand.
+ */
+const REPLY_SORTS = {
+	'liked-recent': (a, b) => (b.savedAt || 0) - (a.savedAt || 0),
+	'liked-first': (a, b) => (a.savedAt || 0) - (b.savedAt || 0),
+	'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
+	'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
+	'likes-desc': (a, b) => (b.diggCount || 0) - (a.diggCount || 0),
+	'plays-desc': (a, b) => (b.savedAt || 0) - (a.savedAt || 0),
+};
+
 function applyFilters(state) {
 	// A sync finishing re-runs this while someone is watching. Hold the position
 	// by id rather than by number: the list it indexes into is about to change.
@@ -140,31 +179,34 @@ function applyFilters(state) {
 	const q = $('search').value.trim().toLowerCase();
 	const kind = $('kind').value;
 	const sort = $('sort').value;
+	const replies = kind === 'replies';
 
-	let list = Object.values(state?.items || {});
+	let list = replies ? replyEntries(state) : Object.values(state?.items || {});
 
-	if (kind !== 'all') list = list.filter((i) => (i.type || 'video') === kind);
+	if (!replies && kind !== 'all') list = list.filter((i) => (i.type || 'video') === kind);
 	if (q) {
 		list = list.filter((i) => {
-			const hay = `${i.desc || ''} ${i.author?.uniqueId || ''} ${i.author?.nickname || ''}`;
+			const hay = `${i.desc || i.text || ''} ${i.author?.uniqueId || ''} ${i.author?.nickname || ''}`;
 			return hay.toLowerCase().includes(q);
 		});
 	}
 
-	const cmp = {
-		'liked-recent': byLikeOrder(1),
-		'liked-first': byLikeOrder(-1),
-		'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
-		'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
-		'likes-desc': (a, b) => (b.stats?.diggCount || 0) - (a.stats?.diggCount || 0),
-		'plays-desc': (a, b) => (b.stats?.playCount || 0) - (a.stats?.playCount || 0),
-	}[sort];
+	const cmp = replies
+		? REPLY_SORTS[sort]
+		: {
+				'liked-recent': byLikeOrder(1),
+				'liked-first': byLikeOrder(-1),
+				'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
+				'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
+				'likes-desc': (a, b) => (b.stats?.diggCount || 0) - (a.stats?.diggCount || 0),
+				'plays-desc': (a, b) => (b.stats?.playCount || 0) - (a.stats?.playCount || 0),
+			}[sort];
 	list.sort(cmp);
 
 	filtered = list;
 	shown = 0;
 	$('grid').replaceChildren();
-	$('libCount').textContent = `${list.length.toLocaleString()} items`;
+	$('libCount').textContent = `${list.length.toLocaleString()} ${replies ? 'replies' : 'items'}`;
 	appendPage();
 
 	if (openId) {
@@ -195,7 +237,8 @@ function tile(item, index) {
 	// Dimmed for a post whose media isn't there — but only once the listing can be
 	// believed about that. Drawn before or during a scan, the whole grid would come
 	// up dim and then un-dim in waves, which reads as a fault rather than progress.
-	el.className = 'tile' + (present(item) || !listingComplete() ? '' : ' missing');
+	el.className =
+		'tile' + (item.type === 'reply' ? ' reply' : '') + (present(item) || !listingComplete() ? '' : ' missing');
 	el.dataset.id = item.id;
 	el.dataset.index = index;
 
@@ -216,7 +259,7 @@ function tile(item, index) {
 	who.className = 'who';
 	who.textContent = item.author?.uniqueId ? `@${item.author.uniqueId}` : '';
 	cap.appendChild(who);
-	cap.appendChild(document.createTextNode(item.desc || ''));
+	cap.appendChild(document.createTextNode(item.desc || item.text || ''));
 	el.appendChild(cap);
 
 	el.addEventListener('click', () => openLightbox(index));
@@ -246,7 +289,8 @@ function loadTile(el) {
 	}
 	img.dataset.loaded = '1';
 	delete img.dataset.again;
-	loadThumb(el.dataset.id).then((url) => {
+	const item = filtered[el.dataset.index];
+	(item?.type === 'reply' ? replyThumb(item) : loadThumb(el.dataset.id)).then((url) => {
 		if (url) {
 			img.src = url;
 			delete img.dataset.again;
@@ -497,6 +541,23 @@ function recordedVideo(id) {
 	return item.files?.video ? fileName(item.files.video) : `${id}.mp4`;
 }
 
+/**
+ * A saved reply's names, by the listing where there is one and by its record
+ * until then — the same shortcut a post's tiles take.
+ */
+function replyNames(item) {
+	const listed = disk.replies.get(item.id);
+	if (listed) return listed;
+	if (listingComplete()) return [];
+	return (item.files || []).map(fileName);
+}
+
+/** A reply is its own thumbnail: the sticker, moving, or the photo. */
+async function replyThumb(item) {
+	const names = replyNames(item);
+	return names.length ? fileURL(LAYOUT.replies, names[0]) : null;
+}
+
 /** Exported so src/dev/thumbs.html can drive it without an IntersectionObserver. */
 export async function loadThumb(id) {
 	const photos = disk.photos.get(id) || recordedPhotos(id);
@@ -643,6 +704,7 @@ function stepVolume(delta) {
  * a scan sat looking like a lost file for as long as that took.
  */
 function photoNames(item) {
+	if (item.type === 'reply') return replyNames(item);
 	return disk.photos.get(item.id) || recordedPhotos(item.id) || [];
 }
 
@@ -785,6 +847,7 @@ function closeLightbox() {
 	lbSeq++;
 	clearStage();
 	clearSong();
+	clearPanelURLs();
 	$('lbMeta').replaceChildren();
 	$('lightbox').classList.add('hidden');
 	const at = lbIndex;
@@ -859,7 +922,7 @@ function stepPhoto(delta) {
 
 function toggleSheet() {
 	const item = filtered[lbIndex];
-	if (!item || item.type !== 'photo' || photoNames(item).length < 2) return;
+	if (!item || !stills(item) || photoNames(item).length < 2) return;
 	lbSheet = !lbSheet;
 	renderStage(item);
 	renderCount();
@@ -868,12 +931,12 @@ function toggleSheet() {
 function renderCount() {
 	if (!lbOpen()) return;
 	const item = filtered[lbIndex];
-	const n = item?.type === 'photo' ? photoNames(item).length : 0;
+	const n = stills(item) ? photoNames(item).length : 0;
 	const where = `${(lbIndex + 1).toLocaleString()} / ${filtered.length.toLocaleString()}`;
 	const shot = lbSheet ? `all ${n} images` : `image ${lbPhoto + 1} of ${n}`;
 	// The rate is a setting with no control of its own on screen, so the counter is
 	// where it says so — and only where there is something for it to act on.
-	const speed = lbRate !== 1 && item?.type !== 'photo' ? ` · ${lbRate}×` : '';
+	const speed = lbRate !== 1 && !stills(item) ? ` · ${lbRate}×` : '';
 	$('lbCount').textContent = (n > 1 ? `${where} · ${shot}` : where) + speed;
 	$('lbPrev').disabled = nextIndex(-1) < 0;
 	$('lbNext').disabled = nextIndex(1) < 0;
@@ -1132,8 +1195,9 @@ async function renderStage(item) {
 		return true;
 	};
 
-	if (item.type === 'photo') {
+	if (stills(item)) {
 		const names = photoNames(item);
+		const dir = stillsDir(item);
 		if (!names.length) {
 			stage.textContent = unreadableNote();
 			return;
@@ -1151,7 +1215,7 @@ async function renderStage(item) {
 			sheet.appendChild(head);
 			stage.appendChild(sheet);
 			for (let i = 0; i < names.length; i++) {
-				const url = await fileURL(LAYOUT.images, names[i]);
+				const url = await fileURL(dir, names[i]);
 				if (stale(url)) return;
 				if (!url) continue;
 				openURLs.push(url);
@@ -1175,7 +1239,7 @@ async function renderStage(item) {
 		}
 
 		lbPhoto = Math.min(lbPhoto, names.length - 1);
-		const url = await fileURL(LAYOUT.images, names[lbPhoto]);
+		const url = await fileURL(dir, names[lbPhoto]);
 		if (stale(url)) return;
 		if (!url) {
 			stage.textContent = unreadableNote();
@@ -1238,10 +1302,12 @@ function renderLightbox() {
 	// The song lives with the metadata rather than on the stage, so tearing the
 	// stage down did not take the previous item's with it.
 	clearSong();
+	clearPanelURLs();
 
-	$('lbMeta').replaceChildren(...metaPanel(item));
-	// Last, since it fills a slot in the panel the line above has just built.
+	$('lbMeta').replaceChildren(...(item.type === 'reply' ? replyPanel(item) : metaPanel(item)));
+	// Last, since they fill slots in the panel the line above has just built.
 	mountSong(item, seq);
+	mountSavedReplies(item);
 }
 
 /** A count under its icon's meaning: `♡ 1.2K`, with the exact number behind it. */
@@ -1308,16 +1374,8 @@ function metaPanel(item) {
 	const stats = item.stats || {};
 	const out = [];
 
-	const who = el('div', 'lb-who');
-	if (author.nickname) who.appendChild(el('div', 'name', author.nickname));
-	if (author.uniqueId) {
-		const handle = el('a', 'handle', `@${author.uniqueId}`);
-		handle.href = `https://www.tiktok.com/@${author.uniqueId}`;
-		handle.target = '_blank';
-		handle.rel = 'noreferrer';
-		who.appendChild(handle);
-	}
-	if (who.childNodes.length) out.push(who);
+	const who = whoRow(author);
+	if (who) out.push(who);
 
 	if (item.desc) out.push(caption(item.desc));
 
@@ -1330,6 +1388,10 @@ function metaPanel(item) {
 	// has come back off disk yet — a row that appears late and pushes the caption
 	// down is worse than a row that is sometimes absent.
 	out.push(el('div', 'lb-song'));
+	// The replies saved off this post, under the song, filled by mountSavedReplies.
+	// Only where there are some: what a post without them looks like is what it
+	// looked like before there were replies to save.
+	if (savedRepliesOf(item.id).length) out.push(el('div', 'lb-replies'));
 
 	const facts = el('div', 'lb-facts');
 	if (item.createTime) {
@@ -1368,6 +1430,179 @@ function metaPanel(item) {
 	return out;
 }
 
+/** Whose it is: the name they go by, then the handle, which opens their profile. Null for nobody. */
+function whoRow(author) {
+	const who = el('div', 'lb-who');
+	if (author.nickname) who.appendChild(el('div', 'name', author.nickname));
+	if (author.uniqueId) {
+		const handle = el('a', 'handle', `@${author.uniqueId}`);
+		handle.href = `https://www.tiktok.com/@${author.uniqueId}`;
+		handle.target = '_blank';
+		handle.rel = 'noreferrer';
+		who.appendChild(handle);
+	}
+	return who.childNodes.length ? who : null;
+}
+
+/** A post's page on TikTok. The handle in the path is only decoration: TikTok goes by the id. */
+function postLink(id, uniqueId) {
+	return `https://www.tiktok.com/@${uniqueId || 'x'}/video/${id}`;
+}
+
+// ------------------------------------------------------------ saved replies
+
+/**
+ * The panel for a saved reply, read in the order a comment is: who, what they
+ * wrote, how it did, the post it was left on, then — as for a post — the date,
+ * the id and the file.
+ *
+ * Kept in step with the same function in src/viewer/viewer.js by hand.
+ */
+function replyPanel(item) {
+	const out = [];
+	const who = whoRow(item.author || {});
+	if (who) out.push(who);
+	if (item.text) out.push(caption(item.text));
+
+	const figs = el('div', 'lb-figs');
+	figs.append(figure('heart', item.diggCount, 'likes'));
+	out.push(figs);
+
+	out.push(fromRow(item));
+
+	const facts = el('div', 'lb-facts');
+	if (item.createTime) {
+		const when = new Date(item.createTime * 1000);
+		const line = el('span', null, when.toLocaleDateString(undefined, { dateStyle: 'medium' }));
+		line.title = when.toLocaleString();
+		facts.appendChild(line);
+	}
+	const n = (item.files || []).length;
+	facts.appendChild(el('span', null, item.kind === 'sticker' ? 'sticker' : n > 1 ? `${n} photos` : 'photo'));
+	if (item.thread) facts.appendChild(el('span', null, 'in a thread'));
+	if (item.savedAt) {
+		const when = new Date(item.savedAt);
+		const saved = el('span', null, `saved ${when.toLocaleDateString(undefined, { dateStyle: 'medium' })}`);
+		saved.title = when.toLocaleString();
+		facts.appendChild(saved);
+	}
+	out.push(facts);
+
+	const idRow = el('div', 'lb-id');
+	idRow.appendChild(el('span', null, 'ID'));
+	const post = getState()?.items?.[item.post];
+	const link = el('a', null, item.id);
+	link.href = postLink(item.post, post?.author?.uniqueId);
+	link.target = '_blank';
+	link.rel = 'noreferrer';
+	link.title = 'Open the post it was left on, on TikTok';
+	link.appendChild(icon('link'));
+	idRow.appendChild(link);
+	if (folderTarget(item)) idRow.appendChild(folderButton(item));
+	out.push(idRow);
+
+	return out;
+}
+
+/**
+ * The post a reply was left on. Opened here when it is in the archive — liked,
+ * most of the time, since that is where the replies worth keeping turn up — and
+ * on TikTok when it isn't.
+ */
+function fromRow(item) {
+	const post = getState()?.items?.[item.post];
+	const row = el('div', 'lb-from');
+	if (post) {
+		const b = el('button', 'post');
+		b.title = 'Open that post here';
+		b.append(
+			el('span', 'lbl', 'On a post you liked'),
+			el('span', 'text', post.desc || (post.author?.uniqueId ? `@${post.author.uniqueId}` : post.id))
+		);
+		b.addEventListener('click', () => openElsewhere('all', post.id));
+		row.appendChild(b);
+	} else {
+		const a = el('a', 'post');
+		a.href = postLink(item.post);
+		a.target = '_blank';
+		a.rel = 'noreferrer';
+		a.title = 'Open that post on TikTok';
+		const text = el('span', 'text', 'Open it on TikTok');
+		text.appendChild(icon('link'));
+		a.append(el('span', 'lbl', 'On a post that isn’t in your likes'), text);
+		row.appendChild(a);
+	}
+	return row;
+}
+
+/**
+ * Object URLs for the panel's own pictures, the replies saved off a post. Not in
+ * `openURLs`: those go every time the stage is rebuilt, which paging a photo
+ * post's images does, and the panel stays put through that.
+ */
+const panelURLs = [];
+
+function clearPanelURLs() {
+	while (panelURLs.length) URL.revokeObjectURL(panelURLs.pop());
+}
+
+/** The replies saved off a post, in the order they were saved. */
+function savedRepliesOf(postId) {
+	return replyEntries(getState())
+		.filter((r) => String(r.post) === String(postId))
+		.sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+}
+
+/**
+ * Open something in the feed from elsewhere in it: the post a reply was left
+ * on, or a reply from its post's panel. Through the filter rather than around
+ * it — the kind changes, and the search is cleared so it can't hide what was
+ * asked for — so the arrows then step through the list it belongs to.
+ */
+function openElsewhere(kind, id) {
+	closeLightbox();
+	$('kind').value = kind;
+	$('search').value = '';
+	applyFilters(getState());
+	const at = filtered.findIndex((i) => String(i.id) === String(id));
+	if (at >= 0) openLightbox(at);
+}
+
+/**
+ * Under a post's song: the replies saved off it, as thumbnails that open them.
+ * Read off disk one by one like the song is, and abandoned the same way when the
+ * panel has been replaced before they arrive.
+ */
+async function mountSavedReplies(item) {
+	if (item.type === 'reply') return;
+	const box = $('lbMeta').querySelector('.lb-replies');
+	const replies = savedRepliesOf(item.id);
+	if (!box || !replies.length) return;
+
+	box.appendChild(el('div', 'lbl', replies.length === 1 ? 'A reply you saved' : `${replies.length} replies you saved`));
+	const strip = el('div', 'strip');
+	box.appendChild(strip);
+	for (const reply of replies) {
+		const b = el('button', 'thumb');
+		const handle = reply.author?.uniqueId ? `@${reply.author.uniqueId}` : '';
+		b.title = reply.text ? `${handle}: ${reply.text}` : handle;
+		b.addEventListener('click', () => openElsewhere('replies', reply.id));
+		strip.appendChild(b);
+
+		const url = await replyThumb(reply);
+		if (!box.isConnected) {
+			if (url) URL.revokeObjectURL(url);
+			return;
+		}
+		if (!url) continue;
+		panelURLs.push(url);
+		const img = document.createElement('img');
+		img.src = url;
+		img.alt = '';
+		b.appendChild(img);
+	}
+}
+
 // ----------------------------------------------------------- show in folder
 
 /**
@@ -1378,9 +1613,9 @@ function metaPanel(item) {
  * This section is kept in step with its namesake in src/viewer/viewer.js by hand.
  */
 function folderTarget(item) {
-	if (item.type === 'photo') {
+	if (stills(item)) {
 		const names = photoNames(item);
-		return names.length ? [LAYOUT.images, names[Math.min(lbPhoto, names.length - 1)]] : null;
+		return names.length ? [stillsDir(item), names[Math.min(lbPhoto, names.length - 1)]] : null;
 	}
 	const name = disk.videos.has(item.id) ? `${item.id}.mp4` : recordedVideo(item.id);
 	return name ? [LAYOUT.videos, name] : null;
@@ -1563,7 +1798,7 @@ export function wireLibrary(stateGetter) {
 		if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
 
 		const item = filtered[lbIndex];
-		const shots = item?.type === 'photo' ? photoNames(item).length : 0;
+		const shots = stills(item) ? photoNames(item).length : 0;
 
 		switch (e.key) {
 			case 'Escape':

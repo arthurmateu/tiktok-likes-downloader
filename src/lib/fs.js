@@ -18,8 +18,8 @@ import * as downloads from './backends/downloads.js';
 import * as helper from './backends/helper.js';
 
 /**
- * Folder layout inside the archive root. Flat on purpose: three media
- * directories and one metadata file, nothing hidden and nothing nested.
+ * Folder layout inside the archive root. Flat on purpose: a directory per kind
+ * of media and one metadata file, nothing hidden and nothing nested.
  *
  * This is deliberately *not* myfaveTT's layout any more. Converting an existing
  * myfaveTT (or older ttarchive) folder is `tools/script.py`'s job, run once,
@@ -30,6 +30,12 @@ export const LAYOUT = {
 	images: ['images'],
 	/** Songs, and only for photo posts — a video's audio is inside its own mp4. */
 	audio: ['audio'],
+	/**
+	 * Stickers and photos out of comments, named by the comment's id the way a
+	 * photo post's images are named by the post's: `<id>.gif`, or `<id>_01.jpg`
+	 * and on for a comment with more than one. See src/lib/replies.js.
+	 */
+	replies: ['replies'],
 	/** The archive root itself — where archive.json lives. */
 	root: [],
 };
@@ -48,7 +54,10 @@ export function photoName(id, index, total, ext) {
 // Ids are numeric, so the suffix can be told from the id without guesswork.
 const PHOTO_FILE = /^(\d+)(?:_\d+)?\.[a-z0-9]{2,5}$/i;
 
-/** The post a file in images/ belongs to, or null if the name isn't ours. */
+/**
+ * The post a file in images/ belongs to — or the comment, for one in replies/,
+ * which is named the same way — or null if the name isn't ours.
+ */
 export function photoOwner(name) {
 	const m = PHOTO_FILE.exec(name);
 	return m ? m[1] : null;

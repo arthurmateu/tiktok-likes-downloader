@@ -578,6 +578,100 @@
 			document.getElementById('lbClose').click();
 			delete state.items['333'].noAudio;
 
+			// ---- saved replies ----------------------------------------------------
+			// Stickers and photos out of comments, under "Saved replies" in the same
+			// grid and feed — and linked both ways with the post each was left on.
+			const { encodeGif } = await import('../lib/gif.js');
+			const frame = (rgb) => {
+				const rgba = new Uint8ClampedArray(16 * 16 * 4);
+				for (let i = 0; i < rgba.length; i += 4) rgba.set([...rgb, 255], i);
+				return { rgba, ms: 100 };
+			};
+			const frames = [frame([0, 200, 0]), frame([200, 0, 200])];
+			const sticker = new Blob([(await encodeGif({ count: 2, width: 16, height: 16, frame: async (i) => frames[i] })).bytes], { type: 'image/gif' });
+			fake.reset();
+			fake.seed('videos/111.mp4', new Blob([bytesFrom(SAMPLE_MP4)], { type: 'video/mp4' }));
+			fake.seed('replies/900.gif', sticker);
+			fake.seed('replies/901_01.jpg', await solidJPEG('#00ff00'));
+			fake.seed('replies/901_02.jpg', await solidJPEG('#ff00ff'));
+			const scanned = await scanDisk({});
+			check('a scan counts the saved replies', scanned.replies === 2, JSON.stringify(scanned));
+			state.replies = {
+				900: { id: '900', post: '111', author: { uniqueId: 'fan', nickname: 'Fan' }, text: 'same', createTime: 5, diggCount: 2, kind: 'sticker', files: ['replies/900.gif'], savedAt: 2 },
+				901: { id: '901', post: '999', author: { uniqueId: 'other' }, text: 'look at this', createTime: 4, kind: 'photo', files: ['replies/901_01.jpg', 'replies/901_02.jpg'], savedAt: 1 },
+			};
+			const kindSelect = document.getElementById('kind');
+			const repliesOption = document.createElement('option');
+			repliesOption.value = 'replies';
+			kindSelect.appendChild(repliesOption);
+			kindSelect.value = 'replies';
+			renderLibrary(state);
+
+			const replyTiles = [...document.querySelectorAll('.tile')];
+			check('"Saved replies" lists the replies and nothing else',
+				replyTiles.map((t) => t.dataset.id).join() === '900,901' && replyTiles.every((t) => t.classList.contains('reply')),
+				replyTiles.map((t) => t.dataset.id).join());
+			check('and counts them as replies', document.getElementById('libCount').textContent === '2 replies',
+				document.getElementById('libCount').textContent);
+
+			tileFor('900').click();
+			await sleep(400);
+			check('a sticker opens on the stage', !!document.querySelector('#lbStage img')?.src);
+			const from = document.querySelector('#lbMeta .lb-from button.post');
+			check('a reply on a post in the archive offers that post', !!from && from.textContent.includes('a video'),
+				document.querySelector('#lbMeta .lb-from')?.textContent);
+			check('and says it is a sticker', document.querySelector('#lbMeta .lb-facts')?.textContent.includes('sticker'));
+			check('its id links to the post it was left on',
+				/\/video\/111$/.test(document.querySelector('#lbMeta .lb-id a')?.href || ''));
+			document.querySelector('#lbMeta .lb-folder')?.click();
+			await sleep(100);
+			check('Show in folder points at the file in replies/', fake.shownInFolder === 'replies/900.gif', fake.shownInFolder);
+
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+			await sleep(400);
+			check('the feed steps on to the next reply', document.getElementById('lbCount').textContent.includes('image 1 of 2'),
+				document.getElementById('lbCount').textContent);
+			const away = document.querySelector('#lbMeta .lb-from a.post');
+			check('a reply on a post not in the archive links to it on TikTok', /\/video\/999$/.test(away?.href || ''), away?.href);
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+			await sleep(300);
+			document.querySelector('#lbMeta .lb-folder')?.click();
+			await sleep(100);
+			check('a reply with two photos pages through them, and shows the one on screen',
+				fake.shownInFolder === 'replies/901_02.jpg', fake.shownInFolder);
+
+			document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true }));
+			await sleep(300);
+			document.querySelector('#lbMeta .lb-from button.post').click();
+			await sleep(400);
+			check('the post a reply was left on opens from it', kindSelect.value === 'all' && !!document.querySelector('#lbStage video'),
+				`${kindSelect.value}, ${document.getElementById('lbStage').innerHTML.slice(0, 80)}`);
+			await sleep(200);
+			const thumbs = document.querySelectorAll('#lbMeta .lb-replies .thumb');
+			check('and that post shows the reply saved off it', thumbs.length === 1 && !!thumbs[0].querySelector('img'),
+				document.querySelector('#lbMeta .lb-replies')?.outerHTML);
+			thumbs[0]?.click();
+			await sleep(400);
+			check('which opens the reply again', kindSelect.value === 'replies' && document.getElementById('lbCount').textContent.startsWith('1 /'),
+				`${kindSelect.value} ${document.getElementById('lbCount').textContent}`);
+			document.getElementById('lbClose').click();
+
+			kindSelect.value = 'all';
+			renderLibrary(state);
+			tileFor('444').click();
+			await sleep(300);
+			check('a post with no replies saved off it has no row for them', !document.querySelector('#lbMeta .lb-replies'));
+			document.getElementById('lbClose').click();
+
+			kindSelect.value = 'replies';
+			document.getElementById('search').value = 'look';
+			renderLibrary(state);
+			check('search finds a reply by what it says',
+				[...document.querySelectorAll('.tile')].map((t) => t.dataset.id).join() === '901');
+			document.getElementById('search').value = '';
+			kindSelect.value = 'all';
+			renderLibrary(state);
+
 			lines.push('', failures
 				? `<span class="fail">${failures} of ${checks} failing</span>`
 				: `<span class="pass">all ${checks} passing</span>`);

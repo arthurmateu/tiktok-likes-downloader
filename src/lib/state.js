@@ -47,6 +47,13 @@ export function emptyState() {
 		 * see `looksTruncated`.
 		 */
 		listLength: 0,
+		/**
+		 * Comments saved for their sticker or photo, by comment id. Kept apart from
+		 * `items` on purpose: nothing about them is a like, so none of what the
+		 * likes list decides — order, `gone`, where a sync stops — touches them.
+		 * See src/lib/replies.js.
+		 */
+		replies: {},
 	};
 }
 
@@ -54,8 +61,9 @@ export const disk = {
 	videos: new Set(), // id
 	photos: new Map(), // id -> sorted file names, images/ being flat
 	audio: new Map(), // id -> file name; photo posts only, and not all of those
+	replies: new Map(), // comment id -> sorted file names, replies/ being flat like images/
 	/**
-	 * Whether a scan is part-way through filling the three above. While it is,
+	 * Whether a scan is part-way through filling the collections above. While it is,
 	 * an id that isn't there yet means "not listed yet" and not "not on disk" —
 	 * which is a distinction anything drawing itself off `disk` has to make.
 	 */
@@ -92,7 +100,13 @@ export function listingComplete() {
 export function diskCounts() {
 	let images = 0;
 	for (const names of disk.photos.values()) images += names.length;
-	return { videos: disk.videos.size, photoSets: disk.photos.size, images, songs: disk.audio.size };
+	return {
+		videos: disk.videos.size,
+		photoSets: disk.photos.size,
+		images,
+		songs: disk.audio.size,
+		replies: disk.replies.size,
+	};
 }
 
 /** Bumped per scan, so one that has been superseded can tell — see scanDisk. */
@@ -103,7 +117,7 @@ let scanSeq = 0;
  *
  * Filled batch by batch as the listing arrives rather than all at once at the
  * end. A folder with thousands of files takes seconds to list, and the Library
- * is drawn off these three collections — waiting for the complete answer meant
+ * is drawn off these collections — waiting for the complete answer meant
  * an empty grid for as long as the scan took, on every page load.
  *
  * Each batch is *added* to whatever was already there, and only what this scan
@@ -126,13 +140,13 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 	await refresh();
 
 	// Each listing reports its own count from zero; carrying the previous ones'
-	// total forward makes the number the caller sees climb once, not three times.
+	// total forward makes the number the caller sees climb once, not once per directory.
 	let base = 0;
 	const step = onProgress ? (n) => onProgress(base + n) : undefined;
 
 	// What this scan has actually seen, so that when it ends the leftovers of the
 	// previous one can be told apart from them.
-	const seen = { videos: new Set(), images: new Set(), audio: new Set() };
+	const seen = { videos: new Set(), images: new Set(), audio: new Set(), replies: new Set() };
 
 	const addVideos = (names) => {
 		for (const name of names) {
@@ -171,6 +185,20 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 		}
 	};
 
+	const addReplies = (names) => {
+		const touched = new Set();
+		for (const name of names) {
+			const id = photoOwner(name);
+			if (!id) continue;
+			seen.replies.add(name);
+			const have = disk.replies.get(id);
+			if (!have) disk.replies.set(id, [name]);
+			else if (!have.includes(name)) have.push(name);
+			touched.add(id);
+		}
+		for (const id of touched) disk.replies.get(id).sort();
+	};
+
 	const fold = (add) => (names) => {
 		add(names);
 		onBatch?.();
@@ -188,7 +216,9 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 		base += videos.size;
 		const images = await listFiles(LAYOUT.images, { onProgress: step, onBatch: fold(addImages) });
 		base += images.size;
-		await listFiles(LAYOUT.audio, { onProgress: step, onBatch: fold(addSongs) });
+		const audio = await listFiles(LAYOUT.audio, { onProgress: step, onBatch: fold(addSongs) });
+		base += audio.size;
+		await listFiles(LAYOUT.replies, { onProgress: step, onBatch: fold(addReplies) });
 
 		// Whatever the previous scan left behind that this one did not find: files
 		// deleted, renamed or moved away from outside since.
@@ -200,7 +230,12 @@ export async function scanDisk({ onProgress, onBatch } = {}) {
 				else disk.photos.delete(id);
 			}
 			for (const id of disk.audio.keys()) if (!seen.audio.has(id)) disk.audio.delete(id);
-			// Here rather than in the `finally`: this is the point at which the three
+			for (const [id, names] of disk.replies) {
+				const kept = names.filter((name) => seen.replies.has(name));
+				if (kept.length) disk.replies.set(id, kept);
+				else disk.replies.delete(id);
+			}
+			// Here rather than in the `finally`: this is the point at which the
 			// collections are the folder, and a scan that threw on the way to it has
 			// listed part of the folder and pruned none of it.
 			complete = true;
@@ -229,6 +264,9 @@ export function hasPhotos(id, expected) {
 }
 export function hasAudio(id) {
 	return disk.audio.has(id);
+}
+export function hasReply(id) {
+	return disk.replies.has(id);
 }
 
 /** What still needs fetching for this record, given what's on disk. */
@@ -598,6 +636,18 @@ export function songlessPhotoPosts(state) {
 	// archive you are most likely to be looking at.
 	out.sort((a, b) => rank(a) - rank(b));
 	return out;
+}
+
+/**
+ * Record a saved reply, over whatever an earlier save of the same comment said.
+ * The files are what this save wrote; the text, the author and the count of
+ * likes are as current as the comment is now.
+ */
+export function upsertReply(state, rec, files) {
+	if (!state.replies) state.replies = {};
+	const prev = state.replies[rec.id] || {};
+	state.replies[rec.id] = { ...prev, ...rec, files, savedAt: Date.now() };
+	return state.replies[rec.id];
 }
 
 export function markUnavailable(state, id, reason) {

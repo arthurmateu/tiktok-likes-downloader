@@ -34,6 +34,8 @@
 	const config = raw.config || {};
 
 	let items = raw.items || [];
+	/** Saved replies — stickers and photos out of comments. See src/lib/replies.js. */
+	let replies = raw.replies || [];
 	let filtered = [];
 	let shown = 0;
 	let observer = null;
@@ -116,6 +118,7 @@
 		const fresh = await call('state', {}, 30000);
 		if (fresh && fresh.ok && fresh.items) {
 			items = fresh.items;
+			replies = fresh.replies || replies;
 			applyFilters();
 			setSub();
 		}
@@ -133,6 +136,7 @@
 				const fresh = await call('state', {}, 30000);
 				if (fresh && fresh.ok && fresh.items) {
 					items = fresh.items;
+					replies = fresh.replies || replies;
 					applyFilters();
 					setSub();
 				}
@@ -342,7 +346,17 @@
 	}
 
 	function photoPaths(item) {
+		if (item.type === 'reply') return item.files || [];
 		return (item.files && item.files.photos) || [];
+	}
+
+	/**
+	 * Whether an entry is pictures rather than a clip: a photo post, or a saved
+	 * reply — a sticker or a photo out of a comment. Both page through their
+	 * images the same way.
+	 */
+	function stills(item) {
+		return !!item && (item.type === 'photo' || item.type === 'reply');
 	}
 
 	/** The song over a photo post. Videos have theirs inside their own mp4. */
@@ -357,7 +371,7 @@
 	}
 
 	function present(item) {
-		return item.type === 'photo' ? photoPaths(item).length > 0 : !!(item.files && item.files.video);
+		return stills(item) ? photoPaths(item).length > 0 : !!(item.files && item.files.video);
 	}
 
 	// ------------------------------------------------------------------ tiles
@@ -369,7 +383,7 @@
 	}
 
 	function tile(item, index) {
-		const node = el('div', 'tile' + (present(item) ? '' : ' missing'));
+		const node = el('div', 'tile' + (item.type === 'reply' ? ' reply' : '') + (present(item) ? '' : ' missing'));
 		node.dataset.id = item.id;
 		node.dataset.index = index;
 
@@ -379,7 +393,7 @@
 
 		const cap = el('div', 'cap');
 		cap.appendChild(el('div', 'who', item.author && item.author.uniqueId ? `@${item.author.uniqueId}` : ''));
-		cap.appendChild(document.createTextNode(item.desc || ''));
+		cap.appendChild(document.createTextNode(item.desc || item.text || ''));
 		node.appendChild(cap);
 
 		observer.observe(node);
@@ -397,7 +411,7 @@
 		const item = byId.get(node.dataset.id);
 		if (!item) return;
 
-		if (item.type === 'photo') {
+		if (stills(item)) {
 			const first = photoPaths(item)[0];
 			if (!first) return;
 			const img = document.createElement('img');
@@ -469,33 +483,58 @@
 
 	let byId = new Map();
 
+	/** The saved replies as entries the grid and the feed can hold beside posts. */
+	function replyEntries() {
+		return replies.map((r) => Object.assign({}, r, { type: 'reply' }));
+	}
+
+	/**
+	 * The same sorts, for replies. There is no like order to a reply — TikTok
+	 * keeps no list of the comments you've liked — so "liked" means when it was
+	 * saved. Nothing counts plays of a comment.
+	 *
+	 * Kept in step with the same table in src/archive/viewer.js by hand.
+	 */
+	const REPLY_SORTS = {
+		'liked-recent': (a, b) => (b.savedAt || 0) - (a.savedAt || 0),
+		'liked-first': (a, b) => (a.savedAt || 0) - (b.savedAt || 0),
+		'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
+		'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
+		'likes-desc': (a, b) => (b.diggCount || 0) - (a.diggCount || 0),
+		'plays-desc': (a, b) => (b.savedAt || 0) - (a.savedAt || 0),
+	};
+
 	function applyFilters() {
-		byId = new Map(items.map((i) => [String(i.id), i]));
+		const kind = $('kind').value;
+		const wantReplies = kind === 'replies';
+		const source = wantReplies ? replyEntries() : items;
+		byId = new Map(source.map((i) => [String(i.id), i]));
 
 		// A live refresh re-runs this while someone is watching. Hold the position
 		// by id rather than by number: the list it indexes into is about to change.
 		const openId = lbOpen() ? String(filtered[lbIndex].id) : null;
 
 		const q = $('search').value.trim().toLowerCase();
-		const kind = $('kind').value;
 
-		let list = items;
-		if (kind !== 'all') list = list.filter((i) => (i.type || 'video') === kind);
+		let list = source;
+		if (!wantReplies && kind !== 'all') list = list.filter((i) => (i.type || 'video') === kind);
 		if (q) {
 			list = list.filter((i) => {
 				const a = i.author || {};
-				return `${i.desc || ''} ${a.uniqueId || ''} ${a.nickname || ''}`.toLowerCase().includes(q);
+				return `${i.desc || i.text || ''} ${a.uniqueId || ''} ${a.nickname || ''}`.toLowerCase().includes(q);
 			});
 		}
 
-		const cmp = {
-			'liked-recent': byLikeOrder(1),
-			'liked-first': byLikeOrder(-1),
-			'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
-			'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
-			'likes-desc': (a, b) => ((b.stats || {}).diggCount || 0) - ((a.stats || {}).diggCount || 0),
-			'plays-desc': (a, b) => ((b.stats || {}).playCount || 0) - ((a.stats || {}).playCount || 0),
-		}[$('sort').value];
+		const cmp = wantReplies
+			? REPLY_SORTS[$('sort').value]
+			: {
+					'liked-recent': byLikeOrder(1),
+					'liked-first': byLikeOrder(-1),
+					'date-desc': (a, b) => (b.createTime || 0) - (a.createTime || 0),
+					'date-asc': (a, b) => (a.createTime || 0) - (b.createTime || 0),
+					'likes-desc': (a, b) => ((b.stats || {}).diggCount || 0) - ((a.stats || {}).diggCount || 0),
+					'plays-desc': (a, b) => ((b.stats || {}).playCount || 0) - ((a.stats || {}).playCount || 0),
+				}[$('sort').value];
 
 		filtered = list.slice().sort(cmp);
 		shown = 0;
@@ -819,12 +858,12 @@
 	function renderCount() {
 		if (!lbOpen()) return;
 		const item = filtered[lbIndex];
-		const n = item && item.type === 'photo' ? photoPaths(item).length : 0;
+		const n = stills(item) ? photoPaths(item).length : 0;
 		const where = `${(lbIndex + 1).toLocaleString()} / ${filtered.length.toLocaleString()}`;
 		const shot = lbSheet ? `all ${n} images` : `image ${lbPhoto + 1} of ${n}`;
 		// The rate is a setting with no control of its own on screen, so the counter
 		// is where it says so — and only where there is something for it to act on.
-		const speed = lbRate !== 1 && item && item.type !== 'photo' ? ` · ${lbRate}×` : '';
+		const speed = lbRate !== 1 && item && !stills(item) ? ` · ${lbRate}×` : '';
 		$('lbCount').textContent = (n > 1 ? `${where} · ${shot}` : where) + speed;
 		$('lbPrev').disabled = nextIndex(-1) < 0;
 		$('lbNext').disabled = nextIndex(1) < 0;
@@ -981,7 +1020,7 @@
 
 	function toggleSheet() {
 		const item = filtered[lbIndex];
-		if (!item || item.type !== 'photo' || photoPaths(item).length < 2) return;
+		if (!item || !stills(item) || photoPaths(item).length < 2) return;
 		lbSheet = !lbSheet;
 		renderStage(item);
 		renderCount();
@@ -1101,7 +1140,7 @@
 		const stage = $('lbStage');
 		clearStage();
 
-		if (item.type === 'photo') {
+		if (stills(item)) {
 			const paths = photoPaths(item);
 			if (!paths.length) {
 				stage.textContent = 'No image paths recorded for this post.';
@@ -1221,16 +1260,8 @@
 		const stats = item.stats || {};
 		const out = [];
 
-		const who = el('div', 'lb-who');
-		if (author.nickname) who.appendChild(el('div', 'name', author.nickname));
-		if (author.uniqueId) {
-			const handle = el('a', 'handle', `@${author.uniqueId}`);
-			handle.href = `https://www.tiktok.com/@${author.uniqueId}`;
-			handle.target = '_blank';
-			handle.rel = 'noreferrer';
-			who.appendChild(handle);
-		}
-		if (who.childNodes.length) out.push(who);
+		const who = whoRow(author);
+		if (who) out.push(who);
 
 		if (item.desc) out.push(caption(item.desc));
 
@@ -1243,6 +1274,8 @@
 		// not its file has finished loading — a row that appears late and pushes
 		// the caption down is worse than a row that is sometimes absent.
 		out.push(el('div', 'lb-song'));
+		const saved = savedReplies(item);
+		if (saved) out.push(saved);
 
 		const facts = el('div', 'lb-facts');
 		if (item.createTime) {
@@ -1284,6 +1317,152 @@
 		return out;
 	}
 
+	/** Whose it is: the name they go by, then the handle, which opens their profile. Null for nobody. */
+	function whoRow(author) {
+		const who = el('div', 'lb-who');
+		if (author.nickname) who.appendChild(el('div', 'name', author.nickname));
+		if (author.uniqueId) {
+			const handle = el('a', 'handle', `@${author.uniqueId}`);
+			handle.href = `https://www.tiktok.com/@${author.uniqueId}`;
+			handle.target = '_blank';
+			handle.rel = 'noreferrer';
+			who.appendChild(handle);
+		}
+		return who.childNodes.length ? who : null;
+	}
+
+	/** A post's page on TikTok. The handle in the path is only decoration: TikTok goes by the id. */
+	function postLink(id, uniqueId) {
+		return `https://www.tiktok.com/@${uniqueId || 'x'}/video/${id}`;
+	}
+
+	function postById(id) {
+		return items.find((i) => String(i.id) === String(id)) || null;
+	}
+
+	// -------------------------------------------------------- saved replies
+
+	/**
+	 * The panel for a saved reply, read in the order a comment is: who, what
+	 * they wrote, how it did, the post it was left on, then the date, the id and
+	 * the file. Kept in step with the same function in src/archive/viewer.js by
+	 * hand.
+	 */
+	function replyPanel(item) {
+		const out = [];
+		const who = whoRow(item.author || {});
+		if (who) out.push(who);
+		if (item.text) out.push(caption(item.text));
+
+		const figs = el('div', 'lb-figs');
+		figs.append(figure('heart', item.diggCount, 'likes'));
+		out.push(figs);
+
+		out.push(fromRow(item));
+
+		const facts = el('div', 'lb-facts');
+		if (item.createTime) {
+			const when = new Date(item.createTime * 1000);
+			const line = el('span', null, when.toLocaleDateString(undefined, { dateStyle: 'medium' }));
+			line.title = when.toLocaleString();
+			facts.appendChild(line);
+		}
+		const n = (item.files || []).length;
+		facts.appendChild(el('span', null, item.kind === 'sticker' ? 'sticker' : n > 1 ? `${n} photos` : 'photo'));
+		if (item.thread) facts.appendChild(el('span', null, 'in a thread'));
+		if (item.savedAt) {
+			const when = new Date(item.savedAt);
+			const saved = el('span', null, `saved ${when.toLocaleDateString(undefined, { dateStyle: 'medium' })}`);
+			saved.title = when.toLocaleString();
+			facts.appendChild(saved);
+		}
+		out.push(facts);
+
+		const idRow = el('div', 'lb-id');
+		idRow.appendChild(el('span', null, 'ID'));
+		const post = postById(item.post);
+		const link = el('a', null, item.id);
+		link.href = postLink(item.post, post && post.author && post.author.uniqueId);
+		link.target = '_blank';
+		link.rel = 'noreferrer';
+		link.title = 'Open the post it was left on, on TikTok';
+		link.appendChild(icon('link'));
+		idRow.appendChild(link);
+		if (bridged && folderPath(item)) idRow.appendChild(folderButton(item));
+		out.push(idRow);
+
+		return out;
+	}
+
+	/** The post a reply was left on: opened here when it is in the archive, on TikTok when it isn't. */
+	function fromRow(item) {
+		const post = postById(item.post);
+		const row = el('div', 'lb-from');
+		if (post) {
+			const b = el('button', 'post');
+			b.title = 'Open that post here';
+			const author = post.author || {};
+			b.append(
+				el('span', 'lbl', 'On a post you liked'),
+				el('span', 'text', post.desc || (author.uniqueId ? `@${author.uniqueId}` : post.id))
+			);
+			b.addEventListener('click', () => openElsewhere('all', post.id));
+			row.appendChild(b);
+		} else {
+			const a = el('a', 'post');
+			a.href = postLink(item.post);
+			a.target = '_blank';
+			a.rel = 'noreferrer';
+			a.title = 'Open that post on TikTok';
+			const text = el('span', 'text', 'Open it on TikTok');
+			text.appendChild(icon('link'));
+			a.append(el('span', 'lbl', 'On a post that isn’t in your likes'), text);
+			row.appendChild(a);
+		}
+		return row;
+	}
+
+	/** Under a post's song: the replies saved off it, as thumbnails that open them. Null for none. */
+	function savedReplies(item) {
+		const mine = replyEntries()
+			.filter((r) => String(r.post) === String(item.id))
+			.sort((a, b) => (a.savedAt || 0) - (b.savedAt || 0));
+		if (!mine.length) return null;
+		const box = el('div', 'lb-replies');
+		box.appendChild(el('div', 'lbl', mine.length === 1 ? 'A reply you saved' : `${mine.length} replies you saved`));
+		const strip = el('div', 'strip');
+		for (const reply of mine) {
+			const b = el('button', 'thumb');
+			const handle = reply.author && reply.author.uniqueId ? `@${reply.author.uniqueId}` : '';
+			b.title = reply.text ? `${handle}: ${reply.text}` : handle;
+			b.addEventListener('click', () => openElsewhere('replies', reply.id));
+			const first = photoPaths(reply)[0];
+			if (first) {
+				const img = document.createElement('img');
+				img.src = src(first);
+				img.alt = '';
+				b.appendChild(img);
+			}
+			strip.appendChild(b);
+		}
+		box.appendChild(strip);
+		return box;
+	}
+
+	/**
+	 * Open something in the feed from elsewhere in it: the post a reply was left
+	 * on, or a reply from its post's panel. Through the filter rather than around
+	 * it, so the arrows then step through the list it belongs to.
+	 */
+	function openElsewhere(kind, id) {
+		closeLightbox();
+		$('kind').value = kind;
+		$('search').value = '';
+		applyFilters();
+		const at = filtered.findIndex((i) => String(i.id) === String(id));
+		if (at >= 0) openLightbox(at);
+	}
+
 	// ------------------------------------------------------- show in folder
 
 	/**
@@ -1293,7 +1472,7 @@
 	 */
 	function folderPath(item) {
 		if (!present(item)) return null;
-		if (item.type !== 'photo') return videoPath(item);
+		if (!stills(item)) return videoPath(item);
 		const paths = photoPaths(item);
 		return paths[Math.min(lbPhoto, paths.length - 1)];
 	}
@@ -1345,7 +1524,7 @@
 		renderStage(item);
 		renderCount();
 
-		$('lbMeta').replaceChildren(...metaPanel(item));
+		$('lbMeta').replaceChildren(...(item.type === 'reply' ? replyPanel(item) : metaPanel(item)));
 		// After the panel is built, since it fills a slot in it. Replacing the panel
 		// is also what stopped the previous song: a media element taken out of the
 		// document pauses itself.
@@ -1360,6 +1539,7 @@
 		const parts = [
 			`${items.length.toLocaleString()} items`,
 			`${saved.toLocaleString()} on disk`,
+			...(replies.length ? [`${replies.length.toLocaleString()} saved replies`] : []),
 			live ? 'live' : when ? `snapshot from ${when}` : 'snapshot',
 		];
 		$('sub').textContent = parts.join(' · ');
@@ -1458,7 +1638,7 @@
 		if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
 
 		const item = filtered[lbIndex];
-		const shots = item && item.type === 'photo' ? photoPaths(item).length : 0;
+		const shots = stills(item) ? photoPaths(item).length : 0;
 
 		switch (e.key) {
 			case 'Escape':

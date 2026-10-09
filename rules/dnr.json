@@ -20,7 +20,8 @@
 				"byteoversea.com",
 				"ibytedtos.com",
 				"muscdn.com",
-				"isnssdk.com"
+				"isnssdk.com",
+				"ibyteimg.com"
 			],
 			"excludedInitiatorDomains": ["tiktok.com"],
 			"resourceTypes": ["xmlhttprequest", "media", "image"]

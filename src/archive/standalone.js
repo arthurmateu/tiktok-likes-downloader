@@ -113,6 +113,33 @@ export function slimItems(state) {
 }
 
 /**
+ * The saved replies, cut down the same way. Their files always come along —
+ * a reply is only ever recorded once its files are written — and so does the
+ * post each was left on, which is how the page links the two.
+ *
+ * Exported for the same reason as `slimItems`.
+ */
+export function slimReplies(state) {
+	const out = [];
+	for (const r of Object.values(state.replies || {})) {
+		const author = r.author || {};
+		out.push({
+			id: r.id,
+			post: r.post,
+			thread: r.thread || undefined,
+			author: { uniqueId: author.uniqueId || '', nickname: author.nickname || '' },
+			text: r.text || '',
+			createTime: r.createTime || 0,
+			diggCount: r.diggCount || 0,
+			kind: r.kind,
+			files: r.files || [],
+			savedAt: r.savedAt || 0,
+		});
+	}
+	return out;
+}
+
+/**
  * The token the content script presents before the extension will answer this
  * page. Not a secret — it sits in a file on disk — but it does mean that opening
  * some other local HTML file can't drive the extension just by carrying the
@@ -135,6 +162,7 @@ export async function buildViewerHTML(state) {
 			version: ext.runtime.getManifest().version,
 		},
 		items: slimItems(state),
+		replies: slimReplies(state),
 	};
 
 	let html = template;

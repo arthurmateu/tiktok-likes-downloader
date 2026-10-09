@@ -29,6 +29,7 @@ On Linux the folder dialog needs `zenity`, `kdialog` or Python's `tkinter`. On W
 1. On the archive page, **Choose folder…** — where the archive goes. With the helper, an archive you chose before is picked up automatically.
 2. Enter your TikTok username and press **Sync likes**. A TikTok tab opens in the background; leave it open and carry on browsing.
 3. Sync again whenever you like — it only fetches what's new. **Full sync** (the ▾ beside the button) reads your whole list again, which is also how unliked posts get noticed.
+4. To keep a sticker or photo from a comment, copy the comment's link (long-press it in the TikTok app, then **Share** › **Copy link**) and paste it into **Save replies** under the sync controls — several at once is fine. Stickers are saved as GIFs, ready to send on; they turn up in the Library under **Saved replies**.
 
 Browse what you've saved in the **Library** tab, or open `viewer.html` in the archive folder — it works without the extension, and on any machine you copy the folder to.
 
@@ -38,6 +39,7 @@ Browse what you've saved in the **Library** tab, or open `viewer.html` in the ar
 videos/<id>.mp4          one file per video
 images/<id>.jpg          a photo post — <id>_01.jpg, <id>_02.jpg … for galleries
 audio/<id>.mp3           the song a photo post plays over its images
+replies/<id>.gif         a sticker from a comment you saved — .png if it doesn't move, .jpg for a photo
 archive.json             every post you've liked, including ones that have since disappeared
 viewer.html              the Library, as a page you can open anywhere
 ```

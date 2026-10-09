@@ -177,6 +177,30 @@
 							<span><b id="cBytes">0 B</b></span>
 						</div>
 					</div>
+
+					<!--
+						Saved replies: the sticker or photo out of a comment, by its share
+						link. Not part of a sync — TikTok keeps no list of the comments you've
+						liked — so it is a box of its own, and works while a sync runs.
+					-->
+					<div class="replies">
+						<h2>Save replies</h2>
+						<p class="muted">
+							Paste links to comments with a sticker or a photo in them — on TikTok, long-press the
+							comment, then Share and Copy link. Stickers are saved as GIFs (a still one as a PNG) and
+							photos as they were posted, into <code>replies/</code>.
+						</p>
+						<div class="row">
+							<textarea
+								id="replyLinks"
+								class="grow"
+								rows="2"
+								spellcheck="false"
+								placeholder="https://vm.tiktok.com/… — one link or several"
+							></textarea>
+							<button id="saveReplies" class="btn">Save replies</button>
+						</div>
+					</div>
 				</div>
 
 				<!--
@@ -205,6 +229,7 @@
 						<option value="all">All types</option>
 						<option value="video">Videos</option>
 						<option value="photo">Photo posts</option>
+						<option value="replies">Saved replies</option>
 					</select>
 					<span id="libCount" class="muted"></span>
 					<!-- Local helper only: the same Library, served off the folder at an address of its own. -->
@@ -244,6 +269,8 @@
   images/&lt;postId&gt;.jpg           a single-image post
   images/&lt;postId&gt;_01.jpg        a gallery, numbered in order
   audio/&lt;postId&gt;.mp3            the song a photo post plays over its images
+  replies/&lt;commentId&gt;.gif       a sticker saved from a comment — .png if it's still,
+                                .jpg for a photo
   archive.json                  every liked item, downloaded or not
   viewer.html                   this Library, as a file you can double-click</pre>
 
@@ -251,7 +278,7 @@
 				<p>
 					Rewritten after every sync, and by <b>Write viewer.html</b> above. It is one
 					self-contained file — the metadata is baked in and the media loads from
-					<code>videos/</code>, <code>images/</code> and <code>audio/</code> beside it — so the folder browses
+					<code>videos/</code>, <code>images/</code>, <code>audio/</code> and <code>replies/</code> beside it — so the folder browses
 					itself with no extension involved, and keeps working if you copy it to another
 					machine or a drive.
 				</p>

@@ -90,9 +90,9 @@
 				'cFail','cBytes','log','loading','loadingMsg','statPosts','statVideos','statImages','statUnavailable','search',
 				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta','lbHelp','lbKeys',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
-				'helperSetup','helperProblem','helperRetry','helperReload','openLibrary',
+				'helperSetup','helperProblem','helperRetry','helperReload','openLibrary','replyLinks','saveReplies',
 			];
-			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput'];
+			const INPUTS = ['search','username','concurrency','dlFolderName','scanInput','replyLinks'];
 			const host = document.getElementById('dom');
 			for (const id of IDS) {
 				const tag = INPUTS.includes(id) ? 'input'
@@ -124,6 +124,8 @@
 				'./src/lib/fs.js',
 				'./src/lib/state.js',
 				'./src/lib/downloader.js',
+				'./src/lib/gif.js',
+				'./src/lib/replies.js',
 				'./src/archive/viewer.js',
 				'./src/archive/standalone.js',
 				'./src/archive/archive.js',

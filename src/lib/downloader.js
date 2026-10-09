@@ -174,8 +174,12 @@ const MAX_PREFER_MISSES = 2;
  * point — a video whose audio is genuinely missing from every gear must still
  * end up in the archive, so this can move the download to a better candidate
  * but must never be able to fail an item on its own.
+ *
+ * `credentials` is the session's cookies by default, because a sync's media
+ * URLs are bound to the session that read them. A saved reply's were read
+ * without one, and are fetched the same way — see src/lib/replies.js.
  */
-export async function fetchFirst(urls, { signal, expect, guard, prefer } = {}) {
+export async function fetchFirst(urls, { signal, expect, guard, prefer, credentials = 'include' } = {}) {
 	const list = urls.filter(Boolean);
 	if (!list.length) throw new Error('no candidate URLs');
 	let lastErr = null;
@@ -189,7 +193,7 @@ export async function fetchFirst(urls, { signal, expect, guard, prefer } = {}) {
 		for (const url of list) {
 			if (guard) await guard.pass(signal);
 			try {
-				const res = await fetch(url, { credentials: 'include', signal, cache: 'no-store' });
+				const res = await fetch(url, { credentials, signal, cache: 'no-store' });
 				if (!res.ok) {
 					lastErr = new Error(`HTTP ${res.status}`);
 					const kind = classifyStatus(res.status);

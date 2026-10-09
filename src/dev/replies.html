@@ -1,0 +1,546 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>saved replies tests</title>
+		<!--
+			Covers saved replies: the GIF encoder that turns a sticker into something
+			that goes into a chat, and the path from a comment link to files in
+			replies/ and a record in archive.json.
+
+			The encoder is checked by decoding what it wrote. Every frame of the GIF
+			is read back with the browser's own decoder and compared with the frame
+			it was made from, pixel for pixel — so a frame written as only the part
+			that changed, or a frame that has to clear the one before it, is judged by
+			what a browser actually shows and not by how the file is laid out. The
+			fixtures use fewer than 256 colours, each in a bin of its own, so the
+			palette is exact and "the same picture" can mean exactly the same.
+
+			The link-to-file half runs replies.js as shipped against an in-memory
+			folder (src/dev/fake-fs.js, swapped in by the import map) and a stubbed
+			`fetch` that plays TikTok: a short link that redirects, the comment list,
+			the sticker and photo CDNs.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/replies.html. Needs ImageDecoder, so
+			Chromium. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+			h2 { font-size: 14px; margin: 20px 0 4px; color: #a9a9c0; }
+		</style>
+		<script type="importmap">
+			{ "imports": { "/src/lib/fs.js": "/src/dev/fake-fs.js" } }
+		</script>
+	</head>
+	<body>
+		<h1>saved replies</h1>
+		<pre id="out">running…</pre>
+
+		<script type="module">
+			import { encodeGif, openFrames, stickerFile, sniffImageType } from '../lib/gif.js';
+			import {
+				linksIn,
+				photoUrls,
+				RateLimited,
+				replyMedia,
+				replyRecord,
+				resolveLink,
+				saveReply,
+				stickerUrls,
+			} from '../lib/replies.js';
+			import { disk, emptyState, scanDisk } from '../lib/state.js';
+			import { slimReplies } from '../archive/standalone.js';
+			import { readBlob, remove, reset, seed } from './fake-fs.js';
+
+			const out = document.getElementById('out');
+			const lines = [];
+			let checks = 0;
+			let failures = 0;
+
+			function check(label, ok, detail = '') {
+				checks++;
+				if (!ok) failures++;
+				lines.push(
+					`<span class="${ok ? 'pass' : 'fail'}">${ok ? 'PASS' : 'FAIL'}</span>  ${label}` +
+						(ok || !detail ? '' : `\n        ${detail}`)
+				);
+				out.innerHTML = lines.join('\n');
+			}
+
+			const same = (label, got, want) =>
+				check(label, JSON.stringify(got) === JSON.stringify(want), `got ${JSON.stringify(got)}, want ${JSON.stringify(want)}`);
+
+			function section(title) {
+				lines.push(`<h2>${title}</h2>`);
+			}
+
+			async function throwsLike(label, fn, test) {
+				try {
+					await fn();
+					check(label, false, 'did not throw');
+				} catch (err) {
+					check(label, test(err), `threw ${err && err.name}: ${err && err.message}`);
+				}
+			}
+
+			// ---------------------------------------------------------- fixtures
+
+			/**
+			 * A clip made of frames drawn by `paint(frame, x, y)`, which returns
+			 * [r, g, b, a]. Colours are kept to multiples of 8 so each falls in a
+			 * palette bin of its own and comes back exactly.
+			 */
+			function clip(width, height, durations, paint) {
+				const frames = durations.map((ms, f) => {
+					const rgba = new Uint8ClampedArray(width * height * 4);
+					for (let y = 0; y < height; y++) {
+						for (let x = 0; x < width; x++) {
+							const px = paint(f, x, y);
+							rgba.set(px, (y * width + x) * 4);
+						}
+					}
+					return { rgba, ms };
+				});
+				return {
+					count: frames.length,
+					width,
+					height,
+					frames,
+					async frame(i) {
+						return frames[i];
+					},
+				};
+			}
+
+			/** What a browser shows for a source pixel: transparent below half alpha, opaque above. */
+			function shown(px) {
+				return px[3] < 128 ? [0, 0, 0, 0] : [px[0], px[1], px[2], 255];
+			}
+
+			/** Every frame a browser decodes out of a file, as RGBA and a duration in ms. */
+			async function decodeAll(blob, type) {
+				const data = new Uint8Array(await blob.arrayBuffer());
+				const dec = new ImageDecoder({ data, type });
+				await dec.tracks.ready;
+				await dec.completed;
+				const n = dec.tracks.selectedTrack.frameCount;
+				const frames = [];
+				for (let i = 0; i < n; i++) {
+					const { image } = await dec.decode({ frameIndex: i });
+					const c = new OffscreenCanvas(image.displayWidth, image.displayHeight);
+					const ctx = c.getContext('2d');
+					ctx.drawImage(image, 0, 0);
+					frames.push({
+						rgba: ctx.getImageData(0, 0, c.width, c.height).data,
+						ms: Math.round((image.duration || 0) / 1000),
+						width: c.width,
+						height: c.height,
+					});
+					image.close();
+				}
+				dec.close();
+				return frames;
+			}
+
+			/** The first pixel at which a decoded frame differs from what should be shown. */
+			function firstDifference(decoded, want, width) {
+				for (let p = 0; p < want.length; p += 4) {
+					const a = Array.from(decoded.subarray(p, p + 4));
+					const b = shown(Array.from(want.subarray(p, p + 4)));
+					// Fully transparent is transparent, whatever colour channels it carries.
+					if (a[3] === 0 && b[3] === 0) continue;
+					if (a.some((v, i) => v !== b[i])) {
+						const i = p / 4;
+						return `pixel (${i % width}, ${Math.floor(i / width)}): got ${a}, want ${b}`;
+					}
+				}
+				return null;
+			}
+
+			/** How each frame was written: its rectangle and what it asks for afterwards. */
+			function gifFrames(bytes) {
+				const frames = [];
+				let at = 13 + (bytes[10] & 0x80 ? 3 * (2 << (bytes[10] & 7)) : 0);
+				let gce = null;
+				const u16 = (i) => bytes[i] | (bytes[i + 1] << 8);
+				const skipBlocks = () => {
+					while (bytes[at]) at += bytes[at] + 1;
+					at++;
+				};
+				while (at < bytes.length) {
+					const b = bytes[at];
+					if (b === 0x3b) break;
+					if (b === 0x21) {
+						if (bytes[at + 1] === 0xf9) gce = { disposal: (bytes[at + 3] >> 2) & 7, delay: u16(at + 4) };
+						at += 2;
+						skipBlocks();
+					} else if (b === 0x2c) {
+						const rect = { x: u16(at + 1), y: u16(at + 3), w: u16(at + 5), h: u16(at + 7) };
+						at += 10 + (bytes[at + 9] & 0x80 ? 3 * (2 << (bytes[at + 9] & 7)) : 0);
+						at++; // LZW minimum code size
+						skipBlocks();
+						frames.push({ ...rect, ...gce });
+						gce = null;
+					} else break;
+				}
+				return frames;
+			}
+
+			// --------------------------------------------------------- the encoder
+
+			section('GIF encoder — what a browser shows is what went in');
+
+			const W = 48;
+			const H = 36;
+			// 12 × 9 shades: few enough that every one gets a palette slot of its own.
+			const bg = (x, y) => [(x >> 2) * 16, (y >> 2) * 16, 128, 255];
+			// A square moving across a still background; frames 2 and 3 identical.
+			const square = [0, 6, 12, 12, 18, 24];
+			const moving = clip(W, H, [40, 40, 100, 100, 33, 0], (f, x, y) => {
+				const sx = square[f];
+				return x >= sx && x < sx + 10 && y >= 10 && y < 20 ? [248, 0, 0, 255] : bg(x, y);
+			});
+			{
+				const { bytes, frames } = await encodeGif(moving);
+				const blob = new Blob([bytes], { type: 'image/gif' });
+				const decoded = await decodeAll(blob, 'image/gif');
+				same('two identical frames in a row become one', [frames, decoded.length], [5, 5]);
+				const wanted = [0, 1, 2, 4, 5];
+				for (let i = 0; i < decoded.length; i++) {
+					const diff = firstDifference(decoded[i].rgba, moving.frames[wanted[i]].rgba, W);
+					check(`frame ${i} shows source frame ${wanted[i]} exactly`, !diff, diff);
+				}
+				// 40, 40, 200 (two of 100 merged), 33, then the default 100 — rounded to
+				// hundredths against the running total: 4, 4, 20, 3 (31.3 → 31 total
+				// minus 28), then 10.
+				same(
+					'delays are the source durations, rounded against the running total',
+					decoded.map((f) => f.ms),
+					[40, 40, 200, 30, 100]
+				);
+				const layout = gifFrames(bytes);
+				check(
+					'after the first frame, only the part that moved is written',
+					layout.slice(1).every((f) => f.w * f.h < (W * H) / 4),
+					JSON.stringify(layout)
+				);
+				check('nothing asks to be cleared in a clip with no transparency', layout.every((f) => f.disposal === 1), JSON.stringify(layout));
+			}
+
+			// A cut-out: a disc that shrinks (taking pixels away, which painting over
+			// can't do) and grows again, with a soft edge either side of the alpha cut.
+			const radius = [14, 10, 6, 10, 14];
+			const disc = clip(40, 40, [60, 60, 60, 60, 60], (f, x, y) => {
+				const d = Math.hypot(x - 20, y - 20);
+				if (d < radius[f]) return [0, 200, 96, 255];
+				if (d < radius[f] + 1) return [0, 200, 96, 160]; // above the cut: opaque
+				if (d < radius[f] + 2) return [0, 200, 96, 96]; // below it: transparent
+				return [0, 0, 0, 0];
+			});
+			{
+				const { bytes } = await encodeGif(disc);
+				const decoded = await decodeAll(new Blob([bytes], { type: 'image/gif' }), 'image/gif');
+				same('a cut-out keeps every frame', decoded.length, 5);
+				for (let i = 0; i < decoded.length; i++) {
+					const diff = firstDifference(decoded[i].rgba, disc.frames[i].rgba, 40);
+					check(`cut-out frame ${i} is exactly the source, transparency included`, !diff, diff);
+				}
+				const layout = gifFrames(bytes);
+				same(
+					'a frame is told to clear itself exactly when the next one takes pixels away',
+					layout.map((f) => f.disposal),
+					[2, 2, 1, 1, 1]
+				);
+			}
+			{
+				// Growing all the way, so the only frame that takes pixels away is the
+				// first one again, when the loop comes round.
+				const grow = [6, 10, 14];
+				const swell = clip(40, 40, [60, 60, 60], (f, x, y) =>
+					Math.hypot(x - 20, y - 20) < grow[f] ? [0, 200, 96, 255] : [0, 0, 0, 0]
+				);
+				const layout = gifFrames((await encodeGif(swell)).bytes);
+				same('the last frame clears itself when the loop back to the first takes pixels away', layout.map((f) => f.disposal), [1, 1, 2]);
+			}
+
+			{
+				const still = clip(16, 16, [50, 50, 50], () => [64, 128, 192, 255]);
+				const { bytes, frames } = await encodeGif(still);
+				const decoded = await decodeAll(new Blob([bytes], { type: 'image/gif' }), 'image/gif');
+				same('a clip that never changes is one frame, shown for the whole of it', [frames, decoded.map((f) => f.ms)], [1, [150]]);
+			}
+
+			{
+				// A frame with nothing in it at all, between two that have something.
+				const blink = clip(20, 20, [100, 100, 100], (f, x, y) =>
+					f === 1 ? [0, 0, 0, 0] : x > 4 && x < 15 && y > 4 && y < 15 ? [200, 200, 0, 255] : [0, 0, 0, 0]
+				);
+				const { bytes } = await encodeGif(blink);
+				const decoded = await decodeAll(new Blob([bytes], { type: 'image/gif' }), 'image/gif');
+				const blank = decoded[1] && decoded[1].rgba.every((v, i) => i % 4 !== 3 || v === 0);
+				check('a fully transparent frame comes back fully transparent', blank);
+				check('and the frame after it is whole again', !firstDifference(decoded[2].rgba, blink.frames[2].rgba, 20));
+			}
+
+			{
+				// More colours than a palette holds: close, not exact.
+				const ramp = clip(64, 64, [80, 80], (f, x, y) => [(x * 4 + f) % 256, y * 4, (x + y) * 2, 255]);
+				const { bytes, palette } = await encodeGif(ramp);
+				const decoded = await decodeAll(new Blob([bytes], { type: 'image/gif' }), 'image/gif');
+				let err = 0;
+				const src = ramp.frames[0].rgba;
+				for (let p = 0; p < src.length; p += 4) {
+					for (let c = 0; c < 3; c++) err += Math.abs(decoded[0].rgba[p + c] - src[p + c]);
+				}
+				const mean = err / ((src.length / 4) * 3);
+				check(`a 4096-colour frame quantizes closely (mean error ${mean.toFixed(2)} of 255)`, mean < 6);
+				check('and the palette leaves the last slot for transparency', palette.length <= 255);
+			}
+
+			// ------------------------------------------------- sticker → file to keep
+
+			section('A sticker becomes a GIF, or a PNG when it is still');
+
+			const movingGif = new Blob([(await encodeGif(moving)).bytes], { type: 'image/gif' });
+			same('sniffing tells a GIF from its bytes', sniffImageType(new Uint8Array(await movingGif.slice(0, 16).arrayBuffer())), 'image/gif');
+			{
+				const opened = await openFrames(movingGif);
+				same('an animation opens with its size and frame count', [opened.width, opened.height, opened.count], [W, H, 5]);
+				opened.close();
+				const kept = await stickerFile(movingGif);
+				same('an animated sticker is kept as a GIF', [kept.ext, kept.frames, kept.width, kept.height], ['gif', 5, W, H]);
+				const again = await decodeAll(kept.blob, 'image/gif');
+				const wanted = [0, 1, 2, 4, 5];
+				check(
+					'and shows the same frames as the original',
+					again.every((f, i) => !firstDifference(f.rgba, moving.frames[wanted[i]].rgba, W))
+				);
+			}
+			{
+				const c = new OffscreenCanvas(24, 24);
+				const ctx = c.getContext('2d');
+				ctx.fillStyle = 'rgb(40, 80, 160)';
+				ctx.fillRect(4, 4, 16, 16);
+				const png = await c.convertToBlob({ type: 'image/png' });
+				const kept = await stickerFile(png);
+				same('a still sticker is kept as a PNG', [kept.ext, kept.frames], ['png', 1]);
+				const back = await decodeAll(kept.blob, 'image/png');
+				same('with its transparency', [Array.from(back[0].rgba.slice(0, 4)), Array.from(back[0].rgba.slice((10 * 24 + 10) * 4, (10 * 24 + 10) * 4 + 4))], [[0, 0, 0, 0], [40, 80, 160, 255]]);
+			}
+			same('something that is not an image opens as nothing', await openFrames(new Blob(['<!doctype html>'])), null);
+
+			// ------------------------------------------------------------ links
+
+			section('Reading comment links');
+
+			same(
+				'every link in pasted text, once, without trailing punctuation',
+				linksIn('look https://vm.tiktok.com/ZMa/, and\nhttps://vm.tiktok.com/ZMb/ https://vm.tiktok.com/ZMa/.'),
+				['https://vm.tiktok.com/ZMa/', 'https://vm.tiktok.com/ZMb/']
+			);
+			same(
+				'a full comment link names its post and comment without a request',
+				await resolveLink('https://www.tiktok.com/@a/video/111?share_comment_id=222&share_item_id=111'),
+				{ post: '111', comment: '222' }
+			);
+			await throwsLike('a link to somewhere else is refused', () => resolveLink('https://example.com/video/1'), (e) => /not a TikTok link/.test(e.message));
+
+			const sticker = {
+				animated_url: {
+					high_resolution_url: { url_list: ['https://s.ibyteimg.com/a-high.awebp'] },
+					low_resolution_url: { url_list: ['https://s.ibyteimg.com/a-low.awebp'] },
+				},
+				static_url: { high_resolution_url: { url_list: ['https://s.ibyteimg.com/s-high.webp', 'https://s.ibyteimg.com/a-high.awebp'] } },
+			};
+			same('sticker candidates: moving before still, high before low, no repeats', stickerUrls(sticker), [
+				'https://s.ibyteimg.com/a-high.awebp',
+				'https://s.ibyteimg.com/a-low.awebp',
+				'https://s.ibyteimg.com/s-high.webp',
+			]);
+			const image = {
+				origin_url: { url_list: ['https://p16.cdn/o~tplv-x-image-origin.image?a=1', 'https://p16.cdn/o~tplv-x-image-origin.jpeg?a=1'] },
+				crop_url: { url_list: ['https://p16.cdn/c~tplv-x-image-medium.image?a=1', 'https://p16.cdn/c~tplv-x-image-medium.jpeg?a=1'] },
+			};
+			same('photo candidates: JPEG before the HEIC .image links, original before the crop', photoUrls(image), [
+				'https://p16.cdn/o~tplv-x-image-origin.jpeg?a=1',
+				'https://p16.cdn/c~tplv-x-image-medium.jpeg?a=1',
+				'https://p16.cdn/o~tplv-x-image-origin.image?a=1',
+				'https://p16.cdn/c~tplv-x-image-medium.image?a=1',
+			]);
+			same(
+				'the record drops the [Sticker] placeholder and notes the thread',
+				replyRecord(
+					{ cid: '222', aweme_id: '111', text: '[Sticker]', user: { uid: '9', unique_id: 'who', nickname: 'Who' }, create_time: 5, digg_count: 3, cmt_sticker_struct: sticker },
+					'111',
+					{ cid: '200' }
+				),
+				{ id: '222', post: '111', thread: '200', author: { id: '9', uniqueId: 'who', nickname: 'Who' }, text: '', createTime: 5, diggCount: 3, kind: 'sticker' }
+			);
+			same('a comment with neither has nothing to keep', replyMedia({ cid: '1', text: 'hi' }), { sticker: [], photos: [] });
+
+			// ------------------------------------------------------- link to files
+
+			section('From a link to replies/ and archive.json');
+
+			const jpeg = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0, 16, 74, 70, 73, 70, 0, 1])], { type: 'image/jpeg' });
+			const heic = new Blob([new Uint8Array([0, 0, 0, 0x1c, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63])], { type: 'image/heic' });
+			const user = { uid: '9', unique_id: 'stickerfan', nickname: 'Sticker Fan' };
+			const comments = {
+				// A sticker reply, inside the thread of comment 200.
+				222: {
+					cid: '200',
+					text: 'top',
+					user,
+					reply_comment: [{ cid: '222', aweme_id: '111', text: '[Sticker] same', user, create_time: 1700000000, digg_count: 7, cmt_sticker_struct: { animated_url: { high_resolution_url: { url_list: ['https://p16-sticker.ibyteimg.com/sticker.awebp'] } } } }],
+				},
+				// A comment with two photos in it.
+				333: {
+					cid: '333',
+					aweme_id: '111',
+					text: 'look',
+					user,
+					create_time: 1700000100,
+					image_list: [image, { origin_url: { url_list: ['https://p16.cdn/second~tplv-x-image-origin.jpeg'] } }],
+				},
+				// Words only.
+				444: { cid: '444', aweme_id: '111', text: 'just words', user },
+			};
+
+			/** Every request the stub answered, so a test can say which were and weren't made. */
+			let asked = [];
+			let limit = false;
+			globalThis.fetch = async (url, init = {}) => {
+				url = String(url);
+				asked.push({ url, credentials: init.credentials });
+				const respond = (body, type, extra = {}) => {
+					const res = new Response(body, { status: extra.status || 200, headers: { 'Content-Type': type } });
+					if (extra.url) Object.defineProperty(res, 'url', { value: extra.url });
+					return res;
+				};
+				if (url.startsWith('https://vm.tiktok.com/ZMsticker')) {
+					return respond('<!doctype html>', 'text/html', { url: 'https://www.tiktok.com/@poster/video/111?_r=1&share_comment_id=222&share_item_id=111' });
+				}
+				if (url.startsWith('https://vm.tiktok.com/ZMpost')) {
+					return respond('<!doctype html>', 'text/html', { url: 'https://www.tiktok.com/@poster/video/111?_r=1' });
+				}
+				if (url.startsWith('https://www.tiktok.com/api/comment/list/')) {
+					if (limit) return respond('', 'text/plain', { status: 429 });
+					const id = new URL(url).searchParams.get('insert_ids');
+					const top = comments[id];
+					return respond(JSON.stringify({ status_code: 0, comments: top ? [top] : [] }), 'application/json');
+				}
+				if (url.includes('sticker.awebp')) return respond(movingGif, 'image/webp');
+				if (url.includes('.jpeg')) return respond(jpeg, 'image/jpeg');
+				if (url.includes('.image')) return respond(heic, 'image/heic');
+				return respond('', 'text/plain', { status: 404 });
+			};
+
+			reset();
+			await scanDisk();
+			const state = emptyState();
+
+			{
+				asked = [];
+				const res = await saveReply(state, 'https://vm.tiktok.com/ZMsticker/');
+				same('a short link is followed to the comment it names', res.status, 'saved');
+				const list = asked.find((a) => a.url.includes('/api/comment/list/'));
+				const q = new URL(list.url).searchParams;
+				same(
+					'the comment is asked for as the iPhone app, by its id, on its post',
+					[q.get('aid'), q.get('device_platform'), q.get('insert_ids'), q.get('aweme_id')],
+					['1233', 'iphone', '222', '111']
+				);
+				check('and nothing is asked with the account’s cookies', asked.every((a) => a.credentials === 'omit'), JSON.stringify(asked));
+				const file = await readBlob(['replies'], '222.gif');
+				check('the sticker lands in replies/ as <comment>.gif', !!file);
+				same('as a real GIF', file && sniffImageType(new Uint8Array(await file.slice(0, 16).arrayBuffer())), 'image/gif');
+				same('the listing knows it at once', disk.replies.get('222'), ['222.gif']);
+				const rec = state.replies['222'];
+				same(
+					'archive.json records who, what, where, and the file',
+					[rec.post, rec.thread, rec.author.uniqueId, rec.text, rec.kind, rec.diggCount, rec.files],
+					['111', '200', 'stickerfan', 'same', 'sticker', 7, ['replies/222.gif']]
+				);
+				check('and when it was saved', rec.savedAt > 0);
+			}
+
+			{
+				asked = [];
+				const res = await saveReply(state, 'https://www.tiktok.com/@poster/video/111?share_comment_id=222&share_item_id=111');
+				same('a comment already in the folder is not fetched again', [res.status, asked.length], ['have', 0]);
+			}
+
+			{
+				asked = [];
+				const res = await saveReply(state, 'https://www.tiktok.com/@poster/video/111?share_comment_id=333&share_item_id=111');
+				same('two photos in one comment are numbered', disk.replies.get('333'), ['333_01.jpg', '333_02.jpg']);
+				const fetched = asked.filter((a) => a.url.includes('p16.cdn')).map((a) => a.url.split('/').pop().split('~')[0]);
+				same('the JPEG is the one fetched, not the HEIC', fetched, ['o', 'second']);
+				same('a photo reply says so', [state.replies['333'].kind, res.files], ['photo', ['replies/333_01.jpg', 'replies/333_02.jpg']]);
+			}
+
+			await throwsLike(
+				'a link to a post rather than a comment says which it is',
+				() => saveReply(state, 'https://vm.tiktok.com/ZMpost/'),
+				(e) => /links to a post, not a comment/.test(e.message)
+			);
+			await throwsLike(
+				'a comment with only words in it is refused',
+				() => saveReply(state, 'https://www.tiktok.com/@p/video/111?share_comment_id=444'),
+				(e) => /no sticker or photo/.test(e.message)
+			);
+			await throwsLike(
+				'a comment TikTok no longer has is reported as gone',
+				() => saveReply(state, 'https://www.tiktok.com/@p/video/111?share_comment_id=555'),
+				(e) => /no longer has that comment/.test(e.message)
+			);
+			limit = true;
+			await throwsLike(
+				'a 429 is RateLimited, which stops a batch, and is not retried',
+				async () => {
+					asked = [];
+					try {
+						await saveReply(state, 'https://www.tiktok.com/@p/video/111?share_comment_id=666');
+					} finally {
+						same('— one request, not three', asked.length, 1);
+					}
+				},
+				(e) => e instanceof RateLimited
+			);
+			limit = false;
+			check('nothing that failed was recorded', !state.replies['444'] && !state.replies['555'] && !state.replies['666']);
+
+			section('Scanning, and the copy viewer.html carries');
+
+			{
+				disk.replies.clear();
+				seed('replies/777.png', jpeg);
+				seed('replies/not-ours.txt', jpeg);
+				await scanDisk();
+				same('a scan reads replies/ by comment id', [...disk.replies.keys()].sort(), ['222', '333', '777']);
+				remove('replies/333_02.jpg');
+				remove('replies/777.png');
+				await scanDisk();
+				same('and lets go of what has been deleted', [disk.replies.get('333'), disk.replies.has('777')], [['333_01.jpg'], false]);
+			}
+			{
+				const slim = slimReplies(state);
+				same('viewer.html gets each reply with its post and its files', slim.map((r) => [r.id, r.post, r.files.length]).sort(), [
+					['222', '111', 1],
+					['333', '111', 2],
+				]);
+			}
+
+			lines.push('');
+			lines.push(
+				`<span class="${failures ? 'fail' : 'pass'}">${checks - failures}/${checks} passed${failures ? `, ${failures} FAILED` : ''}</span>`
+			);
+			out.innerHTML = lines.join('\n');
+			document.title = failures ? `FAIL ${failures}` : `PASS ${checks}`;
+		</script>
+	</body>
+</html>
