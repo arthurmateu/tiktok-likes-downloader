@@ -230,6 +230,8 @@
 			b.appendChild(
 				el('p', 'muted', `Reading live from “${status.folder || 'the archive folder'}”. This page is current.`)
 			);
+			const last = lastRunLine(status.lastRun);
+			if (last) b.appendChild(last);
 		}
 
 		const row = el('div', 'row');
@@ -237,9 +239,13 @@
 		sync.disabled = !!status.syncing;
 		sync.addEventListener('click', async () => {
 			sync.disabled = true;
-			const res = await call('sync', {}, 20000);
+			sync.textContent = 'Starting…';
+			// Long, because with the archive page closed the extension opens it out of
+			// sight first, and it reads the whole folder before it can begin.
+			const res = await call('sync', {}, 120000);
 			if (!res || !res.ok) {
 				b.appendChild(el('p', 'muted', `Could not start: ${(res && res.error) || 'no response'}`));
+				sync.textContent = 'Sync likes';
 				sync.disabled = false;
 				return;
 			}
@@ -252,6 +258,18 @@
 		row.append(sync, open);
 		b.appendChild(row);
 		b.classList.remove('hidden');
+	}
+
+	/**
+	 * How the last sync ended. A sync started here usually runs with no archive
+	 * page open, so nothing else would ever say that it stopped, or why.
+	 */
+	function lastRunLine(run) {
+		if (!run || !run.at) return null;
+		const when = new Date(run.at).toLocaleString();
+		if (run.error) return el('p', 'muted', `The last sync (${when}) stopped: ${run.error}`);
+		const failed = run.failed ? `, ${run.failed.toLocaleString()} failed` : '';
+		return el('p', 'muted', `Last sync ${when}: ${(run.saved || 0).toLocaleString()} new post(s) saved${failed}.`);
 	}
 
 	function showBanner(kind) {

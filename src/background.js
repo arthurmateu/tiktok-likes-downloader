@@ -14,18 +14,48 @@ const ext = globalThis.browser ?? globalThis.chrome;
 
 const ARCHIVE_URL = ext.runtime.getURL('src/archive/archive.html');
 
-/** @type {Set<chrome.runtime.Port>} */
+/**
+ * Every archive page: the tabs, and the one run out of sight for the Library
+ * (see startEngine), which is the port with no `sender.tab`.
+ *
+ * @type {Set<chrome.runtime.Port>}
+ */
 const archivePorts = new Set();
+
+/**
+ * The page whose sync or song pass is running — one at a time, whichever page
+ * started it. Two pages each holding archive.json in memory and both writing
+ * it would leave whichever finished last, and lose the other's run.
+ *
+ * @type {chrome.runtime.Port | null}
+ */
+let syncHolder = null;
+
+/** How the last run went, as the page that ran it put it — for a Library asking after it has gone. */
+let lastRun = null;
 
 ext.runtime.onConnect.addListener((port) => {
 	if (port.name !== 'archive') return;
 	archivePorts.add(port);
-	port.onDisconnect.addListener(() => archivePorts.delete(port));
+	port.onDisconnect.addListener(() => {
+		archivePorts.delete(port);
+		if (syncHolder === port) syncHolder = null;
+		if (engine && engine.port === port) engine.port = null;
+	});
 	port.onMessage.addListener((msg) => handleArchiveMessage(msg, port));
+	// A tab is now what holds the archive; one page holding it is enough.
+	if (port.sender && port.sender.tab) closeIdleEngine();
 });
 
-function broadcast(type, payload) {
+/** An archive page open in a tab, if there is one. */
+function archiveTab() {
+	for (const port of archivePorts) if (port.sender && port.sender.tab) return port;
+	return null;
+}
+
+function broadcast(type, payload, except = null) {
 	for (const port of archivePorts) {
+		if (port === except) continue;
 		try {
 			port.postMessage({ type, payload });
 		} catch (_) {
@@ -42,7 +72,8 @@ ext.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 	// Checked before the broadcast below: these come from a tab too, but they are
 	// requests with an answer, not collector output to fan out.
 	if (msg.type === 'viewer-token') {
-		viewerToken().then((token) => sendResponse({ ok: true, token }));
+		// The version too, for the page run out of sight: its runtime has no getManifest.
+		viewerToken().then((token) => sendResponse({ ok: true, token, version: ext.runtime.getManifest().version }));
 		return true;
 	}
 	if (msg.type === 'viewer-request') {
@@ -119,8 +150,7 @@ let viewerReqId = 0;
 /** @type {Map<number, (payload: any) => void>} */
 const viewerWaiting = new Map();
 
-function askArchivePage(cmd, args) {
-	const port = archivePorts.values().next().value;
+function askArchivePage(port, cmd, args) {
 	const rid = ++viewerReqId;
 	return new Promise((resolve) => {
 		viewerWaiting.set(rid, resolve);
@@ -142,8 +172,111 @@ async function handleViewerRequest(msg) {
 	// Answered here, not by the archive page: the helper needs no folder handle,
 	// so the button works with that page closed.
 	if (msg.cmd === 'show-in-folder') return showInFolder(msg.args && msg.args.path);
-	if (!archivePorts.size) return { ok: false, error: 'no-archive-page' };
-	return askArchivePage(msg.cmd, msg.args);
+
+	// Whoever is running a sync, so that its progress is what the Library sees;
+	// then a tab; then the page already running out of sight.
+	const page = syncHolder || archiveTab() || (engine && engine.port);
+	if (page) {
+		const res = await askArchivePage(page, msg.cmd, msg.args);
+		// The last run may have been another page's — the one run out of sight,
+		// closed since — and this worker heard about every run.
+		if (msg.cmd === 'status' && res && res.ok && lastRun) res.lastRun = lastRun;
+		return res;
+	}
+
+	// No page at all. With the helper one can be run out of sight, which is all a
+	// sync needs — so the Library can start one with the archive page closed.
+	const info = await engineCanRun();
+	if (!info) return { ok: false, error: 'no-archive-page' };
+	if (msg.cmd === 'status') {
+		return { ok: true, ready: true, syncing: false, folder: folderLabel(info.root), lastRun };
+	}
+	if (msg.cmd === 'sync') {
+		const started = await startEngine();
+		if (!started.ok) return started;
+		// A tab that opened meanwhile closed it again, and is as good to ask.
+		const ready = syncHolder || archiveTab() || (engine && engine.port);
+		if (!ready) return { ok: false, error: 'the archiver closed before the sync could start' };
+		return askArchivePage(ready, msg.cmd, msg.args);
+	}
+	// 'state': nothing newer to give than what viewer.html was written with at the
+	// end of the last run, which the Library already has.
+	return { ok: false, error: 'no-archive-page' };
+}
+
+// -------------------------------------------------------------- out of sight
+
+/**
+ * The archive page, run as an offscreen document when the Library asks for a
+ * sync with no archive tab open.
+ *
+ * A sync is the archive page's work: the list arrives there, and every file is
+ * fetched there and written through its storage backend. Without the helper
+ * that backend is a folder permission granted in a tab, which nothing out of
+ * sight can ask for; with it, the folder is the helper's, and the same page can
+ * do the whole run unseen. An offscreen document gets nothing but
+ * chrome.runtime, and that is all the page needs once the helper is writing.
+ *
+ * Started by the first Sync from the Library, it closes itself once it has sat
+ * idle for a while (ENGINE_IDLE_MS in archive.js), and is closed at once when an
+ * archive tab opens — an idle one, that is; one mid-run finishes first.
+ *
+ * @type {{ port: chrome.runtime.Port | null, ready: Promise<any>, announce: (res: any) => void } | null}
+ */
+let engine = null;
+const ENGINE_PATH = 'src/archive/archive.html?engine';
+/** Long enough to read a big archive.json and list the folder behind it. */
+const ENGINE_START_MS = 60000;
+
+/** The helper's answer when a page can run out of sight, null when it can't. */
+async function engineCanRun() {
+	if (!ext.offscreen) return null;
+	const info = await ensureHelper();
+	return info.ok && info.rootOk ? info : null;
+}
+
+function folderLabel(path) {
+	return String(path || '').split(/[\\/]/).filter(Boolean).pop() || path;
+}
+
+/** Resolves once the page has read the folder: `{ ok }`, or `{ ok: false, error }` saying why it couldn't. */
+function startEngine() {
+	if (engine) return engine.ready;
+	const state = { port: null, ready: null, announce: null };
+	state.ready = new Promise((resolve) => (state.announce = resolve));
+	engine = state;
+
+	ext.offscreen
+		.createDocument({
+			url: ENGINE_PATH,
+			reasons: ['BLOBS'],
+			justification: 'Runs a sync the archive’s Library asked for while the archive page is closed: fetches each post as a blob and hands it to the local helper to write.',
+		})
+		.catch(() => {
+			// Already open: left by a worker before this one. It finds its way back
+			// to this one by itself (see channel() in archive.js) and says so the same
+			// way a new one does, so it is waited for like one.
+		});
+
+	const timer = setTimeout(
+		() => state.announce({ ok: false, error: `the archiver did not start within ${ENGINE_START_MS / 1000}s` }),
+		ENGINE_START_MS
+	);
+	state.ready.then((res) => {
+		clearTimeout(timer);
+		if (!res.ok && engine === state) closeEngine();
+	});
+	return state.ready;
+}
+
+function closeEngine() {
+	engine = null;
+	ext.offscreen.closeDocument().catch(() => {});
+}
+
+/** Unless it is mid-run, or still starting for a Sync that is waiting on it. */
+function closeIdleEngine() {
+	if (engine && engine.port && syncHolder !== engine.port) closeEngine();
 }
 
 // --------------------------------------------------------------- local helper
@@ -336,6 +469,45 @@ async function handleArchiveMessage(msg, port) {
 			viewerWaiting.delete(msg.rid);
 			resolve(msg.payload);
 		}
+		return;
+	}
+
+	// The page run out of sight, done reading the folder — or back after this
+	// worker restarted, in which case it is one this worker never started.
+	if (msg.cmd === 'engine-ready') {
+		if (!engine) engine = { port: null, ready: Promise.resolve(msg), announce() {} };
+		engine.port = port;
+		engine.announce({ ok: !!msg.ok, error: msg.error || undefined });
+		if (!msg.ok || archiveTab()) closeIdleEngine();
+		return;
+	}
+	if (msg.cmd === 'engine-idle') {
+		if (engine && engine.port === port) closeIdleEngine();
+		return;
+	}
+
+	if (msg.cmd === 'claim-sync') {
+		if (syncHolder && syncHolder !== port && archivePorts.has(syncHolder)) {
+			reply({
+				ok: false,
+				error: syncHolder.sender && syncHolder.sender.tab
+					? 'a sync is already running on the archiver page'
+					: 'a sync started from the Library is already running in the background',
+			});
+		} else {
+			syncHolder = port;
+			reply({ ok: true });
+		}
+		return;
+	}
+	if (msg.cmd === 'release-sync') {
+		if (syncHolder === port) syncHolder = null;
+		if (msg.lastRun) lastRun = msg.lastRun;
+		// Every other page is now holding an archive.json older than the one just
+		// written, and would write it back over this run if it synced from it.
+		broadcast('archive-changed', {}, port);
+		if (archiveTab()) closeIdleEngine();
+		reply({ ok: true });
 		return;
 	}
 

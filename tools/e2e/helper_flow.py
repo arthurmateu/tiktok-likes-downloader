@@ -36,6 +36,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.request
 from pathlib import Path
 
@@ -99,12 +100,19 @@ def find_browser() -> tuple[str, str] | None:
     return None
 
 
+# Windows: no console window for any of the shells below. A test that runs
+# while someone is using the machine must not flash windows or take the focus.
+QUIET = {"creationflags": subprocess.CREATE_NO_WINDOW} if helper.WINDOWS else {}
+
+
 def outside(command: str) -> None:
-    """Windows: run `command` from a process the WMI service starts, outside any app package."""
+    """Windows: run `command` from a process the WMI service starts, outside any app package, hidden."""
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{CommandLine='{command}'}} | Out-Null"],
-        capture_output=True, check=True,
+         "$hidden = New-CimInstance -ClassName Win32_ProcessStartup -ClientOnly -Property @{ShowWindow = [uint16]0}; "
+         f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+         f"-Arguments @{{CommandLine='{command}'; ProcessStartupInformation=$hidden}} | Out-Null"],
+        capture_output=True, check=True, **QUIET,
     )
 
 
@@ -129,11 +137,14 @@ def registered_manifest(kind: str) -> dict:
     return {}
 
 
-def launch(exe: str) -> None:
+def launch(exe: str, offline: bool = False) -> None:
+    """`offline`: TikTok unreachable, so a sync gets as far as opening its tab and sends TikTok nothing."""
     global browser_proc
     args = [exe, "--headless", f"--user-data-dir={PROFILE}", f"--remote-debugging-port={PORT}", "--no-first-run",
             "--no-default-browser-check", "--window-size=1280,900", f"--load-extension={REPO}",
             "--disable-features=DisableLoadExtensionCommandLineSwitch", "about:blank"]
+    if offline:
+        args.insert(-1, "--host-resolver-rules=MAP *.tiktok.com ~NOTFOUND,MAP tiktok.com ~NOTFOUND")
     if helper.WINDOWS:
         quoted = " ".join(f'"{a}"' if " " in a else a for a in args)
         outside(f'cmd.exe /c "set TTARCHIVE_TEST_NO_WINDOWS=1&& set TTARCHIVE_TEST_PICK={ARCHIVE}&& {quoted}"')
@@ -163,7 +174,7 @@ def stop_browser() -> None:
             ["powershell", "-NoProfile", "-Command",
              f"Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{SCRATCH.name}*' }} | "
              "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"],
-            capture_output=True,
+            capture_output=True, **QUIET,
         )
     time.sleep(1)
 
@@ -273,7 +284,23 @@ def main():
         vids, photos = build_archive(real)
         launch(exe)
         try:
-            run(real, vids, photos)
+            library = run(real, vids, photos)
+        except Exception:
+            # Would otherwise vanish under the sys.exit below.
+            traceback.print_exc()
+            check("the run got to the end", False)
+            return
+        finally:
+            stop_browser()
+        # Its own start, on the same profile: a browser just started has no
+        # archive page open, which is the case under test, and TikTok can be cut
+        # off for this part alone — headless Chromium stops playing HEVC with it.
+        launch(exe, offline=True)
+        try:
+            library_sync(CDP(PORT), library)
+        except Exception:
+            traceback.print_exc()
+            check("the Library's sync got to the end", False)
         finally:
             stop_browser()
     finally:
@@ -351,7 +378,68 @@ def run(real, vids, photos):
         c.eval(t, "document.querySelector('.lb-folder').click(); 1")
         time.sleep(3)
         check("…and its Show in folder reaches the helper too", any('"ok": true' in l for l in new_log_lines(before)))
+        c.eval(t, "document.getElementById('lbClose').click(); 1")
+    return tab and tab["url"]
 
+
+def engine(c):
+    return c.find(lambda t: t["url"].endswith("/src/archive/archive.html?engine"))
+
+
+def library_sync(c, url):
+    """--- 6. the Library syncs with the archive page closed, run out of sight"""
+    if not url:
+        check("a Library address to open", False)
+        return
+    # --load-extension installs it afresh on every start, and a fresh install
+    # opens an archive page; the person this is about has none open.
+    time.sleep(2)
+    for x in c.targets():
+        if x["type"] == "page" and x["url"] == ARCHIVE_URL:
+            c.call("Target.closeTarget", {"targetId": x["targetId"]})
+    _, t = c.open(url)
+    c.wait(t, "document.readyState === 'complete' && !!document.getElementById('banner')", timeout=15)
+    banner = "document.getElementById('banner').innerText"
+    said = lambda: " ".join((c.eval(t, banner) or "").split())
+    c.wait(t, f"/Connected|closed/.test({banner})", timeout=15)
+    check("with the archive page closed, the Library is still connected, with Sync",
+          "Connected to the extension" in said() and c.eval(t, "!document.querySelector('#banner .btn.primary').disabled"),
+          said()[:120])
+    check("…and nothing runs out of sight until it is asked to sync", engine(c) is None)
+
+    c.eval(t, "document.querySelector('#banner .btn.primary').click(); 1")
+    until(c, t, f"/Syncing|Could not start/.test({banner})", 90)
+    check("Sync likes starts a run out of sight", engine(c) is not None and "Syncing" in said(), said()[:160])
+
+    # An archive page opened mid-run neither closes it nor runs a second sync beside it.
+    c.open(ARCHIVE_URL)
+    s = archive_page(c)
+    until(c, s, "/Found|Could not/.test(document.getElementById('log').innerText)", 30)
+    check("…an archive page opened meanwhile leaves it running", engine(c) is not None)
+    c.eval(s, "document.getElementById('startSync').click(); 1")
+    until(c, s, "/Not started/.test(document.getElementById('log').innerText)", 10)
+    log = text(c, s, "log")
+    check("…and its own Sync is refused while it runs", "already running in the background" in log,
+          " ".join(l for l in log.splitlines() if "Not started" in l)[-160:])
+
+    # TikTok can't be reached, so the run ends on the tab never loading.
+    until(c, t, f"/stopped:/.test({banner})", 90)
+    check("the Library says how the run ended", "did not load the profile" in said(), said()[:200])
+    check("the archive page reads archive.json again after it",
+          until(c, s, "/reading it again/.test(document.getElementById('log').innerText)", 10))
+    end = time.time() + 10
+    while engine(c) and time.time() < end:
+        time.sleep(0.3)
+    check("…and the page out of sight closes, the archive page being open", engine(c) is None)
+
+
+def until(c, s, expr, timeout):
+    """c.wait, as a yes or no rather than an exception."""
+    try:
+        c.wait(s, expr, timeout=timeout)
+        return True
+    except TimeoutError:
+        return False
 
 if __name__ == "__main__":
     main()

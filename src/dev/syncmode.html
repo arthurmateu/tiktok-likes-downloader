@@ -40,7 +40,9 @@
 						postMessage: noop,
 						name: 'archive',
 					}),
-					sendMessage: () => Promise.resolve(),
+					// No helper installed, as the background says when there isn't one.
+					sendMessage: (msg) =>
+						Promise.resolve(msg && msg.type === 'helper-ensure' ? { ok: false, error: 'no-helper' } : undefined),
 					onMessage: { addListener: noop },
 					getManifest: () => ({ host_permissions: ['*://*.tiktok.com/*'] }),
 					getURL: (p) => p,

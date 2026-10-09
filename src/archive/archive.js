@@ -31,6 +31,15 @@ import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
 
 const $ = (id) => document.getElementById(id);
 
+/**
+ * This page, run by the background as an offscreen document for a Library that
+ * asked to sync with no archive tab open — see startEngine in background.js.
+ * It does everything it does in a tab except draw a Library nobody can see; the
+ * one asking is that Library.
+ */
+const ENGINE = new URLSearchParams(location.search).has('engine');
+const library = ENGINE ? { render() {}, refresh() {} } : { render: renderLibrary, refresh: refreshPresence };
+
 const app = {
 	state: null,
 	queue: null,
@@ -51,6 +60,16 @@ const app = {
 	songs: { running: false, stop: false, uniqueId: '' },
 	/** Counts syncs, so anything still waiting on an earlier one can tell it is over. */
 	run: 0,
+	/** The folder being read, while it is — see afterFolderReady. */
+	loading: null,
+	/** Done starting up, folder read or not. */
+	booted: false,
+	/** A sync that has stopped harvesting and is writing up. */
+	finishing: false,
+	/** The last line the log showed as an error. */
+	lastError: null,
+	/** How the last run on this page ended, for the Library: `{ reason, at, saved, failed, error }`. */
+	lastRun: null,
 };
 
 // ---------------------------------------------------------------- background
@@ -97,10 +116,60 @@ function channel() {
 		}
 		// A sync in progress is fed through this port — it is how the collector's
 		// items reach the folder. Waiting for the next request to reopen it would
-		// silently drop everything harvested in between.
-		if (app.syncing) channel();
+		// silently drop everything harvested in between. A worker that restarted
+		// has also forgotten whose run it is, so it is told again.
+		if (app.syncing || app.songs.running) {
+			channel();
+			ask('claim-sync');
+		}
+		// Out of sight, nothing else would ever reopen it: the Library reaches this
+		// page through the worker, and a new worker doesn't know it is here.
+		if (ENGINE && app.booted) announceEngine();
 	});
 	return port;
+}
+
+/** Tell the background this page is up, out of sight, and whether it has a folder to sync. */
+function announceEngine() {
+	post({
+		cmd: 'engine-ready',
+		ok: !!app.state,
+		error: app.state ? null : app.lastError || 'the archive folder could not be read',
+	});
+	touchEngine();
+}
+
+/** How long the page run out of sight stays up with nothing to do. */
+const ENGINE_IDLE_MS = 3 * 60 * 1000;
+let idleTimer = null;
+
+/** Out of sight: put off closing for another ENGINE_IDLE_MS. */
+function touchEngine() {
+	if (!ENGINE) return;
+	clearTimeout(idleTimer);
+	idleTimer = setTimeout(() => {
+		if (app.syncing || app.songs.running) touchEngine();
+		else post({ cmd: 'engine-idle' });
+	}, ENGINE_IDLE_MS);
+}
+
+/**
+ * Only one page runs a sync or song pass at a time; see `syncHolder` in
+ * background.js. Resolves to null once this one may, or to why not.
+ */
+async function claimSync() {
+	const res = await ask('claim-sync');
+	if (res.ok) return null;
+	// A worker from before there was anything to claim — Chromium keeps an
+	// unpacked extension's old one until it is reloaded. It can't run a page out
+	// of sight either, so there is no other run to be kept from.
+	if (/^unknown command/.test(res.error || '')) return null;
+	return res.error || 'the extension worker did not answer';
+}
+
+function releaseSync() {
+	ask('release-sync', { lastRun: app.lastRun });
+	touchEngine();
 }
 
 function ask(cmd, extra = {}, { timeout = 60000 } = {}) {
@@ -156,6 +225,7 @@ channel();
 // ---------------------------------------------------------------- logging
 
 function log(msg, cls = '') {
+	if (cls === 'err') app.lastError = msg;
 	const el = $('log');
 	el.classList.remove('hidden');
 	const line = document.createElement('span');
@@ -215,7 +285,23 @@ function scanningMsg(files) {
 		: 'Reading your archive folder…';
 }
 
+/**
+ * Read the folder: archive.json, then the listing. Kept on `app.loading` while
+ * it runs, because a request from the Library can arrive in the middle — and a
+ * sync started against a half-read listing re-downloads everything not yet
+ * listed.
+ */
 async function afterFolderReady() {
+	const loading = readFolder();
+	app.loading = loading;
+	try {
+		await loading;
+	} finally {
+		if (app.loading === loading) app.loading = null;
+	}
+}
+
+async function readFolder() {
 	$('folderName').textContent = fs.rootName();
 	$('folderName').title = fs.rootPath() || '';
 	$('openLibrary').classList.toggle('hidden', !fs.libraryURL());
@@ -246,13 +332,13 @@ async function afterFolderReady() {
 		// One file read is a fraction of that enumeration, so paying for it up front
 		// costs a moment and puts the Library on screen before the slow part starts.
 		app.state = await loadState();
-		renderLibrary(app.state);
+		library.render(app.state);
 
 		log('Scanning folder…');
 		showScanning(scanningMsg(0));
 		counts = await scanDisk({
 			onProgress: (files) => showScanning(scanningMsg(files)),
-			onBatch: refreshPresence,
+			onBatch: library.refresh,
 		});
 	} catch (err) {
 		// Left busy either way. Half the panel assumes app.state exists, and the
@@ -282,7 +368,7 @@ async function afterFolderReady() {
 
 	renderStats(counts);
 	log(summarise('Found', counts), 'ok');
-	renderLibrary(app.state);
+	library.render(app.state);
 }
 
 /**
@@ -399,7 +485,7 @@ $('rescan').addEventListener('click', async () => {
 		// lands through onBatch as it goes.
 		const counts = await scanDisk({
 			onProgress: (files) => showScanning(scanningMsg(files)),
-			onBatch: refreshPresence,
+			onBatch: library.refresh,
 		});
 		renderStats(counts);
 		log(summarise('Rescanned —', counts));
@@ -460,20 +546,27 @@ $('writeViewer').addEventListener('click', async () => {
  * A request from a generated viewer.html, relayed by the background through the
  * content script that runs on it. Chromium only — see src/content/viewer-bridge.js.
  */
-function onViewerRequest({ rid, cmd }) {
-	const respond = (payload) => port.postMessage({ cmd: 'viewer-response', rid, payload });
+async function onViewerRequest({ rid, cmd }) {
+	// Not on `port`: a worker that restarted while this waited on the folder has
+	// given this page a new one, and the answer is just as good over that.
+	const respond = (payload) => post({ cmd: 'viewer-response', rid, payload });
+	touchEngine();
 
 	if (cmd === 'status') {
 		respond({
 			ok: true,
 			ready: !!app.state,
-			syncing: app.syncing,
+			syncing: app.syncing || app.finishing,
 			folder: fs.rootName(),
 			seen: app.seen,
 			stats: app.queue ? { ...app.queue.stats } : null,
+			lastRun: app.lastRun,
 		});
 		return;
 	}
+
+	// Both read what the folder holds, which is half there while it is being read.
+	await app.loading;
 
 	if (cmd === 'state') {
 		if (!app.state) {
@@ -485,8 +578,12 @@ function onViewerRequest({ rid, cmd }) {
 	}
 
 	if (cmd === 'sync') {
-		if (app.syncing) {
+		if (app.syncing || app.finishing) {
 			respond({ ok: true, already: true });
+			return;
+		}
+		if (app.songs.running) {
+			respond({ ok: false, error: 'the song pass is running on the archiver page' });
 			return;
 		}
 		if (!app.state) {
@@ -495,6 +592,12 @@ function onViewerRequest({ rid, cmd }) {
 		}
 		if (!$('username').value.trim()) {
 			respond({ ok: false, error: 'no username known — set one on the archiver page once' });
+			return;
+		}
+		// Asked here rather than left to startSync, so the Library hears it.
+		const busy = await claimSync();
+		if (busy) {
+			respond({ ok: false, error: busy });
 			return;
 		}
 		// Answer before starting: startSync outlives this message by minutes.
@@ -530,6 +633,17 @@ function shareThrottle() {
 function onContentMessage(type, payload) {
 	if (type === 'viewer-request') {
 		onViewerRequest(payload || {});
+		return;
+	}
+
+	// Another page — the one run out of sight for the Library, or another tab —
+	// has just finished a run and written archive.json. What this page holds is
+	// the archive from before it, and a sync from that would write it back over
+	// the newer one.
+	if (type === 'archive-changed') {
+		if (!app.state || app.syncing || app.songs.running) return;
+		log('A sync from another page has just rewritten archive.json — reading it again.');
+		afterFolderReady();
 		return;
 	}
 
@@ -638,7 +752,7 @@ function makeQueue({ onHalt } = {}) {
 			// adds to it as it writes — and the grid is the only thing that hasn't
 			// heard. Same catching-up a scan's batches get, once per finished item, so
 			// a tile lights up as its files land rather than at the end of the run.
-			refreshPresence();
+			library.refresh();
 		},
 		onError: (rec, err) => log(`✗ ${rec.id}: ${err.message || err}`, 'err'),
 		onThrottle: (ev) => {
@@ -674,9 +788,17 @@ async function startSync({ full = false } = {}) {
 		log('Enter your TikTok username first.', 'err');
 		return;
 	}
+	const busy = await claimSync();
+	if (busy) {
+		log(`Not started: ${busy}. This page reads archive.json again once it has finished.`, 'err');
+		return;
+	}
+	// A second click while the claim was out.
+	if (app.syncing || app.finishing || app.songs.running) return;
 
 	const run = ++app.run;
 	app.syncing = true;
+	app.lastError = null;
 	app.seen = 0;
 	app.newItems = 0;
 	app.seenIds = new Set();
@@ -784,8 +906,26 @@ const ENDED = {
 async function finishSync(reason) {
 	if (!app.syncing) return;
 	app.syncing = false;
+	// Still a run to the Library until everything is written.
+	app.finishing = true;
 	$('stopSync').disabled = true;
+	// Before the write-up adds errors of its own.
+	const error = reason === 'error' ? app.lastError : null;
+	try {
+		await writeUp(reason);
+	} catch (err) {
+		log(`Could not finish writing up the run: ${(err && err.message) || err}`, 'err');
+		setSyncButtons(false);
+	} finally {
+		const stats = app.queue ? app.queue.stats : { done: 0 };
+		app.lastRun = { reason, at: Date.now(), saved: stats.done, failed: app.queue ? app.queue.failed.length : 0, error };
+		app.finishing = false;
+		// Whatever happened above, or no page could ever sync again.
+		releaseSync();
+	}
+}
 
+async function writeUp(reason) {
 	if (app.queue) {
 		log(`Harvest ${ENDED[reason] || reason}. Finishing ${app.queue.pending} queued downloads…`);
 		await app.queue.idle();
@@ -882,7 +1022,7 @@ async function finishSync(reason) {
 	// approaches that. Ending where it meant to is still finished.
 	if (reason === 'complete' || reason === 'caught-up') $('bar').style.width = '100%';
 	await saveState(app.state, { immediate: true });
-	renderLibrary(app.state);
+	library.render(app.state);
 	log('Done. archive.json written.', 'ok');
 	await writeViewerFile();
 	setSyncButtons(false);
@@ -1035,6 +1175,12 @@ async function fetchMissingSongs() {
 		log('Every photo post in the archive already has its song.', 'ok');
 		return;
 	}
+	const busy = await claimSync();
+	if (busy) {
+		log(`Not started: ${busy}.`, 'err');
+		return;
+	}
+	if (app.syncing || app.finishing || app.songs.running) return;
 
 	app.songs = { running: true, stop: false, uniqueId };
 	// The counters are the sync's, and they read the same way here: one post
@@ -1133,18 +1279,20 @@ async function finishSongs({ found, noLink }) {
 	const counts = await scanDisk();
 	renderStats(counts);
 	await saveState(app.state, { immediate: true });
-	renderLibrary(app.state);
+	library.render(app.state);
 	log(
 		`Song pass done — the archive now holds ${counts.songs.toLocaleString()} song(s). archive.json written.`,
 		'ok'
 	);
 	await writeViewerFile();
 	setSyncButtons(false);
+	releaseSync();
 }
 
 $('fetchSongs').addEventListener('click', () => {
 	fetchMissingSongs().catch((err) => {
 		log(`The song pass could not run: ${(err && err.message) || err}`, 'err');
+		if (app.songs.running) releaseSync();
 		app.songs.running = false;
 		setSyncButtons(false);
 	});
@@ -1264,8 +1412,10 @@ $('helperRetry').addEventListener('click', () => location.reload());
  * no-op.
  */
 async function checkHostAccess() {
+	// Out of sight there is neither, and nobody to ask.
+	if (!ext.permissions) return;
 	const origins = ext.runtime.getManifest().host_permissions || [];
-	if (!origins.length || !ext.permissions) return;
+	if (!origins.length) return;
 
 	try {
 		if (await ext.permissions.contains({ origins })) return;
@@ -1289,7 +1439,13 @@ async function checkHostAccess() {
 	// The local helper when it is installed, browser storage when it isn't.
 	const helperProblem = await fs.init();
 	if (helperProblem) showHelperProblem(helperProblem);
-	wireLibrary(() => app.state);
+	if (!ENGINE) wireLibrary(() => app.state);
+	// Browser storage is a folder permission granted in a tab, which nothing out
+	// of sight can ask for.
+	if (ENGINE && fs.backendId() !== 'helper') {
+		log('A sync from the Library with the archive page closed needs the local helper.', 'err');
+		return;
+	}
 
 	if (!fs.supported()) {
 		$('noFolder').textContent =
@@ -1321,7 +1477,13 @@ async function checkHostAccess() {
 		$('noFolder').classList.add('hidden');
 		$('dlSetup').classList.remove('hidden');
 	}
-})();
+})()
+	.catch((err) => log(`Could not start: ${(err && err.message) || err}`, 'err'))
+	.then(() => {
+		app.booted = true;
+		// Out of sight, the background is waiting to hear whether there is a folder to sync.
+		if (ENGINE) announceEngine();
+	});
 
 window.addEventListener('beforeunload', (e) => {
 	// The song pass spends most of its time between downloads, waiting on a page

@@ -37,8 +37,14 @@ const TOKEN_HEADER = 'X-Ttarchive-Token';
  */
 let conn = null;
 
+/**
+ * Chromium, by the folder picker it alone has. Not by `connectNative`: the
+ * archive page run out of sight (see startEngine in background.js) has no
+ * native messaging of its own, and needs none — the background starts the
+ * helper, and says when there isn't one.
+ */
 export function supported() {
-	return typeof globalThis.showDirectoryPicker === 'function' && typeof ext?.runtime?.connectNative === 'function';
+	return typeof globalThis.showDirectoryPicker === 'function' && typeof ext?.runtime?.sendMessage === 'function';
 }
 
 /**

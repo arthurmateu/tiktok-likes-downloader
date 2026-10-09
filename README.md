@@ -14,7 +14,7 @@ To update, pull or download the new version and press the reload button on the e
 
 ### Optional: the local helper
 
-A small Python script (3.10 or newer) that makes the archive nicer to live with: no folder-permission prompt every session, the Library in an ordinary browser tab, and a **Show in folder** button that opens your file manager on any post. From the repository folder, once:
+A small Python script (3.10 or newer) that makes the archive nicer to live with: no folder-permission prompt every session, the Library in an ordinary browser tab — one that can sync your likes with the archive page closed — and a **Show in folder** button that opens your file manager on any post. From the repository folder, once:
 
 ```bash
 python3 tools/helper.py install

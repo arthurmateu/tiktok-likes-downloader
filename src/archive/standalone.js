@@ -121,24 +121,30 @@ export function slimItems(state) {
 async function viewerToken() {
 	const res = await ext.runtime.sendMessage({ type: 'viewer-token' });
 	if (!res || !res.token) throw new Error('background did not issue a viewer token');
-	return res.token;
+	return res;
 }
 
 export async function buildViewerHTML(state) {
 	const [template, css, js] = await Promise.all([source(SOURCES.template), source(SOURCES.css), source(SOURCES.js)]);
+	// The version comes with the token rather than from getManifest, which the
+	// archive page run out of sight doesn't have — except from a worker older
+	// than that page, and then this one is a tab, which does.
+	const res = await viewerToken();
+	const { token } = res;
+	const version = res.version || (ext.runtime.getManifest && ext.runtime.getManifest().version);
 
 	const title = rootName() ? `${rootName()} — TikTok archive` : 'TikTok archive';
 	const payload = {
 		config: {
 			generatedAt: Date.now(),
 			bridgeURL: ext.runtime.getURL('src/archive/archive.html'),
-			version: ext.runtime.getManifest().version,
+			version,
 		},
 		items: slimItems(state),
 	};
 
 	let html = template;
-	html = fill(html, '__TOKEN__', escapeAttr(await viewerToken()));
+	html = fill(html, '__TOKEN__', escapeAttr(token));
 	html = fill(html, '__TITLE__', escapeAttr(title));
 	html = fill(html, '/*__CSS__*/', forScriptElement(css));
 	html = fill(html, '/*__JS__*/', forScriptElement(js));

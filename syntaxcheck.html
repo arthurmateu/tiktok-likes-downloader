@@ -21,7 +21,9 @@
 						postMessage: noop,
 						name: 'archive',
 					}),
-					sendMessage: () => Promise.resolve(),
+					// No helper installed, as the background says when there isn't one.
+					sendMessage: (msg) =>
+						Promise.resolve(msg && msg.type === 'helper-ensure' ? { ok: false, error: 'no-helper' } : undefined),
 					onMessage: { addListener: noop },
 					onConnect: { addListener: noop },
 					onInstalled: { addListener: noop },
@@ -88,7 +90,7 @@
 				'folderName','pickFolder','grantFolder','noFolder','syncBody','legacyNote','username',
 				'concurrency','startSync','syncMode','syncMenu','stopSync','fetchSongs','rescan','writeViewer','bar','cSeen','cNew','cDone','cSkip',
 				'cFail','cBytes','log','loading','loadingMsg','statPosts','statVideos','statImages','statUnavailable','search',
-				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbStage','lbMeta','lbHelp','lbKeys',
+				'sort','kind','libCount','grid','libMore','loadMore','lightbox','lbClose','lbPrev','lbNext','lbStage','lbMeta','lbHelp','lbKeys',
 				'hostAccess','grantHost','dlSetup','dlFolderName','dlFolderSave','scanRow','scanFolder','scanInput',
 				'helperSetup','helperProblem','helperRetry','helperReload','openLibrary',
 			];
