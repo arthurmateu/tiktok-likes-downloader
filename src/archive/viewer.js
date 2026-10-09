@@ -586,6 +586,25 @@ function eachSound(fn) {
 }
 
 /**
+ * Sound needs a gesture behind it, and stepping with the wheel or the keys isn't
+ * always counted as one. A refused play is retried muted rather than left looking
+ * broken. Only a refusal, though: stepping on before a clip has started rejects
+ * its play() too, and taking that for a refusal muted every clip after it.
+ *
+ * Kept in step with the same function in src/viewer/viewer.js by hand.
+ */
+async function playOrMute(el) {
+	try {
+		await el.play();
+	} catch (e) {
+		if (e?.name !== 'NotAllowedError' || !el.isConnected) return;
+		el.muted = true;
+		lbMuted = true;
+		el.play().catch(() => {});
+	}
+}
+
+/**
  * Mute is deliberately not kept across sessions. The autoplay fallback below
  * sets it on the viewer's behalf, so persisting it would mostly persist a mute
  * nobody asked for, and a silent archive with the control reading unmuted is a
@@ -755,17 +774,7 @@ async function mountSong(item, seq) {
 		remember();
 	});
 	box.appendChild(audio);
-
-	// Sound needs a gesture behind it, and stepping with the wheel or the keys
-	// isn't always counted as one. A refused play is retried muted rather than
-	// left as a player that looks broken.
-	try {
-		await audio.play();
-	} catch (_) {
-		audio.muted = true;
-		lbMuted = true;
-		audio.play().catch(() => {});
-	}
+	await playOrMute(audio);
 }
 
 function clearStage() {
@@ -1213,17 +1222,7 @@ async function renderStage(item) {
 	});
 	stage.appendChild(v);
 	loopOnLastFrame(v);
-
-	// Sound needs a gesture behind it, and stepping with the wheel or the keys
-	// isn't always counted as one. A refused play is retried muted rather than
-	// left as a still frame.
-	try {
-		await v.play();
-	} catch (_) {
-		v.muted = true;
-		lbMuted = true;
-		v.play().catch(() => {});
-	}
+	await playOrMute(v);
 }
 
 function renderLightbox() {

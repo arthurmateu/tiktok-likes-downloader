@@ -620,6 +620,26 @@
 	}
 
 	/**
+	 * Sound needs a gesture behind it, and stepping with the wheel or the keys
+	 * isn't always counted as one. A refused play is retried muted rather than
+	 * left looking broken. Only a refusal, though: stepping on before a clip has
+	 * started rejects its play() too, and so does a file missing from the folder,
+	 * and taking either for a refusal muted every clip after it.
+	 *
+	 * Kept in step with the same function in src/archive/viewer.js by hand.
+	 */
+	function playOrMute(el) {
+		const started = el.play();
+		if (!started || !started.catch) return;
+		started.catch((e) => {
+			if (!e || e.name !== 'NotAllowedError' || !el.isConnected) return;
+			el.muted = true;
+			lbMuted = true;
+			el.play().catch(() => {});
+		});
+	}
+
+	/**
 	 * The song, in its slot in the metadata panel: its name for anything that has
 	 * one, and a player under that where the track itself is in the folder.
 	 *
@@ -681,18 +701,7 @@
 			{ once: true }
 		);
 		box.appendChild(audio);
-
-		// Sound needs a gesture behind it, and stepping with the wheel or the keys
-		// isn't always counted as one. A refused play is retried muted rather than
-		// left as a player that looks broken.
-		const started = audio.play();
-		if (started && started.catch) {
-			started.catch(() => {
-				audio.muted = true;
-				lbMuted = true;
-				audio.play().catch(() => {});
-			});
-		}
+		playOrMute(audio);
 	}
 
 	/**
@@ -1163,18 +1172,7 @@
 		);
 		stage.appendChild(v);
 		loopOnLastFrame(v);
-
-		// Sound needs a gesture behind it, and stepping with the wheel or the keys
-		// isn't always counted as one. A refused play is retried muted rather than
-		// left as a still frame.
-		const started = v.play();
-		if (started && started.catch) {
-			started.catch(() => {
-				v.muted = true;
-				lbMuted = true;
-				v.play().catch(() => {});
-			});
-		}
+		playOrMute(v);
 	}
 
 	/** A count under its icon's meaning: `♡ 1.2K`, with the exact number behind it. */

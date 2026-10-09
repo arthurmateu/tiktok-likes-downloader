@@ -336,6 +336,40 @@
 			check('and gets no second player over it', !videoSong?.querySelector('audio'));
 			document.getElementById('lbClose').click();
 
+			// ---- stepping on before a clip has started ---------------------------
+			// Tearing a clip down rejects a play() still waiting on its first frames,
+			// with an AbortError rather than the refusal the mute fallback is for.
+			// Taking one for the other muted every clip after a quick step. play() is
+			// held open here, because a local blob starts too fast to step past.
+			{
+				const realPlay = HTMLMediaElement.prototype.play;
+				const held = [];
+				HTMLMediaElement.prototype.play = function () {
+					return new Promise((_, reject) => held.push(reject));
+				};
+				const sounding = () => document.querySelector('#lbStage video, #lbMeta audio');
+				tileFor('111').click();
+				await sleep(400);
+				if (sounding()?.muted) key('m');
+				const before = held.splice(0);
+				key('ArrowDown');
+				for (const reject of before) reject(new DOMException('The play() request was interrupted.', 'AbortError'));
+				await sleep(400);
+				// Where the rejection lands after the next item is already up, it is the
+				// step after that one which comes up muted.
+				key('ArrowUp');
+				await sleep(400);
+				check('stepping past a clip that has not started leaves the sound on',
+					!!sounding() && sounding().muted === false, sounding()?.muted);
+				// The fallback itself still has to work: a real refusal is retried muted.
+				for (const reject of held.splice(0)) reject(new DOMException('No gesture.', 'NotAllowedError'));
+				await sleep(50);
+				check('a refused play is still retried muted', sounding()?.muted === true, sounding()?.muted);
+				HTMLMediaElement.prototype.play = realPlay;
+				key('m');
+				document.getElementById('lbClose').click();
+			}
+
 			// A photo post opens one image at a time, the way TikTok's own slideshow
 			// does; `g` is what opens the whole post out at once.
 			tileFor('333').click();

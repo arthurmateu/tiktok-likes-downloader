@@ -304,6 +304,45 @@
 					sheet.classList.contains('hidden') &&
 						!page.getElementById('lightbox').classList.contains('hidden'));
 
+				// Tearing a clip down rejects a play() still waiting on its first
+				// frames, with an AbortError rather than the refusal the mute fallback
+				// is for. Taking one for the other muted every clip after a quick step.
+				// play() is held open here, since media 404s on this page anyway. The
+				// photo post's song is what gets stepped past: a video that 404s is
+				// swapped for a note before anything can be read off it.
+				{
+					const proto = frame.contentWindow.HTMLMediaElement.prototype;
+					const realPlay = proto.play;
+					const held = [];
+					proto.play = function () {
+						return new Promise((_, reject) => held.push(reject));
+					};
+					const tick = () => new Promise((resolve) => setTimeout(resolve, 50));
+					const sounding = () => page.querySelector('#lbStage video, #lbMeta audio');
+					const ids = [...page.querySelectorAll('.tile')].map((t) => t.dataset.id);
+					const last = ids.indexOf('222') === ids.length - 1;
+					page.querySelector('#lbClose').click();
+					page.querySelector('.tile[data-id="222"]').click();
+					if (sounding() && sounding().muted) press('m');
+					const before = held.splice(0);
+					press(last ? 'ArrowUp' : 'ArrowDown');
+					for (const reject of before) reject(new DOMException('The play() request was interrupted.', 'AbortError'));
+					await tick();
+					// The rejection lands after the next item is already up, so it was the
+					// step after that one which came up muted.
+					press(last ? 'ArrowDown' : 'ArrowUp');
+					await tick();
+					check('stepping past a clip that has not started leaves the sound on',
+						!!sounding() && sounding().muted === false, sounding() && sounding().muted);
+					// The fallback itself still has to work: a real refusal is retried muted.
+					for (const reject of held.splice(0)) reject(new DOMException('No gesture.', 'NotAllowedError'));
+					await tick();
+					check('a refused play is still retried muted', !!sounding() && sounding().muted === true,
+						sounding() && sounding().muted);
+					proto.play = realPlay;
+					press('m');
+				}
+
 				// The hashtags: told apart from the sentence they are piled under, and
 				// each one a way into everything else filed the same.
 				page.querySelector('#lbClose').click();
