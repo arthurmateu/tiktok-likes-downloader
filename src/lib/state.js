@@ -442,6 +442,14 @@ export function applyLikeRanks(state) {
  * one already passed is the one that jumped, so it is skipped as an anchor and
  * its old followers stay with the last id that didn't move. It still takes its
  * new position — it is in `seenOrder`, which is what the rebuild reads.
+ *
+ * Ids that used to lead the order and have dropped out have nothing to follow,
+ * so they are placed by what came after them instead: immediately above the
+ * first anchor below everything new. Not at the very top — an id this run saw
+ * that wasn't there last time was liked since, and so was one sitting above
+ * it, which can only have got there by being re-liked. Pinning them to index 0
+ * is what kept a post unliked while it was the newest like above every like
+ * that came after it, on every sync from then on.
  */
 export function recordLikeOrder(state, seenOrder) {
 	/** id -> where this run put it. Absent means the run never saw it. */
@@ -449,10 +457,18 @@ export function recordLikeOrder(state, seenOrder) {
 	seenOrder.forEach((id, i) => {
 		if (!at.has(id)) at.set(id, i);
 	});
+	const known = new Set(state.likeOrder || []);
+	/** Where this run's last new like sits; everything down to it is newer than the head. */
+	let lastNew = -1;
+	seenOrder.forEach((id, i) => {
+		if (!known.has(id)) lastNew = i;
+	});
 	/** Ids that dropped out before the first surviving one: they were the newest. */
 	const head = [];
 	/** surviving id -> the ids that used to follow it */
 	const after = new Map();
+	/** Survivors that didn't move, which are the only ones that place anything. */
+	const anchors = new Set();
 	let anchor = null;
 	/** Where the current anchor now sits, so an id that surfaced above it can tell. */
 	let anchoredAt = -1;
@@ -463,6 +479,7 @@ export function recordLikeOrder(state, seenOrder) {
 			if (now > anchoredAt) {
 				anchor = id;
 				anchoredAt = now;
+				anchors.add(id);
 			}
 			continue;
 		}
@@ -479,11 +496,13 @@ export function recordLikeOrder(state, seenOrder) {
 		placed.add(id);
 		order.push(id);
 	};
-	for (const id of head) push(id);
-	for (const id of seenOrder) {
+	seenOrder.forEach((id, i) => {
+		if (i > lastNew && anchors.has(id)) head.forEach(push);
 		push(id);
 		for (const trailing of after.get(id) || []) push(trailing);
-	}
+	});
+	// No anchor below the new likes: the head is older than all of them.
+	head.forEach(push);
 
 	state.likeOrder = order;
 	applyLikeRanks(state);
