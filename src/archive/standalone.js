@@ -133,7 +133,7 @@ export async function buildViewerHTML(state) {
 	const { token } = res;
 	const version = res.version || (ext.runtime.getManifest && ext.runtime.getManifest().version);
 
-	const title = rootName() ? `${rootName()} — TikTok archive` : 'TikTok archive';
+	const title = rootName() || 'TikTok archive';
 	const payload = {
 		config: {
 			generatedAt: Date.now(),
