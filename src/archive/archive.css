@@ -907,6 +907,48 @@ select:focus {
 .lb-desc .tag:focus-visible {
 	color: var(--accent);
 }
+/* A post found by what is said in it or written on it, rather than by its
+   caption: where, and the words around the hit. */
+.tile .hit .where {
+	color: var(--fg-dim);
+	margin-right: 5px;
+	text-transform: lowercase;
+}
+.tile mark,
+.lb-heard mark {
+	background: none;
+	color: var(--accent);
+	font-weight: 600;
+}
+/* What is said and what is on screen, from tools/index.py. Folded unless the
+   search was found there. */
+.lb-heard {
+	margin-top: 10px;
+}
+/* Set off from the post's own details, which end at the id row above. */
+.lb-id + .lb-heard {
+	margin-top: 14px;
+	padding-top: 10px;
+	border-top: 1px solid var(--line);
+}
+.lb-heard summary {
+	cursor: pointer;
+	color: var(--fg-dim);
+	font-size: 12px;
+	width: max-content;
+}
+.lb-heard summary:hover {
+	color: var(--fg);
+}
+.lb-heard .body {
+	margin-top: 4px;
+	line-height: 1.45;
+	white-space: pre-wrap;
+	word-break: break-word;
+	max-height: 14em;
+	overflow-y: auto;
+	color: var(--fg-dim);
+}
 .lb-figs {
 	display: flex;
 	align-items: center;

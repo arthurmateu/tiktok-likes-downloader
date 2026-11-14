@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<title>playback levelling tests</title>
+		<!--
+			The measurement and the rule behind src/viewer/levelling.js.
+
+			The tones are EBU Tech 3341's test signals for a loudness meter, so a pass
+			here is a pass against the published expected values and not against
+			numbers this code produced itself: a steady tone, the same tone between
+			quieter passages that the relative gate has to drop, and between
+			near-silence that the absolute gate has to drop.
+
+			The gain cases are mostly about what must not change: only a quiet post
+			moves, and only upward. One uses a real post's figures from TikTok's payload.
+
+			Serve the repo (python -m http.server 8777) and open
+			http://127.0.0.1:8777/src/dev/levelling.html. Dev-only.
+		-->
+		<style>
+			body { background: #12121a; color: #e8e8f0; font: 14px/1.6 ui-monospace, monospace; padding: 24px; }
+			pre { white-space: pre-wrap; }
+			.pass { color: #4ade80; }
+			.fail { color: #f87171; }
+		</style>
+		<script src="../viewer/levelling.js"></script>
+	</head>
+	<body>
+		<h1>playback levelling</h1>
+		<pre id="out">running…</pre>
+
+		<script>
+			const out = document.getElementById('out');
+			out.textContent = '';
+			let failures = 0;
+
+			function check(name, pass, detail) {
+				if (!pass) failures++;
+				const tag = document.createElement('span');
+				tag.className = pass ? 'pass' : 'fail';
+				tag.textContent = pass ? 'PASS' : 'FAIL';
+				out.append(tag, ` ${name}${detail ? ` — ${detail}` : ''}\n`);
+			}
+
+			const { loudness, gainFor } = globalThis.ttLevelling;
+			const near = (a, b, within) => Math.abs(a - b) <= within;
+			const dB = (linear) => 20 * Math.log10(linear);
+
+			/** Stereo 1 kHz, as [seconds, dBFS] passages one after another. */
+			function tone(passages, rate = 48000) {
+				const seconds = passages.reduce((sum, [s]) => sum + s, 0);
+				const buffer = new AudioBuffer({ numberOfChannels: 2, length: Math.round(seconds * rate), sampleRate: rate });
+				const [l, r] = [buffer.getChannelData(0), buffer.getChannelData(1)];
+				let at = 0;
+				for (const [s, level] of passages) {
+					const size = 10 ** (level / 20);
+					const end = at + Math.round(s * rate);
+					for (; at < end; at++) l[at] = r[at] = size * Math.sin((2 * Math.PI * 1000 * at) / rate);
+				}
+				return buffer;
+			}
+
+			function reads(name, passages, expected, rate) {
+				const got = loudness(tone(passages, rate)).lufs;
+				check(name, near(got, expected, 0.1), `${got.toFixed(2)} LUFS, expected ${expected}`);
+			}
+
+			reads('steady tone (3341 case 1)', [[20, -23]], -23);
+			reads('steady tone, a different level (3341 case 2)', [[20, -33]], -33);
+			reads('quieter passages gated out (3341 case 3)', [[10, -36], [60, -23], [10, -36]], -23);
+			reads('near-silence gated out (3341 case 4)', [[10, -72], [10, -36], [60, -23], [10, -36], [10, -72]], -23);
+			reads('the same tone at 44.1 kHz', [[20, -23]], -23, 44100);
+
+			check('silence reads as nothing', loudness(new AudioBuffer({ numberOfChannels: 2, length: 48000, sampleRate: 48000 })).lufs === -Infinity);
+			check('too short to fill a block reads as nothing', loudness(tone([[0.2, -20]])).lufs === -Infinity);
+			check('peak is the largest sample', near(dB(loudness(tone([[1, -6]])).peak), -6, 0.05));
+
+			// Figures from TikTok's own payload for a quiet real post.
+			check('a quiet post comes up to the line', near(dB(gainFor({ lufs: -34.8, peak: 0.06839 })), 12.8, 0.05));
+			check('a post just under the line barely moves', near(dB(gainFor({ lufs: -22.5, peak: 0.1 })), 0.5, 0.05));
+			check('a post at the line is left alone', gainFor({ lufs: -22, peak: 0.1 }) === 1);
+			check('a typical post is left alone', gainFor({ lufs: -15, peak: 0.6 }) === 1);
+			check('a loud post is not turned down', gainFor({ lufs: -6, peak: 1 }) === 1);
+			check('peaks are not pushed past full scale', near(gainFor({ lufs: -35, peak: 0.5 }), 2, 1e-9));
+			check('a quiet post already over full scale is not turned down', gainFor({ lufs: -30, peak: 1.5 }) === 1);
+			check('silence is left alone', gainFor({ lufs: -Infinity, peak: 0 }) === 1);
+			check('a noise floor is left alone', gainFor({ lufs: -60, peak: 0.001 }) === 1);
+
+			out.append(failures ? `\n${failures} failed\n` : '\nall passed\n');
+			document.title = failures ? 'FAILED' : 'passed';
+		</script>
+	</body>
+</html>

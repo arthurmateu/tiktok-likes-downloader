@@ -32,6 +32,19 @@ On Linux the folder dialog needs `zenity`, `kdialog` or Python's `tkinter`. On W
 
 Browse what you've saved in the **Library** tab, or open `viewer.html` in the archive folder — it works without the extension, and on any machine you copy the folder to.
 
+### Optional: search what's said and written in each post
+
+The Library's search covers captions and authors. It can also find a post by what someone says in it or by text on screen, once your computer has transcribed the archive. That runs entirely on your machine with Whisper and OCR. It needs Python 3.10 or newer and about 3 GB of downloads. Reading the text on screen is the slow part, about half a day for 7,000 posts on a desktop CPU; an NVIDIA GPU keeps the speech from adding to that. From the repository folder:
+
+```bash
+pip install -r tools/requirements-index.txt
+python3 tools/index.py "/path/to/your/archive"
+```
+
+You can stop it with Ctrl+C and run it again later; it carries on where it stopped. After that first run, the local helper reads new likes after every sync by itself, as long as the packages are installed in the Python you installed the helper with.
+
+Posts that were uploaded very quietly play louder in the Library. The files themselves stay exactly as saved. A `viewer.html` you double-click can't do this and plays them at their own level.
+
 ## What ends up in the folder
 
 ```
@@ -40,6 +53,7 @@ images/<id>.jpg          a photo post — <id>_01.jpg, <id>_02.jpg … for galle
 audio/<id>.mp3           the song a photo post plays over its images
 archive.json             every post you've liked, including ones that have since disappeared
 viewer.html              the Library, as a page you can open anywhere
+transcripts.json         what is said and written in each post, if you ran tools/index.py
 ```
 
 Delete a file and the next sync downloads it again. Posts that get deleted or made private can't be downloaded any more, but `archive.json` keeps the caption, author and date of any it saw before they went.

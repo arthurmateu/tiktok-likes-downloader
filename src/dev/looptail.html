@@ -1,0 +1,170 @@
+<!doctype html>
+<!--
+	Dev-only: the loop's end-of-clip detector against a clock that is faked, so
+	that "the news of one frame was late" is something a test can arrange rather
+	than wait for.
+
+	The detector lives inside both viewers and isn't exported, so the function is
+	lifted out of each file as it ships. They are kept in step by hand, and this
+	runs every check against the two of them.
+
+	Serve the repo and open http://127.0.0.1:8777/src/dev/looptail.html
+	Add ?src=/some/other.js to run it against another copy.
+-->
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<title>loop tail</title>
+		<style>
+			body { background: #1b1c1f; color: #e6e7ea; font: 13px/1.6 ui-monospace, Consolas, monospace; padding: 20px; }
+			.pass { color: #63d68a; }
+			.fail { color: #ff6b6b; }
+			h1 { font-size: 15px; }
+		</style>
+	</head>
+	<body>
+		<h1>loop tail</h1>
+		<pre id="out">running…</pre>
+
+		<script type="module">
+			const VSYNC = 1 / 60;
+
+			/** The function as a file ships it, built against a fake rAF. */
+			async function lift(url) {
+				const src = await (await fetch(url, { cache: 'no-store' })).text();
+				const start = src.indexOf('function loopOnLastFrame(v)');
+				if (start < 0) throw new Error(`no loopOnLastFrame in ${url}`);
+				let i = src.indexOf('{', start);
+				for (let depth = 0; i < src.length; i++) {
+					if (src[i] === '{') depth++;
+					else if (src[i] === '}' && --depth === 0) break;
+				}
+				return new Function('requestAnimationFrame', `return (${src.slice(start, i + 1)})`);
+			}
+
+			/** Pictures every `step` from 0, stopping `tail` short of the file's end. */
+			function clip({ duration = 8, tail = 0.2, step = 1 / 30 } = {}) {
+				const frames = [];
+				for (let t = 0; t + step <= duration - tail + 1e-6; t += step) frames.push(t);
+				return { duration, frames };
+			}
+
+			/**
+			 * One lap in a world where the display ticks at 60Hz and pictures go up on
+			 * schedule, but word of each reaches the page `late(pts)` ticks after.
+			 * Answers where the lap ended, and how much picture was left unshown.
+			 */
+			function lap(make, { duration, frames }, { rate = 1, late = () => 0 } = {}) {
+				let wall = 0;
+				let tick = 0;
+				let shown = -1;
+				let next = 0;
+				let ended = null;
+				let waiting = [];
+				const onFrame = [];
+				let onPaint = [];
+
+				const v = {
+					isConnected: true,
+					paused: false,
+					seeking: false,
+					duration,
+					playbackRate: rate,
+					get currentTime() {
+						return wall * rate;
+					},
+					set currentTime(_x) {
+						ended ??= { early: true, at: wall * rate };
+					},
+					requestVideoFrameCallback: (cb) => onFrame.push(cb),
+				};
+				make((cb) => onPaint.push(cb))(v);
+
+				while (!ended) {
+					wall += VSYNC;
+					tick++;
+					if (v.currentTime >= duration) {
+						ended = { early: false, at: duration };
+						break;
+					}
+					while (next < frames.length && frames[next] <= v.currentTime) {
+						shown = frames[next];
+						// Reports arrive in order, so one held up holds up those behind it.
+						waiting.push(Math.max(tick + late(frames[next]), waiting.at(-1) ?? 0));
+						next++;
+					}
+					// One callback for however many pictures it has to report, as in a
+					// real browser; and frame callbacks run ahead of animation ones.
+					if (waiting.some((due) => due <= tick)) {
+						waiting = waiting.filter((due) => due > tick);
+						for (const cb of onFrame.splice(0)) cb();
+					}
+					const paint = onPaint;
+					onPaint = [];
+					for (const cb of paint) cb();
+				}
+				return { ...ended, unshown: frames.at(-1) - shown };
+			}
+
+			const out = document.getElementById('out');
+			let failures = 0;
+			function check(name, pass, detail) {
+				if (!pass) failures++;
+				const tag = document.createElement('span');
+				tag.className = pass ? 'pass' : 'fail';
+				tag.textContent = pass ? 'PASS' : 'FAIL';
+				out.append(tag, ` ${name}\n`);
+				if (!pass) out.append(`       ${JSON.stringify(detail)}\n`);
+			}
+
+			/** `late(pts)` for news held up by `ticks`, for pictures around `at` only. */
+			const stutter = (at, ticks) => (pts) => (pts >= at && pts < at + 0.04 ? ticks : 0);
+
+			const files = new URLSearchParams(location.search).getAll('src');
+			out.textContent = '';
+			try {
+				for (const url of files.length ? files : ['/src/viewer/viewer.js', '/src/archive/viewer.js']) {
+					out.append(`${url}\n`);
+					const make = await lift(url);
+					const seen = (rate, late, shape) => lap(make, clip(shape), { rate, late });
+					const allShown = (r) => r.unshown < 1e-6;
+
+					const plain = seen(1);
+					check('at 1× the tail is still cut, with every picture shown', plain.early && allShown(plain), plain);
+
+					for (const rate of [1, 1.5, 2, 3, 4]) {
+						// 50ms is three paints at 60Hz, and a frame's report can be that late
+						// on a page with anything else to do.
+						const far = seen(rate, stutter(7, 3));
+						check(`at ${rate}× a report 50ms late, a second from the end, cuts nothing`, allShown(far), far);
+						const near = seen(rate, stutter(7.7, 3));
+						check(`at ${rate}× nor does one on the very last pictures`, allShown(near), near);
+					}
+
+					// 40 paints: longer than anything can be forgiven, so once in range of
+					// the end it does read as the pictures having stopped. What's being
+					// checked is how much of the clip that is able to cost.
+					const stall = seen(2, stutter(7.3, 40));
+					check('a long stall by the end costs under 0.3s of the clip', stall.unshown < 0.3, stall);
+					const cleared = seen(2, stutter(6.9, 12));
+					check('and one that clears in time costs nothing', allShown(cleared), cleared);
+
+					// The file's own frame spacing: a held picture, a third of a second
+					// before the video ends, as a variable-rate encode leaves behind.
+					const sparse = clip();
+					const uneven = {
+						...sparse,
+						frames: sparse.frames.filter((t) => t < 7.2 || t >= 7.32),
+					};
+					const held = lap(make, uneven);
+					check('a held picture before the end is not the end', allShown(held), held);
+					out.append('\n');
+				}
+			} catch (err) {
+				check('ran', false, String(err));
+			}
+			out.append(failures ? `${failures} FAILED\n` : 'all passed\n');
+			document.title = failures ? 'FAILED' : 'passed';
+		</script>
+	</body>
+</html>

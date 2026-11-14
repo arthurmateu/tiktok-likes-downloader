@@ -230,3 +230,11 @@ export function showInFolder(parts, name) {
 	if (!backend) return Promise.resolve({ ok: false, error: 'no storage backend' });
 	return backend.showInFolder(parts, name);
 }
+
+/**
+ * The helper's background indexer, which reads what is said and written in each
+ * post into transcripts.json. Null where there is no helper to run it.
+ */
+export function indexer(opts) {
+	return backend && typeof backend.indexer === 'function' ? backend.indexer(opts) : Promise.resolve(null);
+}

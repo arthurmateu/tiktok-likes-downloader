@@ -253,3 +253,13 @@ export function libraryURL() {
 export async function showInFolder(parts, name) {
 	return ext.runtime.sendMessage({ type: 'show-in-folder', path: [...parts, name].join('/') });
 }
+
+/**
+ * The background indexer — tools/index.py, run by the helper to read what is
+ * said and written in new posts. `start` asks it to run; either way the answer
+ * is where it is: `{ running, read, total, available, enabled, error? }`.
+ */
+export async function indexer({ start = false } = {}) {
+	const res = await request('api/index', start ? { method: 'POST', body: '{}' } : {});
+	return res.json();
+}

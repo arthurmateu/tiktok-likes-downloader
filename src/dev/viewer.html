@@ -54,6 +54,14 @@
 
 		<script type="module">
 			import { buildViewerHTML } from '../archive/standalone.js';
+			import { setTranscripts } from '../lib/transcripts.js';
+
+			// transcripts.json, as tools/index.py writes it.
+			const HEARD = {
+				222: { said: 'we went to the Café near the beach', seen: 'SALE 50%\nopen today' },
+				444: { said: 'word '.repeat(600), seen: '' },
+			};
+			setTranscripts(HEARD);
 
 			// `<\/script>` rather than the literal: this file has the same problem it
 			// is testing for, and an unescaped one here ends *this* element.
@@ -146,6 +154,8 @@
 				check('token reached the meta tag', html.includes('content="00000000-0000-4000-8000-000000000000"'));
 				check('css was inlined', html.includes('--accent: #4cc2ff'));
 				check('js was inlined', html.includes("__ttarchive: 'req'"));
+				// Ahead of the viewer, whose first lines read it off globalThis.
+				check('levelling comes first', html.indexOf('globalThis.ttLevelling =') > -1 && html.indexOf('globalThis.ttLevelling =') < html.indexOf("__ttarchive: 'req'"));
 
 				// Every mention below is written `<\/script`, including in comments: the
 				// HTML parser ends this element at the raw sequence wherever it sits,
@@ -362,6 +372,45 @@
 				// near-misses beside it, which is half of why anyone clicks one.
 				const tagged = [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
 				check('and the grid holds everything tagged like it', String(tagged) === '222,333', String(tagged));
+
+				// What is said in a post and written on it, from transcripts.json.
+				check('the search comes ahead of the viewer', html.indexOf('globalThis.ttSearch =') > -1 &&
+					html.indexOf('globalThis.ttSearch =') < html.indexOf("__ttarchive: 'req'"));
+				check('what a post says reached the page', post.said === HEARD['222'].said, JSON.stringify(post.said));
+				check('and what is written on it', post.seen === HEARD['222'].seen, JSON.stringify(post.seen));
+				check('a post nobody has read carries neither', !('said' in item) && !('seen' in item));
+				check('a long transcript is cut short in the page', quiet.said.length <= 1501 && quiet.said.endsWith('…'),
+					quiet.said.length);
+
+				const find = async (text) => {
+					const box = page.getElementById('search');
+					box.value = text;
+					box.dispatchEvent(new frame.contentWindow.Event('input'));
+					await new Promise((resolve) => setTimeout(resolve, 300));
+					return [...page.querySelectorAll('.tile')].map((el) => el.dataset.id);
+				};
+				const hitOf = (id) => page.querySelector(`.tile[data-id="${id}"] .hit`);
+				check('found by what is said, accents aside', String(await find('cafe')) === '222');
+				check('and by what is written on it', String(await find('sale today')) === '222');
+				check('the tile says where it was found', hitOf('222')?.querySelector('.where').textContent === 'On screen',
+					hitOf('222')?.textContent);
+				check('and marks the words', [...hitOf('222').querySelectorAll('mark')].map((m) => m.textContent).join() === 'SALE,today',
+					hitOf('222').innerHTML);
+				check('every word has to be there, anywhere in the post', String(await find('CAFÉ photos')) === '222' &&
+					String(await find('cafe ghost')) === '');
+				await find('someone');
+				check('a post found by its caption shows its caption', !hitOf('111'));
+
+				await find('beach');
+				page.querySelector('.tile[data-id="222"]').click();
+				const said = page.querySelector('#lbMeta .lb-said');
+				check('the panel shows what was said, open where it was found', !!said && said.open &&
+					said.querySelector('mark')?.textContent === 'beach', said && said.outerHTML);
+				const seen = page.querySelector('#lbMeta .lb-seen');
+				check('and what is on screen, folded', !!seen && !seen.open, seen && seen.outerHTML);
+				check('with its lines kept', !!seen && seen.querySelector('.body').textContent === HEARD['222'].seen);
+				page.querySelector('#lbClose').click();
+				await find('');
 			} catch (err) {
 				check('generation threw', false, String((err && err.stack) || err));
 			}

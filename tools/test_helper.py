@@ -90,14 +90,14 @@ def forget_picks():
         shutil.rmtree(helper.data_dir(browser), ignore_errors=True)
 
 
-def host(*messages):
+def host(*messages, env=None):
     """Start the helper the way the browser does and hand it `messages`."""
     proc = subprocess.Popen(
         [sys.executable, str(HERE / "helper.py"), ORIGIN + "/"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         cwd=HERE,
-        env={**os.environ, "TTARCHIVE_TEST_NO_WINDOWS": "1"},
+        env={**os.environ, "TTARCHIVE_TEST_NO_WINDOWS": "1", **(env or {})},
     )
     for msg in messages:
         send(proc, msg)
@@ -340,6 +340,83 @@ class Served(unittest.TestCase):
         self.assertIn(b"Write viewer.html", body)
 
 
+FAKE_INDEXER = """
+import json, sys, time
+from pathlib import Path
+root = Path(sys.argv[1])
+print(json.dumps({"event": "start", "total": 2, "indexed": 0}), flush=True)
+for i in (1, 2):
+    time.sleep(0.2)
+    print(json.dumps({"event": "progress", "read": i, "total": 2}), flush=True)
+(root / "indexed-by-fake").write_text(" ".join(sys.argv[2:]))
+print(json.dumps({"event": "done", "read": 2, "total": 2}), flush=True)
+"""
+
+
+class Indexing(unittest.TestCase):
+    """The helper running tools/index.py after a sync — here a fake that reports two posts read."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.dir = Path(tempfile.mkdtemp(prefix="ttarchive-index-"))
+        cls.root = cls.dir / "archive"
+        cls.root.mkdir()
+        fake = cls.dir / "fake_index.py"
+        fake.write_text(FAKE_INDEXER)
+        cls.proc = host(
+            {"cmd": "start", "token": TOKEN, "root": str(cls.root), "port": 0},
+            env={"TTARCHIVE_TEST_INDEXER": str(fake)},
+        )
+        cls.port = receive(cls.proc)["port"]
+
+    @classmethod
+    def tearDownClass(cls):
+        stop(cls.proc)
+        shutil.rmtree(cls.dir, ignore_errors=True)
+
+    call = Served.call
+    auth = Served.auth
+
+    def status(self):
+        status, body, _ = self.call("GET", "/api/index", headers=self.auth())
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def start(self):
+        status, body, _ = self.call("POST", "/api/index", b"{}", self.auth())
+        self.assertEqual(status, 200)
+        return json.loads(body)
+
+    def test_runs_only_where_someone_indexed_by_hand(self):
+        (self.root / "transcripts.json").unlink(missing_ok=True)
+        self.assertFalse(self.status()["enabled"])
+        res = self.start()
+        self.assertFalse(res["ok"])
+        self.assertEqual(res["error"], "not-enabled")
+        self.assertFalse((self.root / "indexed-by-fake").exists())
+
+        (self.root / "transcripts.json").write_text('{"version": 1, "items": {}}')
+        self.assertTrue(self.status()["enabled"])
+        res = self.start()
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(res["running"])
+        # Asked again while it runs: the same run, not a second one.
+        self.assertTrue(self.start()["running"])
+
+        deadline = time.monotonic() + 10
+        while self.status()["running"] and time.monotonic() < deadline:
+            time.sleep(0.1)
+        done = self.status()
+        self.assertFalse(done["running"], "the indexer never finished")
+        self.assertEqual((done["read"], done["total"]), (2, 2))
+        self.assertNotIn("error", done)
+        self.assertEqual((self.root / "indexed-by-fake").read_text(), "--json")
+
+    def test_needs_the_token(self):
+        status, _, _ = self.call("POST", "/api/index", b"{}")
+        self.assertEqual(status, 401)
+
+
 class Lifecycle(unittest.TestCase):
     def test_exits_when_the_pipe_closes(self):
         with tempfile.TemporaryDirectory() as root:
@@ -521,6 +598,76 @@ class Desktop(unittest.TestCase):
     def test_macos_dialog_cancelled(self):
         self.code, self.out = 1, ""
         self.assertIsNone(helper.ask_folder_macos("/Users/x"))
+
+
+class FakeExplorer:
+    """Stands in for helper.explorer_tabs(): tabs by identity, and a new one in front when asked."""
+
+    def __init__(self, *tabs, frame=1, opens=True):
+        self.urls = {number: url for number, (url, _) in enumerate(tabs, 1)}
+        self.in_front = {number for number, (_, showing) in enumerate(tabs, 1) if showing}
+        self.frame, self.opens, self.did = frame, opens, []
+
+    def window(self):
+        return self.frame
+
+    def tabs(self):
+        return {number: number for number in self.urls}
+
+    def location(self, tab):
+        return self.urls[tab]
+
+    def showing(self, tab):
+        return tab in self.in_front
+
+    def bring_forward(self, frame):
+        self.did.append("forward")
+
+    def new_tab(self, frame):
+        self.did.append("new tab")
+        if self.opens:
+            self.urls[len(self.urls) + 1] = ""
+
+    def navigate(self, tab, folder):
+        self.did.append(("navigate", tab))
+        self.urls[tab] = folder.as_uri()
+
+    def select(self, tab, name, patience):
+        self.did.append(("select", tab, name))
+
+
+class ExplorerTab(unittest.TestCase):
+    """When Show in folder adds a tab to Explorer, and when it leaves things alone."""
+
+    target = (FAKE_HOME / "Tik Tok" / "videos" / "42.mp4").resolve()
+    folder_uri = target.parent.as_uri()
+    elsewhere = "file:///somewhere/else"
+
+    def reveal(self, explorer):
+        helper.open_tab_on(self.target, explorer, patience=0.01)
+        return explorer.did
+
+    def test_a_folder_not_open_gets_a_new_tab_with_the_file_selected(self):
+        self.assertEqual(
+            self.reveal(FakeExplorer((self.elsewhere, True))),
+            ["forward", "new tab", ("navigate", 2), ("select", 2, "42.mp4")],
+        )
+
+    def test_a_tab_showing_the_folder_is_left_to_be_reused(self):
+        spelled_differently = self.folder_uri.upper().replace("%20", " ")
+        self.assertEqual(self.reveal(FakeExplorer((spelled_differently, True))), [])
+
+    def test_a_tab_on_the_folder_behind_another_does_not_count(self):
+        self.assertEqual(
+            self.reveal(FakeExplorer((self.folder_uri, False), (self.elsewhere, True))),
+            ["forward", "new tab", ("navigate", 3), ("select", 3, "42.mp4")],
+        )
+
+    def test_no_explorer_window_leaves_it_to_the_system(self):
+        self.assertEqual(self.reveal(FakeExplorer(frame=None)), [])
+
+    def test_a_tab_that_never_appears_leaves_the_others_alone(self):
+        self.assertEqual(self.reveal(FakeExplorer((self.elsewhere, True), opens=False)), ["forward", "new tab"])
 
 
 @unittest.skipIf(sys.platform == "win32", "on Windows installing is the real registry")

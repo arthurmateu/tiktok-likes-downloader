@@ -17,11 +17,18 @@
 
 import { LAYOUT, readBlob, fileSize, mediaURL, hasReadableFiles, showInFolder } from '../lib/fs.js';
 import { disk, listingComplete } from '../lib/state.js';
+import '../viewer/levelling.js';
+import '../viewer/search.js';
+
+const levelling = globalThis.ttLevelling;
+const search = globalThis.ttSearch;
 
 const $ = (id) => document.getElementById(id);
 const PAGE = 200;
 
 let getState = () => null;
+/** The search box, as the words every result has to contain. */
+let query = [];
 let filtered = [];
 let shown = 0;
 let observer = null;
@@ -137,19 +144,14 @@ function applyFilters(state) {
 	// by id rather than by number: the list it indexes into is about to change.
 	const openId = lbOpen() ? String(filtered[lbIndex].id) : null;
 
-	const q = $('search').value.trim().toLowerCase();
+	query = search.parse($('search').value);
 	const kind = $('kind').value;
 	const sort = $('sort').value;
 
 	let list = Object.values(state?.items || {});
 
 	if (kind !== 'all') list = list.filter((i) => (i.type || 'video') === kind);
-	if (q) {
-		list = list.filter((i) => {
-			const hay = `${i.desc || ''} ${i.author?.uniqueId || ''} ${i.author?.nickname || ''}`;
-			return hay.toLowerCase().includes(q);
-		});
-	}
+	if (query.length) list = list.filter((i) => search.matches(i, query));
 
 	const cmp = {
 		'liked-recent': byLikeOrder(1),
@@ -216,7 +218,10 @@ function tile(item, index) {
 	who.className = 'who';
 	who.textContent = item.author?.uniqueId ? `@${item.author.uniqueId}` : '';
 	cap.appendChild(who);
-	cap.appendChild(document.createTextNode(item.desc || ''));
+	// A post found by what is said or written in it shows that, rather than a
+	// caption without a word of the search in it.
+	const found = search.hit(item, query);
+	cap.appendChild(found ? hitLine(found) : document.createTextNode(item.desc || ''));
 	el.appendChild(cap);
 
 	el.addEventListener('click', () => openLightbox(index));
@@ -575,6 +580,15 @@ function applySound(el) {
 	el.muted = lbMuted;
 }
 
+/**
+ * Point an element at a file. The helper's URLs are another origin, and sound
+ * from an element that loaded one without CORS reaches Web Audio as silence.
+ */
+function setSource(el, url) {
+	if (!url.startsWith('blob:')) el.crossOrigin = 'anonymous';
+	el.src = url;
+}
+
 function eachVideo(fn) {
 	for (const v of $('lbStage').querySelectorAll('video')) fn(v);
 }
@@ -701,6 +715,7 @@ let songURL = null;
 function clearSong({ keepBox = false } = {}) {
 	const audio = $('lbMeta').querySelector('audio');
 	if (audio) {
+		levelling.release(audio);
 		audio.pause();
 		audio.removeAttribute('src');
 		audio.load();
@@ -762,7 +777,7 @@ async function mountSong(item, seq) {
 	songURL = url;
 
 	const audio = document.createElement('audio');
-	audio.src = url;
+	setSource(audio, url);
 	audio.controls = true;
 	audio.loop = true;
 	applySound(audio);
@@ -774,12 +789,14 @@ async function mountSong(item, seq) {
 		remember();
 	});
 	box.appendChild(audio);
+	await levelling.level(audio, item.id);
 	await playOrMute(audio);
 }
 
 function clearStage() {
 	const stage = $('lbStage');
 	for (const v of stage.querySelectorAll('video')) {
+		levelling.release(v);
 		v.pause();
 		v.removeAttribute('src');
 		v.load();
@@ -817,6 +834,7 @@ function openLightbox(at) {
 	lbIndex = at;
 	lbPhoto = 0;
 	lbSheet = false;
+	levelling.wake();
 	$('lightbox').classList.remove('hidden');
 	renderLightbox();
 }
@@ -1099,16 +1117,23 @@ function loopOnLastFrame(v) {
 			}
 		}
 
-		// Only ever the last second of the clip, and never before a picture has
+		// Only ever the last moments of the clip, and never before a picture has
 		// turned up in this lap: a frame dropped in the middle of one, a callback
 		// starved by a hidden tab, and the silent run-in these files open with are
-		// none of them a tail.
-		if (!seeded || !(v.duration - v.currentTime < 1)) return;
+		// none of them a tail. Moments, because a wrong call here throws away
+		// whatever was left to play, and real tails are short: under 0.26s on 99.9%
+		// of a 6,000-clip archive.
+		if (!seeded || !(v.duration - v.currentTime < 0.3)) return;
 		// Every eighth lap the memo is set aside and the clip runs to its own end
 		// again. One taken off a decoder hiccup rather than off the file gets found
 		// out that way, instead of trimming every lap from here on.
 		const trusted = laps % 8 === 7 ? Infinity : tail;
-		if (v.currentTime < trusted && v.currentTime - frameAt < gap * 1.5 + 0.03) return;
+		// Word of a frame is late in real time, by a paint or a busy moment on the
+		// page, and the faster the clip plays the more of it goes by in that time.
+		// So the allowance grows with the speed; at 2× a frozen tail lasts half as
+		// long anyway.
+		const allowance = (gap * 1.5 + 0.03) * Math.max(1, v.playbackRate);
+		if (v.currentTime < trusted && v.currentTime - frameAt < allowance) return;
 		// A single lap's answer can be a stutter rather than the tail, and a memo
 		// taken from one would trim every lap after it short. It's held until a
 		// second lap lands in the same place, and trusted only then.
@@ -1204,7 +1229,7 @@ async function renderStage(item) {
 	openURLs.push(url);
 
 	const v = document.createElement('video');
-	v.src = url;
+	setSource(v, url);
 	v.controls = true;
 	v.loop = true;
 	applyPlayback(v);
@@ -1222,6 +1247,7 @@ async function renderStage(item) {
 	});
 	stage.appendChild(v);
 	loopOnLastFrame(v);
+	await levelling.level(v, item.id);
 	await playOrMute(v);
 }
 
@@ -1288,6 +1314,50 @@ function searchFor(text) {
 	closeLightbox();
 	applyFilters(getState());
 	window.scrollTo({ top: 0 });
+}
+
+// ------------------------------------------------- said and written in it
+
+const HEARD = { said: 'Said', seen: 'On screen' };
+
+/** Text pieces from search.js, as nodes: plain text, with the found words in <mark>. */
+function marked(parts) {
+	const frag = document.createDocumentFragment();
+	for (const p of parts) frag.appendChild(p.mark ? el('mark', null, p.text) : document.createTextNode(p.text));
+	return frag;
+}
+
+/** A tile's reason for being in the results: where the search was found, and around what. */
+function hitLine(found) {
+	const line = el('div', 'hit');
+	line.appendChild(el('span', 'where', HEARD[found.field]));
+	line.appendChild(marked(found.parts));
+	return line;
+}
+
+/**
+ * What is said in the post and what is written on it, as tools/index.py read
+ * them. Folded away, since they are long and only sometimes what someone came
+ * for — except the one the search was found in, which is open with the words
+ * marked.
+ */
+function heardPanel(item) {
+	const out = [];
+	for (const field of ['said', 'seen']) {
+		const text = search.text(item, field);
+		if (!text) continue;
+		const box = el('details', `lb-heard lb-${field}`);
+		box.appendChild(el('summary', null, HEARD[field]));
+		const body = el('div', 'body');
+		const words = query.filter((w) => search.fold(text).includes(w));
+		if (words.length) {
+			box.open = true;
+			body.appendChild(marked(search.snippet(text, words, Infinity).parts));
+		} else body.textContent = text;
+		box.appendChild(body);
+		out.push(box);
+	}
+	return out;
 }
 
 /**
@@ -1363,6 +1433,9 @@ function metaPanel(item) {
 	idRow.appendChild(link);
 	if (folderTarget(item)) idRow.appendChild(folderButton(item));
 	out.push(idRow);
+	// Last, so that a post with a transcript and one without keep every row above
+	// in the same place as the feed steps between them.
+	out.push(...heardPanel(item));
 
 	return out;
 }
