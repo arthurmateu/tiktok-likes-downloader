@@ -20,12 +20,15 @@
 
 import { ext } from '../lib/ext.js';
 import { LAYOUT, writeFile, rootName } from '../lib/fs.js';
+import { transcriptOf } from '../lib/transcripts.js';
 
 export const VIEWER_FILE = 'viewer.html';
 
 const SOURCES = {
 	template: 'src/viewer/template.html',
 	css: 'src/viewer/viewer.css',
+	levelling: 'src/viewer/levelling.js',
+	search: 'src/viewer/search.js',
 	js: 'src/viewer/viewer.js',
 };
 
@@ -69,6 +72,20 @@ function escapeAttr(value) {
 }
 
 /**
+ * How much of what is said in a post, and of what is written on it, comes along.
+ * Nearly every post is well under it — a typical one is a sentence or two — and
+ * the few long ones are talks and podcasts whose first minutes say what they
+ * are about. Without a cap those few would be most of the page.
+ */
+const TRANSCRIPT_CAP = 1500;
+
+function capped(text) {
+	if (!text || text.length <= TRANSCRIPT_CAP) return text || undefined;
+	const cut = text.lastIndexOf(' ', TRANSCRIPT_CAP);
+	return `${text.slice(0, cut > TRANSCRIPT_CAP * 0.8 ? cut : TRANSCRIPT_CAP)}…`;
+}
+
+/**
  * Only what the grid, the search box and the lightbox actually read. Dimensions
  * and internal bookkeeping stay in archive.json — at six thousand items the
  * difference is megabytes of page.
@@ -87,6 +104,7 @@ export function slimItems(state) {
 		const author = item.author || {};
 		const stats = item.stats || {};
 		const music = item.music || {};
+		const heard = transcriptOf(item.id);
 		out.push({
 			id: item.id,
 			type: item.type || 'video',
@@ -107,6 +125,10 @@ export function slimItems(state) {
 				music.title || music.authorName
 					? { title: music.title || '', authorName: music.authorName || '' }
 					: undefined,
+			// From transcripts.json, for the search. Absent until tools/index.py has
+			// read the post.
+			said: capped(heard?.said),
+			seen: capped(heard?.seen),
 		});
 	}
 	return out;
@@ -125,7 +147,13 @@ async function viewerToken() {
 }
 
 export async function buildViewerHTML(state) {
-	const [template, css, js] = await Promise.all([source(SOURCES.template), source(SOURCES.css), source(SOURCES.js)]);
+	const [template, css, levelling, search, js] = await Promise.all([
+		source(SOURCES.template),
+		source(SOURCES.css),
+		source(SOURCES.levelling),
+		source(SOURCES.search),
+		source(SOURCES.js),
+	]);
 	// The version comes with the token rather than from getManifest, which the
 	// archive page run out of sight doesn't have — except from a worker older
 	// than that page, and then this one is a tab, which does.
@@ -147,7 +175,7 @@ export async function buildViewerHTML(state) {
 	html = fill(html, '__TOKEN__', escapeAttr(token));
 	html = fill(html, '__TITLE__', escapeAttr(title));
 	html = fill(html, '/*__CSS__*/', forScriptElement(css));
-	html = fill(html, '/*__JS__*/', forScriptElement(js));
+	html = fill(html, '/*__JS__*/', forScriptElement(`${levelling}\n${search}\n${js}`));
 	html = fill(html, '__DATA__', forJSONElement(payload));
 	return html;
 }

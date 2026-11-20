@@ -1,0 +1,17 @@
+# What tools/index.py needs to read speech and on-screen text for the search.
+# Optional: nothing else in the archiver uses these.
+#
+#   pip install -r tools/requirements-index.txt
+#
+# Install them into the same Python the helper was installed with, or the
+# helper can't read new posts after a sync.
+
+faster-whisper>=1.1
+rapidocr>=3.9
+onnxruntime>=1.20
+
+# The CUDA libraries faster-whisper uses on an NVIDIA GPU, about 1 GB. Without
+# a GPU they go unused and speech is transcribed on the CPU instead, more
+# slowly. macOS has no CUDA.
+nvidia-cublas-cu12; sys_platform != "darwin"
+nvidia-cudnn-cu12>=9,<10; sys_platform != "darwin"

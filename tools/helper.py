@@ -292,6 +292,11 @@ def reveal_windows(path: Path) -> None:
     ctypes.windll.user32.AllowSetForegroundWindow(-1)  # ASFW_ANY
     ctypes.windll.ole32.CoInitialize(None)
 
+    try:
+        open_tab_on(path, explorer_tabs())
+    except Exception as err:  # the file still gets shown, in a window of its own
+        log(f"no tab for {path}: {err!r}")
+
     # What the browser's own "Show in folder" calls: it reuses an Explorer window
     # already open on the folder, where `explorer /select` opens a new one each time.
     pidl = shell32.ILCreateFromPathW(str(path))
@@ -302,6 +307,212 @@ def reveal_windows(path: Path) -> None:
             shell32.ILFree(pidl)
     if not ok:
         subprocess.Popen(["explorer", f"/select,{path}"])
+
+
+def open_tab_on(path: Path, explorer, patience: float = 3.0) -> None:
+    """
+    Show `path` in a new tab of the Explorer window on top, rather than in a
+    window of its own. Not when a tab showing its folder is there already: every
+    video is in the one folder, and a tab per click would pile up. Nor with no
+    window to add a tab to, or no tabs in this Windows. In those cases the file
+    gets shown the way it always was.
+
+    A tab on the folder but behind another one doesn't count. Selecting there
+    would look like nothing happened, and Explorer offers no way to bring a tab
+    forward, so it gets a new one like any other folder.
+    """
+    folder = path.parent
+    window = explorer.window()
+    if window is None:
+        return
+    before = explorer.tabs()
+    if any(explorer.showing(tab) for tab in before.values() if is_location(explorer.location(tab), folder)):
+        return
+
+    explorer.bring_forward(window)
+    explorer.new_tab(window)
+
+    def opened():
+        # Exactly one newcomer, or nothing: whatever gets navigated next must
+        # not turn out to be a tab the user was already using.
+        now = explorer.tabs()
+        fresh = [tab for identity, tab in now.items() if identity not in before]
+        return fresh[0] if len(fresh) == 1 and len(now) > len(before) else None
+
+    tab = wait_for(opened, patience)
+    if tab is not None:
+        explorer.navigate(tab, folder)
+        # Selected here because, with a second tab on the folder, the system's
+        # own selection afterwards can't be relied on to pick this one.
+        if wait_for(lambda: is_location(explorer.location(tab), folder), patience):
+            explorer.select(tab, path.name, patience)
+
+
+def is_location(url: str, folder: Path) -> bool:
+    """Explorer and pathlib percent-encode a file: URL differently, and Windows ignores case."""
+
+    def plain(text: str) -> str:
+        return urllib.parse.unquote(text).rstrip("/").casefold()
+
+    return plain(url) == plain(folder.as_uri())
+
+
+def wait_for(condition, seconds: float):
+    """What `condition` returns once that is something, or its last answer when time runs out."""
+    deadline = time.monotonic() + seconds
+    while True:
+        answer = condition()
+        if answer or time.monotonic() > deadline:
+            return answer
+        time.sleep(0.03)
+
+
+def explorer_tabs():
+    """
+    What `open_tab_on` needs from File Explorer. Its tabs can only be reached as
+    COM objects and the standard library has no COM client, so this is just
+    enough of one: IDispatch, which lets everything else be called by name.
+    Nothing is released: the process ends with the click, and a reference held
+    is what keeps a tab's identity comparable.
+    """
+    import ctypes
+    import types
+    import uuid
+    from ctypes import POINTER, WINFUNCTYPE, byref, c_char_p, c_long, c_longlong, c_uint, c_ulong, c_ushort, c_void_p, c_wchar_p, wintypes
+
+    class Variant(ctypes.Structure):
+        class Value(ctypes.Union):
+            _fields_ = [("i4", c_long), ("i8", c_longlong), ("ptr", c_void_p), ("size", c_void_p * 2)]
+
+        _fields_ = [("vt", c_ushort), ("reserved", c_ushort * 3), ("value", Value)]
+
+    class Params(ctypes.Structure):
+        _fields_ = [("args", POINTER(Variant)), ("names", c_void_p), ("count", c_uint), ("name_count", c_uint)]
+
+    VT_I4, VT_BSTR, VT_DISPATCH, VT_I8, VT_INT = 3, 8, 9, 20, 22
+    DISPATCH_METHOD_OR_GET = 3
+    IID_NULL = bytes(16)
+    IID_IUNKNOWN = uuid.UUID("00000000-0000-0000-C000-000000000046").bytes_le
+    IID_IDISPATCH = uuid.UUID("00020400-0000-0000-C000-000000000046").bytes_le
+    IID_SERVICE_PROVIDER = uuid.UUID("6D5140C1-7436-11CE-8034-00AA006009FA").bytes_le
+    IID_SHELL_BROWSER = uuid.UUID("000214E2-0000-0000-C000-000000000046").bytes_le
+    SID_TOP_LEVEL_BROWSER = uuid.UUID("4C96BE40-915C-11CF-99D3-00AA004AE837").bytes_le
+    CLSID_SHELL_WINDOWS = uuid.UUID("9BA05972-F6A8-11CF-A442-00A0C90A8F39").bytes_le
+    CLSCTX_ALL = 0x17
+    SELECT_ONLY_AND_SHOW = 1 | 4 | 8 | 16  # SVSI_SELECT, _DESELECTOTHERS, _ENSUREVISIBLE, _FOCUSED
+    WM_COMMAND = 0x0111
+    SW_RESTORE = 9
+    # The command behind Explorer's own + button. Windows has no API for opening
+    # a tab, so this undocumented number is the only way in.
+    NEW_TAB = 0xA21B
+    FIRST_BUILD_WITH_TABS = 22621
+
+    # Slots in the vtable every IDispatch has. The object itself goes first in a call.
+    query = WINFUNCTYPE(ctypes.HRESULT, c_char_p, POINTER(c_void_p))(0, "QueryInterface")
+    ids_of_names = WINFUNCTYPE(ctypes.HRESULT, c_char_p, POINTER(c_wchar_p), c_uint, c_ulong, POINTER(c_long))(5, "GetIDsOfNames")
+    invoke = WINFUNCTYPE(ctypes.HRESULT, c_long, c_char_p, c_ulong, c_ushort, POINTER(Params), POINTER(Variant), c_void_p, c_void_p)(6, "Invoke")
+    query_service = WINFUNCTYPE(ctypes.HRESULT, c_char_p, c_char_p, POINTER(c_void_p))(3, "QueryService")
+    get_window = WINFUNCTYPE(ctypes.HRESULT, POINTER(wintypes.HWND))(3, "GetWindow")
+
+    oleaut32 = ctypes.windll.oleaut32
+    oleaut32.SysAllocString.argtypes = [c_wchar_p]
+    oleaut32.SysAllocString.restype = c_void_p
+    user32 = ctypes.windll.user32
+    user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    user32.FindWindowExW.restype = wintypes.HWND
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.GetParent.argtypes = [wintypes.HWND]
+    user32.GetParent.restype = wintypes.HWND
+    user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+
+    def call(obj, name, *args):
+        """Call a method or read a property of a COM object, by name."""
+        this = c_void_p(obj)
+        dispid = c_long()
+        ids_of_names(this, IID_NULL, byref(c_wchar_p(name)), 1, 0, byref(dispid))
+        values = (Variant * len(args))()
+        for value, arg in zip(values, reversed(args)):  # IDispatch takes them last first
+            if isinstance(arg, str):
+                value.vt, value.value.ptr = VT_BSTR, oleaut32.SysAllocString(arg)
+            elif isinstance(arg, c_void_p):
+                value.vt, value.value.ptr = VT_DISPATCH, arg.value
+            else:
+                value.vt, value.value.i4 = VT_I4, arg
+        result = Variant()
+        invoke(this, dispid.value, IID_NULL, 0, DISPATCH_METHOD_OR_GET, byref(Params(values, None, len(args), 0)), byref(result), None, None)
+        if result.vt == VT_BSTR:
+            return ctypes.wstring_at(result.value.ptr) if result.value.ptr else ""
+        if result.vt == VT_DISPATCH:
+            return result.value.ptr
+        if result.vt == VT_I8:
+            return result.value.i8
+        return result.value.i4 if result.vt in (VT_I4, VT_INT) else None
+
+    ole32 = ctypes.windll.ole32
+    ole32.CoCreateInstance.argtypes = [c_char_p, c_void_p, c_ulong, c_char_p, POINTER(c_void_p)]
+    ole32.CoCreateInstance.restype = ctypes.HRESULT
+    shell_windows = c_void_p()
+    ole32.CoCreateInstance(CLSID_SHELL_WINDOWS, None, CLSCTX_ALL, IID_IDISPATCH, byref(shell_windows))
+
+    def window():
+        """Top of the stack first. Explorer can keep a hidden window ready, which doesn't count."""
+        if sys.getwindowsversion().build < FIRST_BUILD_WITH_TABS:
+            return None
+        found = None
+        while found := user32.FindWindowExW(None, found, "CabinetWClass", None):
+            if user32.IsWindowVisible(found):
+                return found
+        return None
+
+    def tabs():
+        """Every open tab, keyed by its IUnknown, the one thing COM promises is the same each time."""
+        found = {}
+        for index in range(call(shell_windows.value, "Count")):
+            tab = call(shell_windows.value, "Item", index)
+            if tab:
+                identity = c_void_p()
+                query(c_void_p(tab), IID_IUNKNOWN, byref(identity))
+                found[identity.value] = tab
+        return found
+
+    def tab_in_front(frame):
+        """Each tab has a window of its own, stacked with the one on show first."""
+        return user32.FindWindowExW(frame, None, "ShellTabWindowClass", None)
+
+    def bring_forward(frame):
+        # First, because a tab added to a minimized window doesn't take its place in the stack.
+        if user32.IsIconic(frame):
+            user32.ShowWindow(frame, SW_RESTORE)
+        user32.SetForegroundWindow(frame)
+
+    def new_tab(frame):
+        user32.PostMessageW(tab_in_front(frame), WM_COMMAND, NEW_TAB, 0)
+
+    def showing(tab):
+        services, browser, own_window = c_void_p(), c_void_p(), wintypes.HWND()
+        query(c_void_p(tab), IID_SERVICE_PROVIDER, byref(services))
+        query_service(services, SID_TOP_LEVEL_BROWSER, IID_SHELL_BROWSER, byref(browser))
+        get_window(browser, byref(own_window))
+        return own_window.value == tab_in_front(user32.GetParent(own_window))
+
+    def select(tab, name, patience):
+        view = wait_for(lambda: call(tab, "Document"), patience)
+        item = call(call(view, "Folder"), "ParseName", name)
+        call(view, "SelectItem", c_void_p(item), SELECT_ONLY_AND_SHOW)
+
+    return types.SimpleNamespace(
+        window=window,
+        tabs=tabs,
+        bring_forward=bring_forward,
+        new_tab=new_tab,
+        showing=showing,
+        select=select,
+        location=lambda tab: call(tab, "LocationURL") or "",
+        navigate=lambda tab, folder: call(tab, "Navigate2", str(folder)),
+    )
 
 
 def reveal_freedesktop(path: Path) -> None:
@@ -384,6 +595,99 @@ def replace(src: Path, dst: Path) -> None:
 # ------------------------------------------------------------------- the server
 
 
+INDEXER = Path(__file__).with_name("index.py")
+TRANSCRIPTS = "transcripts.json"
+
+
+class Indexer:
+    """
+    tools/index.py, run in the background over the folder — what reads speech
+    and on-screen text into transcripts.json for the search. Its packages are
+    optional and large, so this only ever runs it where they are installed, and
+    only for a folder someone has already indexed by hand once: the first pass
+    takes hours, and that is a thing to choose, not to find running.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.status = {"running": False}
+
+    @staticmethod
+    def script() -> Path:
+        # Tests stand a small fake in for it, since the real one needs gigabytes.
+        return Path(os.environ.get("TTARCHIVE_TEST_INDEXER") or INDEXER)
+
+    @staticmethod
+    def available() -> bool:
+        if os.environ.get("TTARCHIVE_TEST_INDEXER"):
+            return True
+        import importlib.util
+
+        return all(importlib.util.find_spec(m) is not None for m in ("faster_whisper", "rapidocr"))
+
+    def describe(self, root) -> dict:
+        with self.lock:
+            out = dict(self.status)
+        out["available"] = self.available()
+        out["enabled"] = bool(root) and (Path(root) / TRANSCRIPTS).is_file()
+        return out
+
+    def start(self, root) -> dict:
+        with self.lock:
+            if self.proc and self.proc.poll() is None:
+                return dict(self.status)
+            if not root or not (Path(root) / TRANSCRIPTS).is_file():
+                return {"running": False, "error": "not-enabled"}
+            if not self.available():
+                return {"running": False, "error": "not-installed"}
+            flags, extra = 0, {}
+            if WINDOWS:
+                # Below normal, and without a console window of its own.
+                flags = 0x00004000 | 0x08000000
+            else:
+                extra["preexec_fn"] = lambda: os.nice(10)
+            self.proc = subprocess.Popen(
+                [sys.executable, str(self.script()), str(root), "--json"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                creationflags=flags,
+                **extra,
+            )
+            self.status = {"running": True, "read": 0, "total": None, "startedAt": int(time.time() * 1000)}
+            threading.Thread(target=self.follow, args=(self.proc,), daemon=True).start()
+            log(f"indexing {root}")
+            return dict(self.status)
+
+    def follow(self, proc) -> None:
+        """Progress off the indexer's JSON lines, until it exits."""
+        for raw in proc.stdout:
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            with self.lock:
+                if ev.get("event") in ("start", "progress", "done"):
+                    self.status["total"] = ev.get("total", self.status.get("total"))
+                    self.status["read"] = ev.get("read", self.status.get("read", 0))
+                if ev.get("event") == "error":
+                    self.status["error"] = ev.get("error")
+        code = proc.wait()
+        with self.lock:
+            self.status["running"] = False
+            self.status["finishedAt"] = int(time.time() * 1000)
+            if code and "error" not in self.status:
+                self.status["error"] = f"the indexer exited with {code}"
+        log(f"indexing stopped ({code}): {self.status.get('read')} of {self.status.get('total')} read")
+
+    def stop(self) -> None:
+        with self.lock:
+            proc = self.proc
+        if proc and proc.poll() is None:
+            proc.terminate()
+
+
 class Helper:
     def __init__(self, token: str, root, origin: str):
         self.token = token
@@ -391,6 +695,7 @@ class Helper:
         # Chromium puts on the one it starts a host with.
         self.origin = origin.rstrip("/")
         self.folder = Folder(root)
+        self.indexer = Indexer()
 
 
 RANGE = re.compile(r"bytes=(\d*)-(\d*)$")
@@ -529,6 +834,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(200, {"ok": True, "version": VERSION, **self.app.folder.describe()})
         if path == "/api/list":
             return self.listing()
+        if path == "/api/index":
+            return self.reply(200, {"ok": True, **self.app.indexer.describe(self.app.folder.get())})
         if path.startswith("/api/"):
             return self.reply(404, {"ok": False, "error": "no such endpoint"})
         return self.send_file(head)
@@ -717,6 +1024,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(200, {"ok": False, "error": f"not a folder: {path}"})
             log(f"root is now {self.app.folder.describe()['root']}")
             return self.reply(200, {"ok": True, **self.app.folder.describe()})
+        if self.url.path == "/api/index":
+            res = self.app.indexer.start(self.app.folder.get())
+            return self.reply(200, {"ok": "error" not in res, **res})
         self.reply(404, {"ok": False, "error": "no such endpoint"})
 
     def do_OPTIONS(self):
@@ -791,6 +1101,7 @@ def run(msg: dict, origin: str) -> None:
     # exits — and either way that is the signal to stop.
     while read_message() is not None:
         pass
+    app.indexer.stop()
     server.shutdown()
     log("stopped")
 

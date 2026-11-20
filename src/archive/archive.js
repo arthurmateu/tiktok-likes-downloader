@@ -28,6 +28,7 @@ import {
 import { DownloadQueue } from '../lib/downloader.js';
 import { renderLibrary, refreshPresence, wireLibrary } from './viewer.js';
 import { writeViewer, slimItems, VIEWER_FILE } from './standalone.js';
+import { loadTranscripts } from '../lib/transcripts.js';
 
 const $ = (id) => document.getElementById(id);
 
@@ -333,6 +334,9 @@ async function readFolder() {
 		// costs a moment and puts the Library on screen before the slow part starts.
 		app.state = await loadState();
 		library.render(app.state);
+		// What is said and written in each post, for the search. After the grid is
+		// up rather than before: it only adds to what a search finds.
+		if (await loadTranscripts()) library.render(app.state);
 
 		log('Scanning folder…');
 		showScanning(scanningMsg(0));
@@ -507,6 +511,8 @@ $('rescan').addEventListener('click', async () => {
 async function writeViewerFile({ quiet = false } = {}) {
 	if (!app.state) return;
 	try {
+		// The indexer may have read more posts since this page last looked.
+		await loadTranscripts();
 		const { bytes } = await writeViewer(app.state);
 		if (!quiet) log(`Wrote ${VIEWER_FILE} (${fmtBytes(bytes)}) — open it from the folder to browse offline.`, 'ok');
 	} catch (err) {
@@ -514,6 +520,58 @@ async function writeViewerFile({ quiet = false } = {}) {
 		// is regenerable from them.
 		log(`Could not write ${VIEWER_FILE}: ${err.message || err}`, 'err');
 	}
+}
+
+// ------------------------------------------------- said and written in it
+
+const INDEX_POLL_MS = 15_000;
+let indexWatch = null;
+
+/**
+ * After a sync, have the helper read what is said and written in the posts it
+ * brought in, so the search finds them by that too. Only where transcripts.json
+ * already exists — the first pass over an archive is tools/index.py, run by
+ * hand, since it takes hours — and only where the helper's Python has the
+ * packages for it. When it finishes, the search and viewer.html take up the
+ * new text.
+ */
+async function indexNewPosts() {
+	let res;
+	try {
+		res = await fs.indexer({ start: true });
+	} catch (_) {
+		return;
+	}
+	if (!res || !res.running) {
+		if (res && res.error === 'not-installed') {
+			log('transcripts.json is in the folder, but the helper’s Python can’t read new posts into it: ' +
+				'pip install -r tools/requirements-index.txt, then sync again.', 'err');
+		}
+		return;
+	}
+	clearInterval(indexWatch);
+	indexWatch = setInterval(async () => {
+		// The page run out of sight stays up while there is something to report.
+		touchEngine();
+		let s;
+		try {
+			s = await fs.indexer();
+		} catch (_) {
+			return;
+		}
+		if (!s || s.running) return;
+		clearInterval(indexWatch);
+		indexWatch = null;
+		if (s.error) {
+			log(`Could not read speech and on-screen text: ${s.error}`, 'err');
+			return;
+		}
+		if (!s.read) return;
+		// Redrawn only for a search in progress: without one the grid is the same.
+		if ((await loadTranscripts()) && $('search')?.value.trim()) library.render(app.state);
+		await writeViewerFile({ quiet: true });
+		log(`Read speech and on-screen text in ${s.read.toLocaleString()} new post(s) for the search.`, 'ok');
+	}, INDEX_POLL_MS);
 }
 
 /**
@@ -573,6 +631,7 @@ async function onViewerRequest({ rid, cmd }) {
 			respond({ ok: false, error: 'no folder open' });
 			return;
 		}
+		await loadTranscripts({ maxAge: 60_000 });
 		respond({ ok: true, items: slimItems(app.state) });
 		return;
 	}
@@ -1025,6 +1084,7 @@ async function writeUp(reason) {
 	library.render(app.state);
 	log('Done. archive.json written.', 'ok');
 	await writeViewerFile();
+	indexNewPosts();
 	setSyncButtons(false);
 }
 
