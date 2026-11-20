@@ -7,7 +7,7 @@
 # helper can't read new posts after a sync.
 
 faster-whisper>=1.1
-rapidocr>=3.0
+rapidocr>=3.9
 onnxruntime>=1.20
 
 # The CUDA libraries faster-whisper uses on an NVIDIA GPU, about 1 GB. Without

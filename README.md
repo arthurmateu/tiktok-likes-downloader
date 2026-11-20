@@ -34,7 +34,7 @@ Browse what you've saved in the **Library** tab, or open `viewer.html` in the ar
 
 ### Optional: search what's said and written in each post
 
-The Library's search covers captions and authors. It can also find a post by what someone says in it or by text on screen, once your computer has transcribed the archive. That runs entirely on your machine with Whisper and OCR. It needs Python 3.10 or newer and about 3 GB of downloads. Reading the text on screen is the slow part, about half a day for 7,000 posts on a desktop CPU; an NVIDIA GPU keeps the speech from adding to that. From the repository folder:
+The Library's search covers captions and authors. It can also find a post by what someone says in it or by text on screen, once your computer has transcribed the archive. That runs entirely on your machine with Whisper and OCR. It needs Python 3.10 or newer and about 3 GB of downloads. Reading the text on screen is the slow part, most of a day for 7,000 posts on a desktop CPU; an NVIDIA GPU keeps the speech from adding to that. From the repository folder:
 
 ```bash
 pip install -r tools/requirements-index.txt

@@ -32,6 +32,7 @@ Options:
 """
 
 import argparse
+import difflib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import NamedTuple
 
 VERSION = 1
 FILE = "transcripts.json"
@@ -60,8 +62,8 @@ FRAMES_MAX = 240
 
 # Raise when the way text or speech is read improves, so the next run reads
 # every post again with it. Posts keep what the other one read.
-EYES = 2
-EARS = 1
+EYES = 3
+EARS = 2
 
 # OCR reads at this height. TikTok's captions are large; full 1080p or 4K
 # frames cost several times as much to read for nothing more.
@@ -70,6 +72,19 @@ OCR_HEIGHT = 960
 # A line read with less confidence than this is more likely noise — a pattern
 # on a shirt, a blurred sign — than text anyone meant to be read.
 OCR_MIN_SCORE = 0.75
+
+# The longer side, in pixels, the second OCR pass for huge text detects at.
+BIG_TEXT_SIDE = 480
+
+# Text fixed in place through a clip (see `fixtures`): within FIXTURE_NEAR of
+# one spot, as a share of the frame, no taller than FIXTURE_HEIGHT of it, and
+# read the same in at least FIXTURE_SHARE of the frames and FIXTURE_MIN of them.
+# A reading there at least FIXTURE_ALIKE like that one is a variant of it.
+FIXTURE_NEAR = 0.03
+FIXTURE_SHARE = 0.4
+FIXTURE_MIN = 4
+FIXTURE_HEIGHT = 0.06
+FIXTURE_ALIKE = 0.5
 
 # Whisper writes these over silence and music. They come from the subtitles it
 # was trained on, not from the clip.
@@ -161,10 +176,12 @@ def tidy_lines(lines) -> str:
     kept, seen = [], []
     for line in lines:
         line = " ".join(line.split())
-        f = fold(line)
+        # Compared without spaces or punctuation: OCR splits and joins words
+        # differently from one frame to the next ("QUE LLEVA 3", "QUELLEVA3").
+        f = alnum(line)
         # Two letters is a piece of a word the camera cut off, or a logo, not
         # something to search for. CJK packs a word into fewer characters, so two
-        # of them are kept \u2014 but not one, which OCR reads off any box or bar.
+        # of them are kept, but not one, which OCR reads off any box or bar.
         cjk = re.search(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]", f)
         if len(f) < (2 if cjk else 3):
             continue
@@ -242,7 +259,11 @@ class Ears:
             return "", ""
         segments, info = self.model.transcribe(
             audio,
-            vad_filter=True,
+            # No voice-activity filter: it takes singing for music and drops it,
+            # and a song's words are what someone searching a lyric is after.
+            # What it saved Whisper from, made-up lines over silence, the
+            # no-speech, log-probability and phantom checks below catch.
+            vad_filter=False,
             # Each window on its own: carrying the previous text over is what lets
             # Whisper repeat one line for the rest of a song.
             condition_on_previous_text=False,
@@ -291,34 +312,50 @@ def soundtrack(path: Path):
 
 class Eyes:
     def __init__(self):
-        from rapidocr import RapidOCR
+        from rapidocr import ModelType, RapidOCR
 
         # No angle classifier: TikTok's text is upright, and it costs a sixth of the time.
-        params = {"Global.log_level": "critical", "Global.use_cls": False}
-        self.engine = RapidOCR(params=params) if _takes_params() else RapidOCR()
+        base = {"Global.log_level": "critical", "Global.use_cls": False}
+        self.engines = [
+            RapidOCR(params=base),
+            # A second look for text too big for the first: an edit that flashes
+            # one word per beat across the whole frame. The larger detector, on
+            # the frame shrunk to BIG_TEXT_SIDE, finds those words where the
+            # default one at full size misses most; it costs a fraction of the
+            # first pass, since it sees a quarter of the pixels.
+            RapidOCR(params={**base, "Det.model_type": ModelType.MEDIUM,
+                             "Det.limit_type": "max", "Det.limit_side_len": BIG_TEXT_SIDE}),
+        ]
 
     def read(self, img) -> list:
-        res = self.engine(img)
-        txts = getattr(res, "txts", None) or ()
-        scores = getattr(res, "scores", None) or ()
-        boxes = getattr(res, "boxes", None)
+        """What one image says, top to bottom, the way a caption is read."""
+        if isinstance(img, str):
+            from PIL import Image
+            import numpy as np
+
+            with Image.open(img) as im:
+                img = np.asarray(im.convert("RGB"))
+        height, width = img.shape[:2]
         out = []
-        for i, (t, s) in enumerate(zip(txts, scores)):
-            if s >= OCR_MIN_SCORE and t.strip():
-                y = float(boxes[i][0][1]) if boxes is not None else i
-                out.append((y, t.strip()))
-        # Top to bottom, the way a caption is read.
-        return [t for _, t in sorted(out)]
+        for engine in self.engines:
+            res = engine(img)
+            boxes = getattr(res, "boxes", None)
+            for i, (t, s) in enumerate(zip(getattr(res, "txts", None) or (), getattr(res, "scores", None) or ())):
+                if s < OCR_MIN_SCORE or not t.strip():
+                    continue
+                xs = [p[0] for p in boxes[i]] if boxes is not None else [0, width]
+                ys = [p[1] for p in boxes[i]] if boxes is not None else [i, i]
+                out.append(Read(t.strip(), float(s), (min(xs) + max(xs)) / 2 / width,
+                                (min(ys) + max(ys)) / 2 / height, (max(ys) - min(ys)) / height))
+        return sorted(out, key=lambda r: r.y)
 
 
-def _takes_params() -> bool:
-    import inspect
-    from rapidocr import RapidOCR
-
-    try:
-        return "params" in inspect.signature(RapidOCR.__init__).parameters
-    except (TypeError, ValueError):
-        return False
+class Read(NamedTuple):
+    text: str
+    score: float
+    x: float  # the middle of its box, as a share of the image's width
+    y: float  # ... and of its height
+    h: float  # how tall the box is, as a share of the image's height
 
 
 def frames(path: Path):
@@ -360,14 +397,76 @@ def again(fn, *args):
         return fn(*args)
 
 
-def read_post(eyes: Eyes, files: dict) -> str:
-    lines = []
+def read_post(eyes: Eyes, files: dict, names=()) -> str:
+    """
+    The post's on-screen text. `names` are its author's handle and display
+    name: text that only repeats them is a watermark, and the author is already
+    searchable by name.
+    """
+    reads = []
     if files["video"]:
-        for img in frames(files["video"]):
-            lines.extend(eyes.read(img))
+        reads = fixtures([eyes.read(img) for img in frames(files["video"])])
     for f in files["images"]:
-        lines.extend(eyes.read(str(f)))
-    return tidy_lines(lines)
+        reads.append(eyes.read(str(f)))
+    names = [n for n in (alnum(x) for x in names) if len(n) >= 4]
+    return tidy_lines(r.text for frame in reads for r in frame if not names_only(r.text, names))
+
+
+def alnum(text: str) -> str:
+    return "".join(ch for ch in fold(text) if ch.isalnum())
+
+
+def alike(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def names_only(text: str, names) -> bool:
+    """
+    Whether a line is only a name: `TikTok`, `@handle`, `TikTok @handle`, or a
+    misreading of one. Not a caption that merely starts with the same letters:
+    "so yeah I went" is not @soyeah.
+    """
+    t = alnum(text).replace("tiktok", "")
+    return not t or any(alike(t, n) >= 0.75 for n in names)
+
+
+def fixtures(frames: list) -> list:
+    """
+    The frames' reads, less the variants of text fixed in place through the
+    clip: a creator's watermark or a standing title is read off every frame,
+    differently each time ("Soyeah", "Soyear", "Juycah"), and each misreading
+    would otherwise be kept as a line of its own. A fixture is one spot holding
+    small text read the same in at least FIXTURE_SHARE of the frames; that reading
+    is kept, once, and readings there that look like it are dropped. A different
+    caption that happens to sit in the same place doesn't look like it, and stays.
+    """
+    spots = []  # [x, y, reads: [(frame, read)]]
+    for i, frame in enumerate(frames):
+        for r in frame:
+            if r.h > FIXTURE_HEIGHT:
+                continue
+            spot = next((s for s in spots if abs(s[0] - r.x) <= FIXTURE_NEAR and abs(s[1] - r.y) <= FIXTURE_NEAR), None)
+            if spot is None:
+                spots.append([r.x, r.y, [(i, r)]])
+            else:
+                spot[2].append((i, r))
+    drop = set()
+    for _, _, reads in spots:
+        counts = {}
+        for i, r in reads:
+            counts.setdefault(alnum(r.text), set()).add(i)
+        main = max(counts, key=lambda k: len(counts[k]))
+        # Read the same in that many frames: a subtitle line moves on long before.
+        if len(counts[main]) < max(FIXTURE_MIN, FIXTURE_SHARE * len(frames)):
+            continue
+        kept = False
+        for _, r in reads:
+            t = alnum(r.text)
+            if t == main and not kept:
+                kept = True
+            elif alike(t, main) >= FIXTURE_ALIKE:
+                drop.add(id(r))
+    return [[r for r in frame if id(r) not in drop] for frame in frames]
 
 
 # ------------------------------------------------------------------ the run
@@ -449,7 +548,9 @@ def main(argv=None) -> int:
                 break
             files = media[pid]
             had = done.get(pid) or {}
-            seen_job = pool.submit(again, read_post, eyes, files) if look else None
+            author = ((state.get("items") or {}).get(pid) or {}).get("author") or {}
+            names = (author.get("uniqueId") or "", author.get("nickname") or "")
+            seen_job = pool.submit(again, read_post, eyes, files, names) if look else None
             said, lang, ok = had.get("said", ""), had.get("lang", ""), True
             if hear:
                 said, lang = "", ""

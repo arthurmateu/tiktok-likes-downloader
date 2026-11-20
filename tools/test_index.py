@@ -24,6 +24,9 @@ class Text(unittest.TestCase):
         lines = ["Had to teach my son a", "lesson", "Had to teach my son a", "lesson for spamming", "202.50"]
         self.assertEqual(index.tidy_lines(lines), "Had to teach my son a\nlesson for spamming\n202.50")
 
+    def test_a_caption_split_differently_is_still_one(self):
+        self.assertEqual(index.tidy_lines(["QUELLEVA3", "QUE LLEVA 3", "AÑO YA", "AÑOYA"]), "QUELLEVA3\nAÑO YA")
+
     def test_fragments_and_noise_go(self):
         self.assertEqual(index.tidy_lines(["ck", "th", "ok", "rock star"]), "rock star")
 
@@ -36,6 +39,28 @@ class Text(unittest.TestCase):
             self.assertTrue(index.PHANTOMS.search(line), line)
         for line in ["Thank you for the food, mom", "you don't seem that happy"]:
             self.assertFalse(index.PHANTOMS.search(line), line)
+
+    def test_a_watermark_is_kept_once_and_captions_under_it_stay(self):
+        def read(text, x, y, h=0.02):
+            return index.Read(text, 0.9, x, y, h)
+        marks = ["Soyeah"] * 6 + ["Soyear", "Juycah", "Soy sh", "veah"]
+        captions = ["first line", "second words", "third bit", "fourth one", "fifth thing",
+                    "sixth part", "seventh go", "eighth row", "ninth try", "tenth end"]
+        frames = [[read(c, 0.5, 0.75), read(m, 0.8, 0.92)] for c, m in zip(captions, marks)]
+        kept = [r.text for frame in index.fixtures(frames) for r in frame]
+        self.assertEqual(kept, [captions[0], "Soyeah"] + captions[1:])
+
+    def test_huge_words_in_one_spot_are_not_a_watermark(self):
+        words = ["PLEASE", "STOP", "ESCAPE", "REFUSE", "MUSIC", "PLAY"]
+        frames = [[index.Read(w, 0.9, 0.5, 0.5, 0.4)] for w in words]
+        self.assertEqual([r.text for f in index.fixtures(frames) for r in f], words)
+
+    def test_lines_that_only_name_the_author_go(self):
+        names = ["soyeah1", "soyeah"]
+        for line in ["@soyeah1", "TikTok", "TikTok @soyeah1", "Soyear", "𝐒𝐨𝐲𝐞𝐚𝐡"]:
+            self.assertTrue(index.names_only(line, names), line)
+        for line in ["so yeah I went", "MUSIC", "Soyeah's new song is out"]:
+            self.assertFalse(index.names_only(line, names), line)
 
     def test_fold(self):
         self.assertEqual(index.fold("Café, NAÏVE!"), "cafe naive")
@@ -93,7 +118,7 @@ class Folder(unittest.TestCase):
                 raise AssertionError("speech was read again")
 
         saved = index.Ears, index.Eyes, index.read_post
-        index.Ears, index.Eyes, index.read_post = NoEars, object, lambda eyes, files: "new"
+        index.Ears, index.Eyes, index.read_post = NoEars, object, lambda *_: "new"
         try:
             self.assertEqual(index.main([str(self.root)]), 0)
         finally:
